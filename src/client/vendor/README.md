@@ -1,7 +1,9 @@
 # Vendored from pacman
 
 `alpm_list.c` is taken verbatim from pacman v6.1.0
-(`lib/libalpm/alpm_list.c`), GPL-2.0-or-later, same licence as this project.
+(`lib/libalpm/alpm_list.c`), GPL-2.0-or-later — the same terms as this
+project, which is not a coincidence: linking it is why those are the terms.
+See [../../../LICENSE](../../../LICENSE).
 
 It is here because `alpm_list_t` is a *transparent* type: callers walk
 `->next` and call `alpm_list_count`, `alpm_list_free`, `alpm_list_msort` and

@@ -232,3 +232,13 @@ frames and 0.7 ms of a 1.8 s commit, 0.04%. A transaction is `fork`, `exec`
 and disk; the bridge is not what it is waiting for. Codecs are therefore
 still not worth revisiting — the read path said the codec is 2% of a call,
 and the write path does not disagree.
+
+## License
+
+GPL-2.0-or-later. The full text is in [LICENSE](LICENSE).
+
+That is not a free choice. `src/client/vendor/alpm_list.c` is taken verbatim
+from pacman and carries "version 2, or (at your option) any later version",
+and it is linked into the client DLL — `alpm_list_t` is transparent, so those
+functions have to exist here with libalpm's exact semantics. The server links
+libalpm itself, which is under the same terms.
