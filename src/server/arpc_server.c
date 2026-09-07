@@ -211,6 +211,11 @@ int arpc_node_elem(const arpc_req *rq, int arr, int k)
 	return aj_elem(rq->doc, arr, k);
 }
 
+int arpc_node_member(const arpc_req *rq, int obj, const char *key)
+{
+	return aj_member(rq->doc, obj, key);
+}
+
 long long arpc_node_i64(const arpc_req *rq, int n)
 {
 	return aj_i64(rq->doc, n, 0);

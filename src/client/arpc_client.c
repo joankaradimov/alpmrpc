@@ -206,6 +206,7 @@ typedef struct owned {
 	const char *key;        /* generated literal; static lifetime */
 	void *value;
 	alpm_list_fn_free elem_free;
+	void (*release_ptr)(void *);    /* set for a cached struct pointer */
 	int is_list;
 } owned;
 
@@ -215,6 +216,8 @@ static void release_owned(owned *o)
 {
 	if (o->is_list)
 		arpc_free_list((alpm_list_t *)o->value, o->elem_free);
+	else if (o->release_ptr)
+		o->release_ptr(o->value);
 	else
 		free(o->value);
 	free(o);
@@ -293,6 +296,41 @@ void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
 			n->value = list;
 			n->elem_free = elem_free;
 			n->is_list = 1;
+			n->next = g_owned;
+			g_owned = n;
+		}
+	}
+	LeaveCriticalSection(&g_lock);
+}
+
+void *arpc_cached_ptr(uint64_t owner, const char *key)
+{
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	owned *p = find_owned(owner, key);
+	void *r = (p && !p->is_list && p->release_ptr) ? p->value : NULL;
+	LeaveCriticalSection(&g_lock);
+	return r;
+}
+
+void arpc_cache_ptr(uint64_t owner, const char *key, void *ptr,
+		    void (*release)(void *))
+{
+	if (!ptr)
+		return;
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	owned *p = find_owned(owner, key);
+	if (p && !p->is_list && p->release_ptr) {
+		p->release_ptr(p->value);       /* lost a race; keep the new one */
+		p->value = ptr;
+	} else {
+		owned *n = (owned *)calloc(1, sizeof(*n));
+		if (n) {
+			n->owner = owner;
+			n->key = key;
+			n->value = ptr;
+			n->release_ptr = release;
 			n->next = g_owned;
 			g_owned = n;
 		}
@@ -667,6 +705,11 @@ int arpc_begin(arpc_call *c, const char *method)
 	ajw_arr_begin(&c->req);
 	return 1;
 }
+
+void arpc_put_null(arpc_call *c)                  { ajw_null(&c->req); }
+void arpc_obj_begin(arpc_call *c)                 { ajw_obj_begin(&c->req); }
+void arpc_obj_end(arpc_call *c)                   { ajw_obj_end(&c->req); }
+void arpc_key(arpc_call *c, const char *key)      { ajw_key(&c->req, key); }
 
 void arpc_put_str(arpc_call *c, const char *s)    { ajw_str(&c->req, s); }
 void arpc_put_i64(arpc_call *c, long long v)      { ajw_i64(&c->req, v); }

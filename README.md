@@ -67,6 +67,16 @@ everything else, why it is not.
   this is not a new API, it is the same one not going to the wire.
   Which accessors are cheap enough to batch is an overlay rule: the excluded
   ones hash a package file or compute a download size.
+- **Structs cross in both directions.** The server writes a record and the
+  client materialises it; the client writes one and the server rebuilds a
+  temporary for the duration of the call. As with lists, `const` marks the
+  read-only inputs, and a non-const struct param is skipped rather than
+  guessed at. Two records are refused outright -- `alpm_filelist_t` and
+  `alpm_siglist_t` are a count plus an array, not a pointer to one struct,
+  and the generator would otherwise materialise exactly one element.
+- **`alpm_dep_free` and friends never reach the server.** They free a struct
+  this client materialised; the server has libalpm's own copy, which is not
+  ours to free. The generated stub calls the matching free helper locally.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. Caller-owned lists are

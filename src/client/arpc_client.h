@@ -87,6 +87,18 @@ alpm_list_t *arpc_cached_list(uint64_t owner, const char *key);
 void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
                      alpm_list_fn_free elem_free);
 
+/* Raw request-writer access, for generated struct serialisers. */
+void arpc_put_null(arpc_call *c);
+void arpc_obj_begin(arpc_call *c);
+void arpc_obj_end(arpc_call *c);
+void arpc_key(arpc_call *c, const char *key);
+
+/* A borrowed struct return, cached against its owner exactly like a borrowed
+ * list: same lifetime rule, same pre-call lookup. */
+void *arpc_cached_ptr(uint64_t owner, const char *key);
+void  arpc_cache_ptr(uint64_t owner, const char *key, void *ptr,
+                     void (*release)(void *));
+
 /* List parameters, serialised from the caller's own list. */
 void arpc_put_str_list(arpc_call *c, const alpm_list_t *l);
 void arpc_put_handle_list(arpc_call *c, const alpm_list_t *l);

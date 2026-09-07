@@ -196,6 +196,52 @@ int main(void)
 	check((size_t)distinct == walked, "column indexing lines up per member",
 	      buf);
 
+	printf("\n-- structs travel back the other way --\n");
+	if (deps) {
+		alpm_depend_t *d = (alpm_depend_t *)deps->data;
+		/* This struct was materialised here from the server's copy. Sending
+		 * it back and having libalpm render it only agrees if every field
+		 * survived both directions. */
+		char *s = alpm_dep_compute_string(d);
+		check(s != NULL && strstr(s, d->name) != NULL,
+		      "alpm_dep_compute_string() round-trips a struct", s);
+		free(s);
+	}
+
+	/* Built by hand rather than materialised, so nothing about it came from
+	 * the server -- it still has to serialise correctly. */
+	alpm_depend_t *made = alpm_dep_from_string("bash>=5.0");
+	check(made != NULL, "alpm_dep_from_string() returns a struct",
+	      made ? made->name : NULL);
+	if (made) {
+		check(made->name && !strcmp(made->name, "bash"), "name parsed",
+		      made->name);
+		check(made->version && !strcmp(made->version, "5.0"),
+		      "version parsed", made->version);
+		check(made->mod == ALPM_DEP_MOD_GE, "comparison parsed", ">=");
+		char *back = alpm_dep_compute_string(made);
+		check(back && !strcmp(back, "bash>=5.0"),
+		      "and renders back to the original", back);
+		free(back);
+		alpm_dep_free(made);    /* local free, no round trip */
+		check(1, "alpm_dep_free() on a caller-owned struct", NULL);
+	}
+
+	printf("\n-- borrowed struct returns --\n");
+	if (groups) {
+		alpm_group_t *g0 = (alpm_group_t *)groups->data;
+		alpm_group_t *byname = alpm_db_get_group(db, g0->name);
+		check(byname != NULL, "alpm_db_get_group()", g0->name);
+		if (byname) {
+			check(byname->name && !strcmp(byname->name, g0->name),
+			      "same group by name", byname->name);
+			alpm_group_t *again2 = alpm_db_get_group(db, g0->name);
+			check(again2 == byname,
+			      "repeat call returns the same pointer",
+			      "cached against the owning handle");
+		}
+	}
+
 	printf("\n-- teardown releases cached lists --\n");
 	alpm_release(h);
 	check(1, "alpm_release() with lists outstanding", "no leak, no crash");

@@ -65,7 +65,44 @@ def find_record(c_type):
     base = c_type.replace("const", "").replace("*", "").strip()
     for cand in (base, "_" + base):
         if cand in RECORDS:
+            if cand in OVERLAY.get("records_unsupported", {}):
+                return None     # refuse rather than materialise it wrongly
             return RECORDS[cand]
+    return None
+
+
+def record_unsupported_reason(c_type):
+    base = c_type.replace("const", "").replace("*", "").strip()
+    for cand in (base, "_" + base):
+        why = OVERLAY.get("records_unsupported", {}).get(cand)
+        if why:
+            return why
+    return None
+
+
+def struct_own(name):
+    return OVERLAY.get("struct_own", {}).get(name)
+
+
+def client_local_record(name):
+    """Functions that operate on a struct this client materialised: they are
+    a local free, not a call."""
+    t = OVERLAY.get("client_local", {}).get(name)
+    return elem_of(t) if t else None
+
+
+def libalpm_free_fn(c_type):
+    """The libalpm function that frees this record. client_local already
+    pairs the two, so the fact is stated once rather than twice."""
+    want = elem_of(c_type)
+    if not want:
+        return None
+    for fname, t in OVERLAY.get("client_local", {}).items():
+        if fname.startswith("_"):
+            continue
+        e = elem_of(t)
+        if e and e["name"] == want["name"]:
+            return fname
     return None
 
 
@@ -153,6 +190,20 @@ def select(model):
 
         if fn["ret"]["kind"] == "list" and ret_elem(n) is None:
             why = "list return with no element type in the overlay"
+
+        # A struct this client materialised is freed locally; nothing about
+        # it needs to reach the server.
+        if not why and client_local_record(n):
+            gen.append(fn)
+            continue
+
+        if not why and fn["ret"]["kind"] == "struct_ptr":
+            r = record_unsupported_reason(fn["ret"]["c_type"])
+            if r:
+                why = "unsupported record: " + r
+            elif struct_own(n) is None:
+                why = "struct return with no ownership in the overlay"
+
         for p in fn["params"]:
             if why:
                 break
@@ -160,13 +211,24 @@ def select(model):
             if k in ("ptr_enum", "ptr_scalar"):
                 if p["name"] not in outs:
                     why = "pointer param with undeclared direction: " + p["name"]
+            elif k == "struct_ptr":
+                r = record_unsupported_reason(p["c_type"])
+                if r:
+                    why = "unsupported record: " + r
+                elif p["name"] in outs:
+                    why = "struct out-param: " + p["name"]
+                elif "const" not in p["c_type"]:
+                    # As with lists, const marks the read-only inputs. A
+                    # non-const struct param may be written through, and
+                    # guessing would be worse than skipping.
+                    why = ("non-const struct param, direction unclear: "
+                           + p["name"])
             elif k == "list":
                 pe = param_elem(n, p["name"])
                 if pe is None:
                     why = "list param with no element type: " + p["name"]
-                elif pe["kind"] == "record":
-                    why = ("list param of records needs a server-side reader: "
-                           + p["name"])
+                # A record-element list is fine now: the server can read a
+                # record back off the wire, so take_list_* can build one.
             elif k in ("callback", "unsupported", "opaque_void",
                        "foreign_handle"):
                 why = "unsupported type kind: " + k
@@ -174,7 +236,8 @@ def select(model):
                 why = "not yet generated: " + k
 
         if not why and fn["ret"]["kind"] not in (
-                "void", "scalar", "enum", "string", "handle", "list"):
+                "void", "scalar", "enum", "string", "handle", "list",
+                "struct_ptr"):
             why = "not yet generated: " + fn["ret"]["kind"]
 
         if why:
@@ -193,13 +256,61 @@ def select(model):
     return gen, skipped
 
 
+def _close_over_records(queue):
+    """Expand a set of records to everything they reference, transitively."""
+    need = {}
+    while queue:
+        e = queue.pop()
+        rec = e["record"]
+        if rec["name"] in need:
+            continue
+        need[rec["name"]] = e
+        for f in rec["fields"]:
+            if f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                if sub and sub["kind"] == "record":
+                    queue.append(sub)
+            elif f["kind"] == "list":
+                sub = field_list_elem(rec["name"], f["name"])
+                if sub and sub["kind"] == "record":
+                    queue.append(sub)
+    return list(need.values())
+
+
+def records_input(gen):
+    """Records the client sends and the server rebuilds: the mirror of
+    records_needed. Kept separate so the emitter only generates the direction
+    each record is actually used in."""
+    queue = []
+    for fn in gen:
+        if client_local_record(fn["name"]):
+            continue        # a local free serialises nothing
+        for p in fn["params"]:
+            if p["kind"] == "struct_ptr":
+                e = elem_of(p["c_type"])
+                if e and e["kind"] == "record":
+                    queue.append(e)
+            elif p["kind"] == "list":
+                pe = param_elem(fn["name"], p["name"])
+                if pe and pe["kind"] == "record":
+                    queue.append(pe)
+    return _close_over_records(queue)
+
+
 def records_needed(gen):
-    """Every record reachable from a generated list, transitively."""
+    """Every record the server writes and the client reads, transitively."""
     need, queue = {}, []
     for fn in gen:
         e = ret_elem(fn["name"])
         if e and e["kind"] == "record":
             queue.append(e)
+        if fn["ret"]["kind"] == "struct_ptr":
+            e = elem_of(fn["ret"]["c_type"])
+            if e and e["kind"] == "record":
+                queue.append(e)
+        cl = client_local_record(fn["name"])
+        if cl:
+            queue.append(cl)        # its free helper has to exist
         for p in fn["params"]:
             if p["kind"] == "list":
                 pe = param_elem(fn["name"], p["name"])
@@ -269,8 +380,10 @@ def emit_server_helpers(need, elems):
         o.append("static void put_list_%s(aj_w *w, const alpm_list_t *l, "
                  "uint64_t owner);\n" % e["name"])
     for e in need:
-        o.append("static void put_%s(aj_w *w, const %s v, uint64_t owner);\n"
-                 % (e["name"], e["c_type"]))
+        # A record reached only through a client-local free may be used in
+        # neither direction on the wire; that is legitimate, not dead code.
+        o.append("ARPC_MAYBE_UNUSED static void put_%s(aj_w *w, const %s v, "
+                 "uint64_t owner);\n" % (e["name"], e["c_type"]))
     o.append("\n")
 
     for e in need:
@@ -309,7 +422,107 @@ def collect_elems(gen, need):
     return elems
 
 
-def emit_server_list_writers(elems):
+def emit_server_readers(rin):
+    """Rebuild a struct the client sent, for the duration of one call.
+
+    Every libalpm function taking one of these takes it const, so the server
+    owns the temporary outright and frees it afterwards."""
+    o = []
+    for e in rin:
+        o.append("static %s read_%s(arpc_req *rq, int n);\n"
+                 % (e["c_type"], e["name"]))
+        o.append("static void drop_%s(%s v);\n" % (e["name"], e["c_type"]))
+    if rin:
+        o.append("\n")
+
+    for e in rin:
+        rec, ct = e["record"], e["c_type"]
+        o.append("static %s read_%s(arpc_req *rq, int n)\n{\n" % (ct, e["name"]))
+        o.append("\tif (n < 0 || arpc_node_is_null(rq, n))\n\t\treturn NULL;\n")
+        o.append("\t%s v = (%s)calloc(1, sizeof(*v));\n" % (ct, ct))
+        o.append("\tif (!v)\n\t\treturn NULL;\n")
+        for f in rec["fields"]:
+            node = "arpc_node_member(rq, n, " + qq(f["name"]) + ")"
+            if f["kind"] == "string":
+                o.append("\tv->%s = arpc_node_strdup(rq, %s);\n"
+                         % (f["name"], node))
+            elif f["kind"] in ("scalar", "enum"):
+                o.append("\tv->%s = (%s)arpc_node_i64(rq, %s);\n"
+                         % (f["name"], f["c_type"], node))
+            elif f["kind"] == "handle":
+                o.append("\tv->%s = (%s)arpc_handle_get(\n"
+                         "\t\t\t(uint64_t)arpc_node_i64(rq, %s), %s);\n"
+                         % (f["name"], f["c_type"], node,
+                            handle_tag(f["c_type"])))
+            elif f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                o.append("\tv->%s = read_%s(rq, %s);\n"
+                         % (f["name"], sub["name"], node))
+        o.append("\treturn v;\n}\n\n")
+
+        o.append("static void drop_%s(%s v)\n{\n" % (e["name"], ct))
+        o.append("\tif (!v)\n\t\treturn;\n")
+        for f in rec["fields"]:
+            if f["kind"] == "string":
+                o.append("\tfree(v->%s);\n" % f["name"])
+            elif f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                o.append("\tdrop_%s(v->%s);\n" % (sub["name"], f["name"]))
+            # handle fields point at libalpm's own objects; not ours to free
+        o.append("\tfree(v);\n}\n\n")
+    return "".join(o)
+
+
+def emit_client_writers(rin):
+    """Serialise a struct the caller handed us, field for field."""
+    o = []
+    for e in rin:
+        o.append("static void put_%s(arpc_call *c, const %s v);\n"
+                 % (e["name"], e["c_type"]))
+    if rin:
+        o.append("\n")
+
+    for e in rin:
+        rec, ct = e["record"], e["c_type"]
+        o.append("static void put_%s(arpc_call *c, const %s v)\n{\n"
+                 % (e["name"], ct))
+        o.append("\tif (!v) {\n\t\tarpc_put_null(c);\n\t\treturn;\n\t}\n")
+        o.append("\tarpc_obj_begin(c);\n")
+        for f in rec["fields"]:
+            o.append("\tarpc_key(c, " + qq(f["name"]) + ");\n")
+            if f["kind"] == "string":
+                o.append("\tarpc_put_str(c, v->%s);\n" % f["name"])
+            elif f["kind"] in ("scalar", "enum"):
+                o.append("\tarpc_put_i64(c, (long long)v->%s);\n" % f["name"])
+            elif f["kind"] == "handle":
+                o.append("\tarpc_put_handle(c, ARPC_ID(v->%s));\n" % f["name"])
+            elif f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                o.append("\tput_%s(c, v->%s);\n" % (sub["name"], f["name"]))
+            else:
+                o.append("\tarpc_put_null(c);\n")
+        o.append("\tarpc_obj_end(c);\n}\n\n")
+    return "".join(o)
+
+
+def param_elems_of(gen):
+    """Element types that arrive as parameters, so only these need the
+    inbound half (take_list_*/drop_list_*). A record used only in returns has
+    no server-side reader, and emitting a take_list_* for it would not
+    compile."""
+    out, seen = [], set()
+    for fn in gen:
+        for p in fn["params"]:
+            if p["kind"] != "list":
+                continue
+            e = param_elem(fn["name"], p["name"])
+            if e and e["name"] not in seen:
+                seen.add(e["name"])
+                out.append(e)
+    return out
+
+
+def emit_server_list_writers(elems, pelems):
     """One array writer per element type actually used."""
     o = []
     for e in elems:
@@ -329,9 +542,13 @@ def emit_server_list_writers(elems):
         o.append("\t}\n\tajw_arr_end(w);\n}\n\n")
 
     # rebuilding an incoming list, for list-typed parameters
-    for e in elems:
-        if e["kind"] not in ("string", "handle"):
-            continue
+    for e in pelems:
+        if e["kind"] == "record":
+            # alpm_list_fn_free takes void*, and casting a function pointer
+            # to call it through a different type is undefined -- so wrap.
+            o.append("static void drop_%s_v(void *p)\n{\n"
+                     "\tdrop_%s((%s)p);\n}\n\n"
+                     % (e["name"], e["name"], e["c_type"]))
         o.append("/* Caller-owned temporary: every libalpm function taking a\n"
                  " * list either copies it or takes it const, so the server\n"
                  " * frees this after the call. */\n")
@@ -346,6 +563,9 @@ def emit_server_list_writers(elems):
         if e["kind"] == "string":
             o.append("\t\tchar *s = arpc_node_strdup(rq, e);\n")
             o.append("\t\talpm_list_append(&out, s);\n")
+        elif e["kind"] == "record":
+            o.append("\t\talpm_list_append(&out, read_%s(rq, e));\n"
+                     % e["name"])
         else:
             o.append("\t\tvoid *p = arpc_handle_get("
                      "(uint64_t)arpc_node_i64(rq, e), %s);\n" % e["tag"])
@@ -356,6 +576,8 @@ def emit_server_list_writers(elems):
         o.append("static void drop_list_%s(alpm_list_t *l)\n{\n" % e["name"])
         if e["kind"] == "string":
             o.append("\talpm_list_free_inner(l, free);\n")
+        elif e["kind"] == "record":
+            o.append("\talpm_list_free_inner(l, drop_%s_v);\n" % e["name"])
         o.append("\talpm_list_free(l);\n}\n\n")
     return "".join(o)
 
@@ -416,21 +638,27 @@ def emit_pkg_batch(gen):
     return "".join(o)
 
 
-def emit_server(gen, need, src_header):
+def emit_server(gen, need, rin, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_server.h"\n')
     o.append("#include <alpm.h>\n#include <alpm_list.h>\n"
              "#include <stdlib.h>\n#include <string.h>\n\n")
+    o.append("#if defined(__GNUC__) || defined(__clang__)\n"
+             "#  define ARPC_MAYBE_UNUSED __attribute__((unused))\n"
+             "#else\n#  define ARPC_MAYBE_UNUSED\n#endif\n\n")
     elems = collect_elems(gen, need)
     o.append(emit_server_helpers(need, elems))
-    o.append(emit_server_list_writers(elems))
+    o.append(emit_server_readers(rin))
+    o.append(emit_server_list_writers(elems, param_elems_of(gen)))
 
     for fn in gen:
         n = fn["name"]
+        if client_local_record(n):
+            continue    # handled entirely on the client; never reaches here
         spec = OVERLAY["functions"].get(n, {})
         o.append("static int h_%s(arpc_req *rq, arpc_res *rs)\n{\n" % n)
 
-        args, temps = [], []
+        args, temps, struct_temps = [], [], []
         for i, p in enumerate(fn["params"]):
             k, pn, ct = p["kind"], p["name"], p["c_type"]
             if k == "string":
@@ -443,6 +671,12 @@ def emit_server(gen, need, src_header):
                 o.append("\t%s %s = (%s)arpc_arg_handle(rq, %d, %s);\n"
                          % (ct, pn, ct, i, handle_tag(ct)))
                 args.append(pn)
+            elif k == "struct_ptr":
+                e = elem_of(ct)
+                o.append("\t%s %s = read_%s(rq, arpc_arg_node(rq, %d));\n"
+                         % (e["c_type"], pn, e["name"], i))
+                args.append(pn)
+                struct_temps.append((pn, e["name"]))
             elif k == "list":
                 e = param_elem(n, pn)
                 o.append("\talpm_list_t *%s = take_list_%s(rq, %d);\n"
@@ -460,6 +694,8 @@ def emit_server(gen, need, src_header):
         o.append("\tif (arpc_req_bad(rq)) {\n")
         for tn, te in temps:
             o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
+        for tn, te in struct_temps:
+            o.append("\t\tdrop_%s(%s);\n" % (te, tn))
         o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
                  + qq(n + ": bad arguments") + ");\n\t}\n")
 
@@ -491,6 +727,17 @@ def emit_server(gen, need, src_header):
             o.append("\t%s r = %s;\n" % (rct, call))
             o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
                      % (handle_tag(rct), owner))
+        elif rk == "struct_ptr":
+            e = elem_of(rct)
+            o.append("\t%s r = %s;\n" % (rct, call))
+            o.append("\tarpc_ret_begin(rs);\n")
+            o.append("\tput_%s(arpc_res_writer(rs), r, %s);\n"
+                     % (e["name"], owner))
+            if struct_own(n) == "caller":
+                ff = libalpm_free_fn(rct)
+                o.append("\t/* overlay says caller-owned; the server is the\n"
+                         "\t * caller that made it, so it frees it here */\n")
+                o.append("\t%s(r);\n" % (ff or "free"))
         elif rk == "list":
             e = ret_elem(n)
             own = list_ownership(n)
@@ -511,6 +758,8 @@ def emit_server(gen, need, src_header):
 
         for tn, te in temps:
             o.append("\tdrop_list_%s(%s);\n" % (te, tn))
+        for tn, te in struct_temps:
+            o.append("\tdrop_%s(%s);\n" % (te, tn))
 
         if spec.get("destroys"):
             o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
@@ -525,6 +774,8 @@ def emit_server(gen, need, src_header):
         # single field for many packages at once.
         o.append("\t{ " + qq("arpc.pkg_fields") + ", h_arpc_pkg_fields },\n")
     for fn in gen:
+        if client_local_record(fn["name"]):
+            continue
         o.append("\t{ " + qq(fn["name"]) + ", h_%s },\n" % fn["name"])
     o.append("\t{ NULL, NULL }\n};\n")
     return "".join(o)
@@ -555,7 +806,8 @@ def cli_get_value(o, target, kind, c_type, node, indent, recname=None,
 def emit_client_helpers(need, elems):
     o = []
     for e in need:
-        o.append("static void *get_%s(const aj_doc *d, int n);\n" % e["name"])
+        o.append("ARPC_MAYBE_UNUSED static void *get_%s(const aj_doc *d, "
+                 "int n);\n" % e["name"])
         # A record that only ever appears in caller-owned lists has no
         # caching path, so its free helper can legitimately go unused.
         o.append("ARPC_MAYBE_UNUSED static void free_%s(void *p);\n"
@@ -625,7 +877,7 @@ def elem_free_fn(e):
     return "free_" + e["name"]
 
 
-def emit_client(gen, need, src_header):
+def emit_client(gen, need, rin, src_header):
     elems = collect_elems(gen, need)
     o = [BANNER % src_header]
     o.append('#include "arpc_client.h"\n')
@@ -637,12 +889,26 @@ def emit_client(gen, need, src_header):
              "#  define ARPC_MAYBE_UNUSED\n"
              "#endif\n\n")
     o.append(emit_client_helpers(need, elems))
+    o.append(emit_client_writers(rin))
 
     for fn in gen:
         n, rk, rct = fn["name"], fn["ret"]["kind"], fn["ret"]["c_type"]
         spec = OVERLAY["functions"].get(n, {})
         sig = ", ".join("%s %s" % (p["c_type"], p["name"])
                         for p in fn["params"]) or "void"
+
+        # Frees a struct this client materialised. The server has
+        # libalpm's own copy, which is not ours to free, so this never
+        # leaves the process.
+        cl = client_local_record(n)
+        if cl:
+            o.append("%s %s(%s)\n{\n" % (rct, n, sig))
+            o.append("\tfree_%s(%s);\n"
+                     % (cl["name"], fn["params"][0]["name"]))
+            if rk != "void":
+                o.append("\treturn (%s)0;\n" % rct)
+            o.append("}\n\n")
+            continue
 
         # Batchable accessors never call out on their own. The runtime fetches
         # the whole column for the package's list on first use, so the 1149
@@ -666,6 +932,7 @@ def emit_client(gen, need, src_header):
             "string": "return NULL;",
             "handle": "return NULL;",
             "list": "return NULL;",
+            "struct_ptr": "return NULL;",
         }[rk]
 
         first_handle = None
@@ -680,6 +947,10 @@ def emit_client(gen, need, src_header):
         # A borrowed list is looked up before the call, not after: libalpm
         # hands back the same pointer for repeated calls, and re-fetching
         # would either break that or free a list the caller still holds.
+        if rk == "struct_ptr" and struct_own(n) == "borrowed":
+            o.append("\t%s cached = (%s)arpc_cached_ptr(%s, %s);\n"
+                     % (rct, rct, owner, qq(n)))
+            o.append("\tif (cached)\n\t\treturn cached;\n")
         if rk == "list" and list_ownership(n) == "borrowed":
             o.append("\talpm_list_t *cached = arpc_cached_list(%s, %s);\n"
                      % (owner, qq(n)))
@@ -695,6 +966,9 @@ def emit_client(gen, need, src_header):
                 o.append("\tarpc_put_i64(&c, (long long)%s);\n" % pn)
             elif k == "handle":
                 o.append("\tarpc_put_handle(&c, ARPC_ID(%s));\n" % pn)
+            elif k == "struct_ptr":
+                e = elem_of(p["c_type"])
+                o.append("\tput_%s(&c, %s);\n" % (e["name"], pn))
             elif k == "list":
                 e = param_elem(n, pn)
                 if e["kind"] == "string":
@@ -743,6 +1017,21 @@ def emit_client(gen, need, src_header):
             o.append("\tarpc_end(&c);\n")
             if spec.get("creates"):
                 o.append("\tif (r)\n\t\tarpc_conn_ref();\n")
+            teardown()
+            o.append("\treturn r;\n")
+        elif rk == "struct_ptr":
+            e = elem_of(rct)
+            o.append("\t%s r = (%s)get_%s(arpc_doc(&c), "
+                     "arpc_ret_node(&c));\n" % (rct, rct, e["name"]))
+            o.append("\tarpc_end(&c);\n")
+            if struct_own(n) == "borrowed":
+                o.append("\t/* Borrowed: lives as long as its owner, and\n"
+                         "\t * the caller must not free it. */\n")
+                o.append("\tarpc_cache_ptr(%s, %s, r, free_%s);\n"
+                         % (owner, qq(n), e["name"]))
+            else:
+                o.append("\t/* Caller-owned: freed with %s. */\n"
+                         % (libalpm_free_fn(rct) or "free"))
             teardown()
             o.append("\treturn r;\n")
         elif rk == "list":
@@ -805,11 +1094,12 @@ def main():
 
     gen, skipped = select(model)
     need = records_needed(gen)
+    rin = records_input(gen)
     os.makedirs(a.outdir, exist_ok=True)
 
     files = (
-        ("arpc_dispatch.c", emit_server(gen, need, model["header"])),
-        ("arpc_stubs.c", emit_client(gen, need, model["header"])),
+        ("arpc_dispatch.c", emit_server(gen, need, rin, model["header"])),
+        ("arpc_stubs.c", emit_client(gen, need, rin, model["header"])),
         ("arpc_handle_tags.h", emit_handle_tags(model)),
     )
     for name, text in files:

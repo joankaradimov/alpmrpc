@@ -181,9 +181,6 @@
     },
     "alpm_pkg_free": {
       "destroys": "pkg"
-    },
-    "alpm_dep_free": {
-      "destroys": "dep"
     }
   },
   "skip": {
@@ -208,5 +205,38 @@
       "is not."
     ],
     "include": []
+  },
+  "client_local": {
+    "_comment": [
+      "These free a struct this client materialised, so they must never reach",
+      "the server -- it has libalpm's own copy, which it does not own. The",
+      "generated stub calls the matching free_<record> helper locally and costs",
+      "no round trip.",
+      "The value is the record whose free helper to call."
+    ],
+    "alpm_dep_free": "alpm_depend_t *",
+    "alpm_conflict_free": "alpm_conflict_t *",
+    "alpm_depmissing_free": "alpm_depmissing_t *",
+    "alpm_fileconflict_free": "alpm_fileconflict_t *"
+  },
+  "struct_own": {
+    "_comment": [
+      "Ownership of a returned struct pointer. Unlike strings, const-ness does",
+      "not settle this: both of these return a non-const pointer.",
+      "alpm_dep_from_string is documented as newly allocated and freed with",
+      "alpm_dep_free; alpm_db_get_group returns the db's own entry."
+    ],
+    "alpm_dep_from_string": "caller",
+    "alpm_db_get_group": "borrowed"
+  },
+  "records_unsupported": {
+    "_comment": [
+      "Records the materialiser must refuse rather than get wrong. Both are a",
+      "count plus a pointer to an array -- not a pointer to one struct, which",
+      "is what the generator would otherwise assume. Supporting them means",
+      "teaching it about counted arrays."
+    ],
+    "_alpm_filelist_t": "counted array (count + files), not a single struct",
+    "_alpm_siglist_t": "counted array (count + results), not a single struct"
   }
 }
