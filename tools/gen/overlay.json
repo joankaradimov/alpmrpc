@@ -229,7 +229,10 @@
     "alpm_option_get_eventcb_ctx": "hand-written in arpc_callbacks.c",
     "alpm_option_get_questioncb_ctx": "hand-written in arpc_callbacks.c",
     "alpm_option_get_progresscb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_filelist_contains": "hand-written in arpc_local.c"
+    "alpm_filelist_contains": "hand-written in arpc_local.c",
+    "alpm_pkg_mtree_open": "hand-written in arpc_mtree.c",
+    "alpm_pkg_mtree_next": "hand-written in arpc_mtree.c",
+    "alpm_pkg_mtree_close": "hand-written in arpc_mtree.c"
   },
   "spike": {
     "_comment": [

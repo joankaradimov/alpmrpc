@@ -786,6 +786,14 @@ void arpc_put_bytes(arpc_call *c, const unsigned char *b, size_t n)
 	free(enc);
 }
 
+unsigned char *arpc_ret_bytes(arpc_call *c, size_t *n)
+{
+	*n = 0;
+	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, "ret"),
+			       NULL);
+	return s ? arpc_b64_decode(s, n) : NULL;
+}
+
 unsigned char *arpc_out_bytes(arpc_call *c, const char *name, size_t *n)
 {
 	*n = 0;

@@ -29,6 +29,9 @@
 #include <alpm.h>
 #include <alpm_list.h>
 
+#include <archive.h>
+#include <archive_entry.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -392,62 +395,6 @@ int main(int argc, char **argv)
 	check(fl != NULL && alpm_pkg_get_files(installed) == fl,
 	      "a repeat call is the same pointer", "borrowed, so cached");
 
-	/* ---- the changelog, which is a cursor and a stream of bytes ---- */
-
-	printf("\n-- reading the changelog through a cursor --\n");
-	/* The package file, not the installed one, and that is libalpm's
-	 * doing rather than a choice: a package added to the local db cache
-	 * by a transaction in this same session has no changelog reader
-	 * attached until the db is read again from disk, so
-	 * alpm_pkg_changelog_open on it returns NULL. A fresh process reads
-	 * the same installed package fine. The file-backed cursor is the same
-	 * mechanism and does not depend on that. */
-	alpm_pkg_t *fromfile = NULL;
-	alpm_pkg_load(h, base_pkg, 1, 0, &fromfile);
-	check(fromfile != NULL, "alpm_pkg_load() for the changelog", NULL);
-
-	void *cl = fromfile ? alpm_pkg_changelog_open(fromfile) : NULL;
-	check(cl != NULL, "alpm_pkg_changelog_open()",
-	      "an id, not a pointer this process could follow");
-	if (cl) {
-		/* Deliberately small, so the whole file cannot arrive in one
-		 * read and the cursor has to be where it was left. */
-		char chunk[16];
-		char whole[1024];
-		size_t total = 0, got;
-		int reads = 0;
-		while ((got = alpm_pkg_changelog_read(chunk, sizeof(chunk),
-						      fromfile, cl)) > 0) {
-			reads++;
-			if (total + got < sizeof(whole)) {
-				memcpy(whole + total, chunk, got);
-				total += got;
-			}
-			if (reads > 200)
-				break;
-		}
-		whole[total] = '\0';
-
-		snprintf(buf, sizeof(buf), "%zu bytes over %d reads", total,
-			 reads);
-		check(reads > 1, "it took more than one read", buf);
-		check(strstr(whole, "first release of alpmrpc-base") != NULL,
-		      "and the text came back whole", NULL);
-		check(strstr(whole, "and a third") != NULL,
-		      "including the last line, so nothing was lost between "
-		      "reads", NULL);
-
-		check(alpm_pkg_changelog_close(fromfile, cl) == 0,
-		      "alpm_pkg_changelog_close()", NULL);
-		/* The id is dropped when it closes, so this misses a lookup
-		 * rather than reaching a cursor libalpm has already freed. */
-		check(alpm_pkg_changelog_read(chunk, sizeof(chunk), fromfile,
-					      cl) == 0,
-		      "reading a closed cursor gets nothing", "the id is gone");
-	}
-	if (fromfile)
-		alpm_pkg_free(fromfile);
-
 	/* ---- the conflict, which is a question ---- */
 
 	printf("\n-- installing alpmrpc-rival, which conflicts --\n");
@@ -593,6 +540,114 @@ int main(int argc, char **argv)
 	check(up != 0, "refusing it failed the update, rather than passing",
 	      NULL);
 	alpm_option_set_fetchcb(h, NULL, NULL);
+
+	/* ---- what a later reader sees of what was installed ----
+	 *
+	 * A second handle on the same root, because libalpm attaches neither a
+	 * changelog reader nor an mtree reader to a package its local db cache
+	 * got from a transaction in this session -- both stay NULL until the
+	 * db is read from disk again. That is what a fresh handle does, and it
+	 * is what the next pacman to run would see. Nothing about it is
+	 * peculiar to this bridge; a native caller finds the same. */
+
+	printf("\n-- a fresh handle re-reads what was installed --\n");
+	alpm_errno_t err2 = 0;
+	alpm_handle_t *h2 = alpm_initialize(posix_root, dbpath, &err2);
+	check(h2 != NULL, "a second alpm_initialize() on the same root", NULL);
+
+	alpm_db_t *local2 = h2 ? alpm_get_localdb(h2) : NULL;
+	alpm_pkg_t *rival = local2 ?
+		alpm_db_get_pkg(local2, "alpmrpc-rival") : NULL;
+	check(rival != NULL, "alpm_db_get_pkg() off its local db",
+	      "alpmrpc-rival");
+
+	printf("\n-- the changelog, through a cursor --\n");
+	void *cl = rival ? alpm_pkg_changelog_open(rival) : NULL;
+	check(cl != NULL, "alpm_pkg_changelog_open()",
+	      "an id, not a pointer this process could follow");
+	if (cl) {
+		/* Deliberately small, so the whole file cannot arrive in one
+		 * read and the cursor has to be where it was left. */
+		char chunk[16];
+		char whole[1024];
+		size_t total = 0, got;
+		int reads = 0;
+
+		while ((got = alpm_pkg_changelog_read(chunk, sizeof(chunk),
+						      rival, cl)) > 0) {
+			reads++;
+			if (total + got < sizeof(whole)) {
+				memcpy(whole + total, chunk, got);
+				total += got;
+			}
+			if (reads > 200)
+				break;
+		}
+		whole[total] = '\0';
+
+		snprintf(buf, sizeof(buf), "%zu bytes over %d reads", total,
+			 reads);
+		check(reads > 1, "it took more than one read", buf);
+		check(strstr(whole, "first release of alpmrpc-rival") != NULL,
+		      "and the text came back whole", NULL);
+		check(strstr(whole, "and a third") != NULL,
+		      "including the last line, so nothing was lost between "
+		      "reads", NULL);
+
+		check(alpm_pkg_changelog_close(rival, cl) == 0,
+		      "alpm_pkg_changelog_close()", NULL);
+		/* The id is dropped when it closes, so this misses a lookup
+		 * rather than reaching a cursor libalpm has already freed. */
+		check(alpm_pkg_changelog_read(chunk, sizeof(chunk), rival, cl)
+		      == 0,
+		      "reading a closed cursor gets nothing", "the id is gone");
+	}
+
+	printf("\n-- the mtree, with this process's own libarchive --\n");
+	struct archive *mt = rival ? alpm_pkg_mtree_open(rival) : NULL;
+	check(mt != NULL, "alpm_pkg_mtree_open()", "a real struct archive");
+	if (mt) {
+		struct archive_entry *ent = NULL;
+		int entries = 0, rc2, saw_dir = 0;
+		long long txt_size = -1;
+		char last_path[512] = "";
+
+		while ((rc2 = alpm_pkg_mtree_next(rival, mt, &ent)) == 0) {
+			const char *path = archive_entry_pathname(ent);
+			entries++;
+			if (!path)
+				continue;
+			snprintf(last_path, sizeof(last_path), "%s", path);
+			if (!strcmp(path, "./usr/share/alpmrpc-scratch/"
+					  "alpmrpc-rival.txt"))
+				txt_size = (long long)archive_entry_size(ent);
+			if (!strcmp(path, "./usr/share")
+			    && archive_entry_filetype(ent) == AE_IFDIR)
+				saw_dir = 1;
+			if (entries > 100)
+				break;
+		}
+
+		snprintf(buf, sizeof(buf), "%d entries, last %s", entries,
+			 last_path);
+		check(entries > 1, "it walked the whole listing", buf);
+		check(rc2 == 1, "and stopped at the end, not on an error",
+		      NULL);
+
+		/* Read with libarchive's own accessors off an entry libarchive
+		 * built, which is why the stream travels rather than a set of
+		 * fields picked out here. */
+		snprintf(buf, sizeof(buf), "%lld bytes", txt_size);
+		check(txt_size == 20, "a file's size survived the round trip",
+		      buf);
+		check(saw_dir, "and so did a directory's type", "./usr/share");
+
+		check(alpm_pkg_mtree_close(rival, mt) == 0,
+		      "alpm_pkg_mtree_close()", NULL);
+	}
+
+	if (h2)
+		alpm_release(h2);
 
 	printf("\n-- the connection survived all of it --\n");
 	check(events > 0, "events were delivered throughout", NULL);

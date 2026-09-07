@@ -70,6 +70,7 @@ void arpc_out_i64(arpc_res *rs, const char *name, long long v);
 unsigned char *arpc_arg_bytes(arpc_req *rq, int i, size_t *n);
 void arpc_out_bytes(arpc_res *rs, const char *name, const unsigned char *b,
                     size_t n);
+void arpc_ret_bytes(arpc_res *rs, const unsigned char *b, size_t n);
 
 /* Open the "ret" slot and hand back the writer, so generated code can emit a
  * composite value (an array, an object) straight into the response instead of
@@ -123,6 +124,11 @@ int  arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
 void arpc_cb_set_conn(arpc_conn *c);
 void arpc_cb_purge(uint64_t handle);
 int  arpc_cb_set(arpc_req *rq, arpc_res *rs);
+
+/* A package's whole mtree, as bytes. struct archive is a libarchive
+ * object the caller reads with libarchive, so it is materialised on the
+ * client rather than proxied; see src/server/arpc_mtree.c. */
+int  arpc_mtree_get(arpc_req *rq, arpc_res *rs);
 
 /* Set once a client has asked the server to exit. The accept loop checks it
  * after each connection closes, so an in-flight call always completes. */

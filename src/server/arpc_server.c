@@ -273,6 +273,14 @@ void arpc_ret_handle(arpc_res *rs, uint64_t id)
 	ajw_i64(&rs->out, (long long)id);
 }
 
+void arpc_ret_bytes(arpc_res *rs, const unsigned char *b, size_t n)
+{
+	char *enc = b ? arpc_b64_encode(b, n) : NULL;
+	set_ret(rs);
+	ajw_str(&rs->out, enc);         /* NULL stays null, not "" */
+	free(enc);
+}
+
 void arpc_ret_begin(arpc_res *rs)
 {
 	set_ret(rs);
@@ -408,6 +416,7 @@ char *arpc_handle_frame(const char *req, size_t len)
 	 * generated table. They still go through the same req/res path. */
 	static const arpc_method builtins[] = {
 		{ "arpc.set_callback", arpc_cb_set },
+		{ "arpc.mtree", arpc_mtree_get },
 		{ NULL, NULL }
 	};
 

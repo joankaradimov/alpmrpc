@@ -127,10 +127,17 @@ $VER:
   - and a third
 EOF
 
+	# The same listing makepkg puts in a package, written by the same tool.
+	# libalpm copies it into the local db entry and alpm_pkg_mtree_open
+	# reads it back.
+	( cd "$stage" && bsdtar -czf .MTREE --format=mtree \
+		--options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
+		.PKGINFO .INSTALL .CHANGELOG usr )
+
 	local file="$name-$VER-$ARCH.pkg.tar.zst"
 	# .PKGINFO first, which is where libalpm expects to find it.
 	bsdtar --zstd -cf "$WORK/$file" -C "$stage" \
-		.PKGINFO .INSTALL .CHANGELOG usr
+		.PKGINFO .INSTALL .CHANGELOG .MTREE usr
 
 	# Everything is in the repo, so it can be installed by name; only some
 	# of it is in the cache, so the rest has to be fetched.

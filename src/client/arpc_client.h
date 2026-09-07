@@ -1,8 +1,9 @@
 /* Client-side runtime that generated stubs are written against.
  *
- * Runs inside an arbitrary mingw/clang process, so it depends on nothing but
- * kernel32 and advapi32. It never loads anything from the MSYS2 tree into
- * this process -- the only contact with MSYS2 is a pipe.
+ * Runs inside an arbitrary mingw/clang process. The rule is that nothing from
+ * the MSYS2 tree is ever loaded into it -- the only contact with MSYS2 is a
+ * pipe. Ordinary mingw libraries are not a problem; libarchive is linked for
+ * the mtree stream, the same one a caller would be using.
  *
  * Handles are not proxied objects: an alpm_db_t* on this side is the server's
  * handle id cast to a pointer. Nothing ever dereferences it, NULL maps to id
@@ -107,6 +108,7 @@ void  arpc_cache_ptr(uint64_t owner, const char *key, void *ptr,
  * malloc'd buffer, or NULL if the field was null or malformed. */
 void arpc_put_bytes(arpc_call *c, const unsigned char *b, size_t n);
 unsigned char *arpc_out_bytes(arpc_call *c, const char *name, size_t *n);
+unsigned char *arpc_ret_bytes(arpc_call *c, size_t *n);
 
 /* List parameters, serialised from the caller's own list. */
 void arpc_put_str_list(arpc_call *c, const alpm_list_t *l);

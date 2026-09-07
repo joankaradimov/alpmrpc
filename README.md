@@ -10,9 +10,12 @@ callers reach it over a pipe.
 
     ucrt64 app ──> libalpm-14.dll ──named pipe──> alpmrpcd (MSYS2) ──> libalpm
 
-The client DLL is a drop-in shim exporting the `alpm_*` C ABI. It imports
-nothing but kernel32, advapi32 and the UCRT — no MSYS2 DLL is ever loaded
-into the calling process.
+The client DLL is a drop-in shim exporting the `alpm_*` C ABI. The rule it
+keeps is that **no MSYS2 DLL is ever loaded into the calling process** — the
+only contact with MSYS2 is the pipe. Ordinary mingw/ucrt64 libraries are
+fine, and it links libarchive for the same reason a caller would. That the
+import list stays short is a consequence of the architecture, not a target
+it is being held to.
 
 ## Building
 
@@ -108,11 +111,18 @@ everything else, why it is not.
   file. The header says `void`, so which kind of object it is — and therefore
   which tag guards it — is an overlay entry; after that it behaves like every
   other handle, and closing it drops the id so a later read misses instead of
-  reaching a cursor libalpm has already freed. mtree is deliberately *not*
-  declared this way: its open and close would work identically, but
-  `alpm_pkg_mtree_next` hands back a `struct archive_entry` the client has no
-  libarchive to read, so declaring the cursor would buy two thirds of an API
-  nobody could use.
+  reaching a cursor libalpm has already freed.
+- **An mtree is not proxied at all — it is parsed here.** `struct archive` is
+  a libarchive object whose entries a caller reads with `archive_entry_*`, so
+  there is no accessor for this bridge to sit in front of — the same problem
+  `alpm_list_t` has. The server sends the whole listing in one call and the
+  client parses it with its own libarchive into a real archive and real
+  entries, so anything the caller asks of them works. What travels is what
+  libarchive's mtree *writer* makes of what its mtree *reader* read: going out
+  through the same format it came in by keeps the mapping between mtree
+  keywords and `archive_entry` fields libarchive's business, so nothing here
+  enumerates which fields matter. Reading an mtree costs one round trip
+  instead of one per entry as a side effect.
 - **Bytes are not text.** A signature has NULs in it, so a JSON string would
   carry the first byte and stop. The three functions that deal in raw bytes
   send them base64 (`src/common/arpc_b64.c`), and the length that comes back
@@ -167,16 +177,15 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-168 of 193 functions are generated, plus 19 written by hand — the eighteen
-callback setters, getters and ctx getters, and `alpm_filelist_contains`.
+168 of 193 functions are generated, plus 22 written by hand — the eighteen
+callback setters, getters and ctx getters, `alpm_filelist_contains`, and the
+three mtree functions.
 
-That leaves six, and they are two reasons rather than a list. Three are the
-PGP signature-checking functions, refused because `alpm_siglist_t`'s element
-embeds an `alpm_pgpkey_t` whose `data` is the gpgme key itself; every other
-field would cross fine, which is exactly the trap. The other three are mtree,
-where `alpm_pkg_mtree_next` hands back a `struct archive_entry` and reading
-it would mean the shim depending on libarchive — which is the one thing this
-DLL is built not to do. `coverage.json` says so per function.
+That leaves three, all one reason: the PGP signature-checking functions, where
+`alpm_siglist_t`'s element embeds an `alpm_pgpkey_t` whose `data` is the gpgme
+key itself. Every other field would cross fine, which is exactly the trap — it
+would be a working function with one silently NULL member. `coverage.json`
+says so per function.
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to

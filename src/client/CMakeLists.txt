@@ -14,6 +14,7 @@ add_library(alpm SHARED
   arpc_client.c
   arpc_callbacks.c
   arpc_local.c
+  arpc_mtree.c
   vendor/alpm_list.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
@@ -27,13 +28,16 @@ target_include_directories(alpm PRIVATE
   ${ALPMRPC_GEN_DIR})
 
 target_compile_options(alpm PRIVATE -Wall -Wextra)
-target_link_libraries(alpm PRIVATE advapi32)
+# libarchive is the mingw/ucrt64 one, not MSYS2's: an mtree is a
+# libarchive stream and the caller reads its entries with libarchive,
+# so this DLL parses it with the same library the caller has.
+target_link_libraries(alpm PRIVATE advapi32 archive)
 
 set_target_properties(alpm PROPERTIES
   PREFIX "lib"
   OUTPUT_NAME "alpm-${ALPM_SOVERSION}"
-  # Deliberately no msys2 anything: this DLL is loaded into unrelated
-  # processes and must import nothing but kernel32/advapi32 and the CRT.
+  # This DLL is loaded into unrelated mingw/ucrt64 processes, so nothing
+  # from the MSYS2 tree may come with it. Ordinary mingw libraries are fine.
   IMPORT_SUFFIX ".dll.a"
   IMPORT_PREFIX "lib")
 set_target_properties(alpm PROPERTIES ARCHIVE_OUTPUT_NAME "alpm")
@@ -82,7 +86,8 @@ if(ALPMRPC_BUILD_TESTS)
     set_tests_properties(scratch_root PROPERTIES FIXTURES_SETUP scratch)
 
     add_executable(e2e_transaction ${_tests}/e2e_transaction.c)
-    target_link_libraries(e2e_transaction PRIVATE alpm)
+    # It reads mtree entries, so it links the same libarchive the DLL does.
+    target_link_libraries(e2e_transaction PRIVATE alpm archive)
     add_test(NAME e2e_transaction COMMAND e2e_transaction "${_scratch}")
     set_tests_properties(e2e_transaction PROPERTIES FIXTURES_REQUIRED scratch)
 
