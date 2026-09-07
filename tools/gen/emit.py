@@ -62,7 +62,10 @@ def short(c_type):
 
 
 def find_record(c_type):
-    base = c_type.replace("const", "").replace("*", "").strip()
+    # clang spells an elaborated type "union _alpm_event_t *"; the tag word
+    # is not part of the name.
+    base = c_type.replace("const", "").replace("*", "")
+    base = base.replace("union ", "").replace("struct ", "").strip()
     for cand in (base, "_" + base):
         if cand in RECORDS:
             if cand in OVERLAY.get("records_unsupported", {}):
@@ -292,14 +295,152 @@ def base_type(c_type):
     return c_type.replace("const", "").rstrip(" *").strip()
 
 
-def exported_record(name):
-    """Marshallers shared with the hand-written callback layer, which cannot
-    call a static in a generated file."""
-    return name in OVERLAY.get("export_helpers", {}).get("records", [])
+# --- callbacks -------------------------------------------------------------
 
 
-def exported_list(name):
-    return name in OVERLAY.get("export_helpers", {}).get("lists", [])
+def callbacks_of(model):
+    """The callbacks to generate, paired with what the overlay says about
+    them. Order is the wire's: an index into this list is the kind id both
+    sides use, so it comes from the model and not from a dict."""
+    spec = OVERLAY.get("callbacks", {})
+    out = []
+    for cb in model.get("callbacks", []):
+        if cb["name"] in spec:
+            out.append((cb, spec[cb["name"]]))
+        elif callback_setter(model, cb["name"]):
+            out.append((cb, {}))
+    if len(out) > 32:
+        raise SystemExit("emit: more callbacks than the registry's bitmask "
+                         "and arrays hold")
+    return out
+
+
+def callback_setter(model, cbname):
+    for fn in model["functions"]:
+        if not fn["name"].startswith("alpm_option_set_"):
+            continue
+        if any(p["kind"] == "callback" and p["c_type"] == cbname
+               for p in fn["params"]):
+            return fn
+    return None
+
+
+def callback_trio(model, cbname):
+    """Setter, getter and ctx getter, found by type rather than restated in
+    the overlay: the setter is the alpm_option_set_* that takes this callback,
+    the getter the alpm_option_get_* that returns it, and the ctx getter the
+    one named after the getter."""
+    setter = callback_setter(model, cbname)
+    getter = ctxgetter = None
+    for fn in model["functions"]:
+        if fn["name"].startswith("alpm_option_get_") \
+                and fn["ret"]["kind"] == "callback" \
+                and fn["ret"]["c_type"] == cbname:
+            getter = fn
+    if getter:
+        want = getter["name"] + "_ctx"
+        ctxgetter = next((f for f in model["functions"]
+                          if f["name"] == want), None)
+    return setter, getter, ctxgetter
+
+
+def cb_wire_name(setter):
+    """alpm_option_set_logcb -> log. The two sides derive it the same way, so
+    it is not something either of them has to be told."""
+    n = setter["name"][len("alpm_option_set_"):]
+    return n[:-2] if n.endswith("cb") else n
+
+
+def pretty_ctype(ct):
+    """clang spells an elaborated type "union _alpm_event_t *"; libalpm's own
+    name for it is the typedef, which is what generated code should say."""
+    for kw in ("union ", "struct "):
+        if ct.startswith(kw):
+            rest = ct[len(kw):]
+            return rest[1:] if rest.startswith("_") else rest
+    return ct
+
+
+def cb_union_record(cb, spec):
+    """The union a callback carries, and the parameter carrying it."""
+    pname = spec.get("union_param")
+    if not pname:
+        return None, None
+    p = next(x for x in cb["params"] if x["name"] == pname)
+    return p, find_record(p["c_type"])
+
+
+def cb_variant(member_c_type):
+    """A union member's own record."""
+    return find_record(member_c_type)
+
+
+def cb_check_tags(cb, spec, model, union_rec):
+    """Every value of the tag enum must be accounted for, and every mapping
+    must name something that exists. This is the whole point of stating the
+    mapping rather than writing the switch by hand: a variant added by a
+    later libalpm fails the build here instead of arriving empty.
+
+    The tag is a field of the union, or a sibling argument when the payload
+    is a bare void * -- the check is the same either way."""
+    if union_rec:
+        tag = union_rec["fields"][0]
+    else:
+        tag = next(x for x in cb["params"]
+                   if x["name"] == spec["tag_param"])
+    enum_name = tag.get("extra", {}).get("enum")
+    values = next((e["values"] for e in model["enums"]
+                   if e["name"] == enum_name), None)
+    if values is None:
+        raise SystemExit("emit: %s: nothing behind its tag %r"
+                         % (cb["name"], tag["name"]))
+
+    mapped = spec.get("members", spec.get("types", {}))
+    known = set(mapped) | set(spec.get("type_only", []))
+    missing = [v["name"] for v in values if v["name"] not in known]
+    if missing:
+        raise SystemExit(
+            "emit: %s: %d value(s) of %s are in neither the mapping nor "
+            "type_only in the overlay: %s.\nlibalpm has grown a variant; say "
+            "which payload it selects, or that it carries only its type."
+            % (cb["name"], len(missing), enum_name, ", ".join(missing)))
+
+    for val, m in mapped.items():
+        ok = ({f["name"] for f in union_rec["fields"]} if union_rec
+              else set(RECORDS) | {"_" + x for x in RECORDS})
+        if union_rec and m not in ok:
+            raise SystemExit("emit: %s: %s maps to %r, which is not a member "
+                             "of %s" % (cb["name"], val, m, union_rec["name"]))
+        if not union_rec and find_record(m) is None:
+            raise SystemExit("emit: %s: %s maps to %r, which is not a record"
+                             % (cb["name"], val, m))
+    return tag
+
+
+def cb_skipped_fields(spec, variant, union_rec):
+    """The fields of a variant that are not payload: the tag, which travels
+    once at the top, and the answer, which travels back rather than out.
+
+    The answer's position is derived and then checked, not assumed: libalpm
+    documents `any` as always safe to read, which is only true because every
+    variant begins with the same two fields."""
+    skip = {variant["fields"][0]["name"]}
+    ans = spec.get("answer")
+    if not ans:
+        return skip
+    anyrec = cb_variant(union_rec["fields"][1]["c_type"])
+    idx = next(i for i, f in enumerate(anyrec["fields"]) if f["name"] == ans)
+    if len(variant["fields"]) <= idx:
+        raise SystemExit("emit: %s has no field at the answer's position"
+                         % variant["name"])
+    slot = variant["fields"][idx]
+    if slot["kind"] != "scalar":
+        raise SystemExit("emit: %s.%s is where the answer aliases, but it is "
+                         "%s, not a scalar -- the aliasing libalpm documents "
+                         "no longer holds"
+                         % (variant["name"], slot["name"], slot["kind"]))
+    skip.add(slot["name"])
+    return skip
 
 
 def out_params_of(name):
@@ -315,9 +456,16 @@ def select(model):
     skip_map = {k: v for k, v in OVERLAY.get("skip", {}).items()
                 if not k.startswith("_")}
 
+    cb_api = callback_api_functions(model)
+
     gen, skipped = [], []
     for fn in model["functions"]:
         n = fn["name"]
+        if n in cb_api:
+            # Emitted by the callback emitter, from the same model. Not an
+            # ordinary call: registering one never reaches the server as
+            # itself, it goes as arpc.set_callback.
+            continue
         if n in skip_map:
             skipped.append((n, skip_map[n]))
             continue
@@ -414,7 +562,7 @@ def select(model):
         if missing:
             raise SystemExit("emit: allowlist names functions that were not "
                              "generatable: " + ", ".join(sorted(missing)))
-    return gen, skipped
+    return gen, skipped, sorted(cb_api)
 
 
 def _close_over_records(queue):
@@ -462,9 +610,9 @@ def records_input(gen):
     return _close_over_records(queue)
 
 
-def records_needed(gen):
+def records_needed(gen, extra=()):
     """Every record the server writes and the client reads, transitively."""
-    need, queue = {}, []
+    need, queue = {}, list(extra)
     for fn in gen:
         e = ret_elem(fn["name"])
         if e and e["kind"] == "record":
@@ -829,7 +977,204 @@ def emit_pkg_batch(gen):
     return "".join(o)
 
 
-def emit_server(gen, need, rin, src_header):
+def cb_seed_records(model):
+    """Records a callback payload refers to but nothing else does.
+
+    Not the variants themselves -- their fields are emitted inline, so a
+    materialiser for one would go unused. What is needed is whatever their
+    fields point at: the alpm_depend_t inside a conflict question, say."""
+    seeds = []
+    for cb, spec in callbacks_of(model):
+        up, urec = cb_union_record(cb, spec)
+        variants = []
+        if urec:
+            for member in set(spec.get("members", {}).values()):
+                variants.append(cb_variant(
+                    next(f["c_type"] for f in urec["fields"]
+                         if f["name"] == member)))
+        for tname in spec.get("types", {}).values():
+            variants.append(find_record(tname))
+        for v in variants:
+            for f in (v["fields"] if v else []):
+                if f["kind"] == "struct_ptr":
+                    seeds.append(elem_of(f["c_type"]))
+                elif f["kind"] == "list":
+                    seeds.append(field_list_elem(v["name"], f["name"]))
+    return [s for s in seeds if s and s["kind"] == "record"]
+
+
+def callback_api_functions(model):
+    """The setters, getters and ctx getters. They are generated -- by the
+    callback emitter rather than the ordinary one -- so they are neither
+    emitted as normal calls nor reported as skipped."""
+    names = set()
+    for cb, _ in callbacks_of(model):
+        for fn in callback_trio(model, cb["name"]):
+            if fn:
+                names.add(fn["name"])
+    return names
+
+
+def cb_validate(model):
+    """Check every tag value is accounted for before emitting anything, so a
+    libalpm that grew a variant fails here with a name rather than later with
+    a silence."""
+    for cb, spec in callbacks_of(model):
+        up, urec = cb_union_record(cb, spec)
+        if urec or spec.get("tag_param"):
+            cb_check_tags(cb, spec, model, urec)
+
+
+def emit_cb_server(model):
+    """The trampolines libalpm actually calls, and the table that installs
+    them. Written here rather than by hand because a payload is a struct
+    whose fields the model already has -- the only thing that was ever
+    hand-knowledge is which member a tag selects, and that is in the overlay
+    now, where it can be checked against the enum."""
+    cbs = callbacks_of(model)
+    o = ["\n/* ---- callback trampolines ----\n"
+         " *\n"
+         " * libalpm calls these from inside a call the client is waiting on."
+         "\n * They serialise their arguments and hand them to the transport,"
+         "\n * which sends them up the same pipe and blocks for the answer.\n"
+         " */\n\n"]
+
+    for i, (cb, spec) in enumerate(cbs):
+        o.append("#define ARPC_CB_%s %d\n"
+                 % (cb_wire_name(callback_setter(model, cb["name"])).upper(), i))
+    o.append("\n")
+
+    for cb, spec in cbs:
+        setter = callback_setter(model, cb["name"])
+        wire = cb_wire_name(setter)
+        rk = cb["ret"]["kind"]
+        rct = cb["ret"]["c_type"]
+        dflt = "0"
+        if rk != "void":
+            # A callback the caller answers: a dead pipe must give libalpm
+            # the answer that fails safe, and for a fetch that is an error
+            # rather than a download that did not happen.
+            dflt = "-1"
+
+        sig = ", ".join("%s %s" % (pretty_ctype(p["c_type"]), p["name"])
+                        for p in cb["params"])
+        o.append("static %s tr_%s(%s)\n{\n" % (rct, wire, sig))
+
+        ctxp = cb["params"][0]["name"]
+        o.append("\tuint64_t owner = (uint64_t)(uintptr_t)%s;\n" % ctxp)
+        o.append("\tif (!arpc_cb_wanted(owner, ARPC_CB_%s))\n\t\treturn%s;\n"
+                 % (wire.upper(), "" if rk == "void" else " " + dflt))
+
+        fmt = spec.get("format", {})
+        if fmt:
+            o.append("\t/* The va_list is consumed here; the text is what\n"
+                     "\t * travels, since a va_list cannot be marshalled. */\n")
+            o.append("\tchar arpc_msg[4096];\n")
+            for tgt, src in fmt.items():
+                o.append("\tvsnprintf(arpc_msg, sizeof(arpc_msg), %s, %s);\n"
+                         % (tgt, src))
+
+        # Named w, and a pointer, because that is what the field marshallers
+        # shared with the ordinary handlers write into.
+        o.append("\n\taj_w wbuf;\n\taj_w *w = &wbuf;\n"
+                 "\tajw_init(w);\n\tajw_obj_begin(w);\n")
+
+        up, urec = cb_union_record(cb, spec)
+        for p in cb["params"][1:]:
+            pn = p["name"]
+            if pn in fmt.values():
+                continue                # the va_list itself does not travel
+            if up and pn == up["name"]:
+                o.append(emit_cb_union_put(cb, spec, urec, pn))
+                continue
+            if pn == spec.get("payload_param"):
+                o.append(emit_cb_void_put(spec, pn))
+                continue
+            expr = "arpc_msg" if pn in fmt else pn
+            o.append("\tajw_key(w, %s);\n" % qq(pn))
+            srv_put_value(o, expr, p["kind"], p["c_type"], "owner", 1)
+
+        o.append("\tajw_obj_end(w);\n\n")
+        o.append("\tlong long r = arpc_cb_send(ARPC_CB_%s, owner, w, %s);\n"
+                 % (wire.upper(), dflt))
+        o.append("\tajw_free(w);\n")
+
+        ans = spec.get("answer")
+        if ans and up:
+            anym = urec["fields"][1]["name"]
+            o.append("\t/* Whatever the caller set is readable here whichever\n"
+                     "\t * variant arrived: the aliasing libalpm documents. */\n")
+            o.append("\t%s->%s.%s = (int)r;\n" % (up["name"], anym, ans))
+        if rk == "void":
+            o.append("\t(void)r;\n")
+        else:
+            o.append("\treturn (%s)r;\n" % rct)
+        o.append("}\n\n")
+
+    for cb, spec in cbs:
+        wire = cb_wire_name(callback_setter(model, cb["name"]))
+        o.append("static int install_%s(void *h, int on, void *ctx)\n{\n"
+                 % wire)
+        o.append("\treturn %s((alpm_handle_t *)h, on ? tr_%s : NULL, ctx);\n}\n\n"
+                 % (callback_setter(model, cb["name"])["name"], wire))
+
+    o.append("const arpc_cb_kind arpc_cb_kinds[] = {\n")
+    for cb, spec in cbs:
+        wire = cb_wire_name(callback_setter(model, cb["name"]))
+        o.append("\t{ " + qq(wire) + ", install_%s },\n" % wire)
+    o.append("\t{ NULL, NULL }\n};\n\n")
+    return "".join(o)
+
+
+def emit_cb_union_put(cb, spec, urec, pn):
+    """The tag, then whatever the tag says is live."""
+    o = []
+    tag = urec["fields"][0]["name"]
+    o.append("\tajw_key(w, %s);\n\tajw_i64(w, (long long)%s->%s);\n"
+             % (qq(tag), pn, tag))
+    o.append("\tswitch (%s->%s) {\n" % (pn, tag))
+
+    by_member = {}
+    for val, member in spec.get("members", {}).items():
+        by_member.setdefault(member, []).append(val)
+
+    for member, vals in by_member.items():
+        variant = cb_variant(next(f["c_type"] for f in urec["fields"]
+                                  if f["name"] == member))
+        for v in sorted(vals):
+            o.append("\tcase %s:\n" % v)
+        skip = cb_skipped_fields(spec, variant, urec)
+        for f in variant["fields"]:
+            if f["name"] in skip:
+                continue
+            o.append("\t\tajw_key(w, %s);\n" % qq(f["name"]))
+            srv_put_value(o, "%s->%s.%s" % (pn, member, f["name"]),
+                          f["kind"], f["c_type"], "owner", 2,
+                          variant["name"], f["name"])
+        o.append("\t\tbreak;\n")
+    o.append("\tdefault:\n\t\tbreak;\t/* carries only its type */\n\t}\n")
+    return "".join(o)
+
+
+def emit_cb_void_put(spec, pn):
+    """A payload whose type is named by a sibling argument rather than by a
+    tag inside it, so there is nothing to work out -- libalpm says which."""
+    o = ["\tswitch (%s) {\n" % spec["tag_param"]]
+    for val, tname in spec.get("types", {}).items():
+        rec = find_record(tname)
+        o.append("\tcase %s: {\n" % val)
+        o.append("\t\tconst %s *v = (const %s *)%s;\n" % (tname, tname, pn))
+        o.append("\t\tif (v) {\n")
+        for f in rec["fields"]:
+            o.append("\t\t\tajw_key(w, %s);\n" % qq(f["name"]))
+            srv_put_value(o, "v->" + f["name"], f["kind"], f["c_type"],
+                          "owner", 3, rec["name"], f["name"])
+        o.append("\t\t}\n\t\tbreak;\n\t}\n")
+    o.append("\tdefault:\n\t\tbreak;\n\t}\n")
+    return "".join(o)
+
+
+def emit_server(model, gen, need, rin, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_server.h"\n')
     o.append("#include <alpm.h>\n#include <alpm_list.h>\n"
@@ -1116,6 +1461,7 @@ def emit_server(gen, need, rin, src_header):
 
         o.append("\treturn 0;\n}\n\n")
 
+    o.append(emit_cb_server(model))
     o.append(emit_pkg_batch(gen))
 
     o.append("const arpc_method arpc_methods[] = {\n")
@@ -1290,7 +1636,223 @@ def elem_free_fn(e):
     return "free_" + e["name"]
 
 
-def emit_client(gen, need, rin, src_header):
+def emit_cb_client(model):
+    """The caller's side: the six setters, their getters and ctx getters, and
+    one dispatcher per callback that rebuilds the payload and calls the
+    function pointer this process is holding."""
+    cbs = callbacks_of(model)
+    o = ["\n/* ---- callbacks ----\n"
+         " *\n"
+         " * A callback fires on the server, inside a call this process is\n"
+         " * waiting on. The frame loop hands it here, where the payload is\n"
+         " * rebuilt and the caller's own function pointer is called.\n"
+         " */\n\n"]
+
+    for i, (cb, spec) in enumerate(cbs):
+        o.append("#define ARPC_CB_%s %d\n"
+                 % (cb_wire_name(callback_setter(model, cb["name"])).upper(), i))
+    o.append("\n")
+
+    for cb, spec in cbs:
+        setter, getter, ctxgetter = callback_trio(model, cb["name"])
+        wire = cb_wire_name(setter)
+        K = "ARPC_CB_" + wire.upper()
+        cbt = cb["name"]
+
+        o.append("int %s(alpm_handle_t * handle, %s cb, void * ctx)\n{\n"
+                 % (setter["name"], cbt))
+        o.append("\treturn arpc_cb_register(ARPC_ID(handle), %s, " % K
+                 + qq(wire) + ",\n\t\t\t\t(void (*)(void))cb, ctx);\n}\n\n")
+
+        if getter:
+            o.append("%s %s(alpm_handle_t * handle)\n{\n"
+                     % (cbt, getter["name"]))
+            o.append("\treturn (%s)arpc_cb_fn(ARPC_ID(handle), %s);\n}\n\n"
+                     % (cbt, K))
+        if ctxgetter:
+            o.append("/* Never asked the server: the pointer is the caller's\n"
+                     " * own and has not left this process. */\n")
+            o.append("void * %s(alpm_handle_t * handle)\n{\n"
+                     % ctxgetter["name"])
+            o.append("\treturn arpc_cb_ctx(ARPC_ID(handle), %s);\n}\n\n" % K)
+
+    for cb, spec in cbs:
+        o.append(emit_cb_dispatch(model, cb, spec))
+
+    o.append("const arpc_cb_kind arpc_cb_kinds[] = {\n")
+    for cb, spec in cbs:
+        wire = cb_wire_name(callback_setter(model, cb["name"]))
+        o.append("\t{ " + qq(wire) + ", call_%s },\n" % wire)
+    o.append("\t{ NULL, NULL }\n};\n\n")
+    return "".join(o)
+
+
+def emit_cb_dispatch(model, cb, spec):
+    setter = callback_setter(model, cb["name"])
+    wire = cb_wire_name(setter)
+    o = ["static long long call_%s(void (*fn)(void), void *ctx,\n"
+         "\t\t\tconst aj_doc *d, int args)\n{\n" % wire]
+
+    up, urec = cb_union_record(cb, spec)
+    fmt = spec.get("format", {})
+
+    # Locals: the union or payload struct, plus anything materialised for a
+    # field that owns memory. Declared up front because a switch case cannot.
+    temps = []
+    if up:
+        # libalpm's own typedef, not clang's elaborated spelling of it.
+        base = urec["name"].lstrip("_")
+        o.append("\t%s %s;\n\tmemset(&%s, 0, sizeof(%s));\n"
+                 % (base, up["name"], up["name"], up["name"]))
+        for member in sorted(set(spec.get("members", {}).values())):
+            variant = cb_variant(next(f["c_type"] for f in urec["fields"]
+                                      if f["name"] == member))
+            skip = cb_skipped_fields(spec, variant, urec)
+            for f in variant["fields"]:
+                if f["name"] in skip:
+                    continue
+                if f["kind"] == "struct_ptr":
+                    sub = elem_of(f["c_type"])
+                    t = "t_%s_%s" % (member, f["name"])
+                    o.append("\t%s %s = NULL;\n" % (f["c_type"], t))
+                    temps.append((t, "free_" + sub["name"], None))
+                elif f["kind"] == "list":
+                    sub = field_list_elem(variant["name"], f["name"])
+                    t = "t_%s_%s" % (member, f["name"])
+                    o.append("\talpm_list_t *%s = NULL;\n" % t)
+                    temps.append((t, None, elem_free_fn(sub)))
+    for tname in spec.get("types", {}).values():
+        o.append("\t%s v_%s;\n" % (tname, short(tname)))
+    if spec.get("types"):
+        o.append("\tvoid *%s = NULL;\n" % spec["payload_param"])
+
+    # Plain parameters straight off the frame.
+    for p in cb["params"][1:]:
+        pn = p["name"]
+        if up and pn == up["name"]:
+            continue
+        if pn == spec.get("payload_param"):
+            continue
+        if pn in fmt.values():
+            continue
+        node = "aj_member(d, args, %s)" % qq(pn)
+        if p["kind"] == "string":
+            o.append("\tconst char *%s = aj_str(d, %s, NULL);\n" % (pn, node))
+        else:
+            o.append("\t%s %s = (%s)aj_i64(d, %s, 0);\n"
+                     % (p["c_type"], pn, p["c_type"], node))
+
+    if up:
+        o.append(emit_cb_union_fill(spec, urec, up["name"]))
+    if spec.get("types"):
+        o.append(emit_cb_void_fill(spec))
+
+    # The call itself.
+    args = []
+    for p in cb["params"]:
+        pn = p["name"]
+        if p is cb["params"][0]:
+            args.append("ctx")
+        elif up and pn == up["name"]:
+            args.append("&" + pn)
+        elif pn in fmt.values():
+            args.append(None)           # consumed; handled below
+        else:
+            args.append(pn)
+    args = [a for a in args if a is not None]
+
+    if fmt:
+        # alpm_cb_log wants a va_list and there is no portable way to build
+        # one but to be variadic, so the transport owns that trampoline.
+        o.append("\tarpc_cb_log_via(fn, %s);\n" % ", ".join(args))
+    elif cb["ret"]["kind"] == "void":
+        o.append("\t((%s)fn)(%s);\n" % (cb["name"], ", ".join(args)))
+    else:
+        o.append("\t%s r = ((%s)fn)(%s);\n"
+                 % (cb["ret"]["c_type"], cb["name"], ", ".join(args)))
+
+    for t, freefn, elemfree in temps:
+        if freefn:
+            o.append("\t%s(%s);\n" % (freefn, t))
+        else:
+            o.append("\tarpc_free_list(%s, %s);\n" % (t, elemfree))
+
+    ans = spec.get("answer")
+    if ans and up:
+        o.append("\t/* Read back through `any`, which is safe whichever\n"
+                 "\t * variant this was. */\n")
+        o.append("\treturn %s.%s.%s;\n"
+                 % (up["name"], urec["fields"][1]["name"], ans))
+    elif cb["ret"]["kind"] != "void":
+        o.append("\treturn (long long)r;\n")
+    else:
+        o.append("\treturn 0;\n")
+    o.append("}\n\n")
+    return "".join(o)
+
+
+def emit_cb_union_fill(spec, urec, pn):
+    o = []
+    tag = urec["fields"][0]
+    o.append("\t%s.%s = (%s)aj_i64(d, aj_member(d, args, %s), 0);\n"
+             % (pn, tag["name"], tag["c_type"], qq(tag["name"])))
+    o.append("\tswitch (%s.%s) {\n" % (pn, tag["name"]))
+
+    by_member = {}
+    for val, member in spec.get("members", {}).items():
+        by_member.setdefault(member, []).append(val)
+
+    for member, vals in by_member.items():
+        variant = cb_variant(next(f["c_type"] for f in urec["fields"]
+                                  if f["name"] == member))
+        for v in sorted(vals):
+            o.append("\tcase %s:\n" % v)
+        skip = cb_skipped_fields(spec, variant, urec)
+        for f in variant["fields"]:
+            if f["name"] in skip:
+                continue
+            node = "aj_member(d, args, %s)" % qq(f["name"])
+            tgt = "%s.%s.%s" % (pn, member, f["name"])
+            if f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                t = "t_%s_%s" % (member, f["name"])
+                o.append("\t\t%s = (%s)get_%s(d, %s);\n"
+                         % (t, f["c_type"], sub["name"], node))
+                o.append("\t\t%s = %s;\n" % (tgt, t))
+            elif f["kind"] == "list":
+                sub = field_list_elem(variant["name"], f["name"])
+                t = "t_%s_%s" % (member, f["name"])
+                o.append("\t\t%s = build_list_%s(d, %s);\n"
+                         % (t, sub["name"], node))
+                o.append("\t\t%s = %s;\n" % (tgt, t))
+            elif f["kind"] == "string":
+                # Points into the parsed frame, which outlives the callback.
+                o.append("\t\t%s = aj_str(d, %s, NULL);\n" % (tgt, node))
+            else:
+                cli_get_value(o, tgt, f["kind"], f["c_type"], node, 2,
+                              variant["name"], f["name"])
+        o.append("\t\tbreak;\n")
+    o.append("\tdefault:\n\t\tbreak;\n\t}\n")
+    return "".join(o)
+
+
+def emit_cb_void_fill(spec):
+    o = ["\tswitch (%s) {\n" % spec["tag_param"]]
+    for val, tname in spec.get("types", {}).items():
+        rec = find_record(tname)
+        nick = short(tname)
+        o.append("\tcase %s:\n" % val)
+        o.append("\t\tmemset(&v_%s, 0, sizeof(v_%s));\n" % (nick, nick))
+        for f in rec["fields"]:
+            node = "aj_member(d, args, %s)" % qq(f["name"])
+            cli_get_value(o, "v_%s.%s" % (nick, f["name"]), f["kind"],
+                          f["c_type"], node, 2, rec["name"], f["name"])
+        o.append("\t\t%s = &v_%s;\n\t\tbreak;\n" % (spec["payload_param"], nick))
+    o.append("\tdefault:\n\t\tbreak;\n\t}\n")
+    return "".join(o)
+
+
+def emit_client(model, gen, need, rin, src_header):
     elems = collect_elems(gen, need)
     o = [BANNER % src_header]
     o.append('#include "arpc_client.h"\n')
@@ -1586,6 +2148,8 @@ def emit_client(gen, need, rin, src_header):
             teardown()
             o.append("\treturn r;\n")
         o.append("}\n\n")
+
+    o.append(emit_cb_client(model))
     return "".join(o)
 
 
@@ -1634,14 +2198,17 @@ def main():
               "libalpm: %s (expected %s). Re-verify ownership before shipping."
               % (sorted(owned), sorted(expected)), file=sys.stderr)
 
-    gen, skipped = select(model)
-    need = records_needed(gen)
+    cb_validate(model)
+    gen, skipped, cb_api = select(model)
+    need = records_needed(gen, cb_seed_records(model))
     rin = records_input(gen)
     os.makedirs(a.outdir, exist_ok=True)
 
     files = (
-        ("arpc_dispatch.c", emit_server(gen, need, rin, model["header"])),
-        ("arpc_stubs.c", emit_client(gen, need, rin, model["header"])),
+        ("arpc_dispatch.c", emit_server(model, gen, need, rin,
+                                       model["header"])),
+        ("arpc_stubs.c", emit_client(model, gen, need, rin,
+                                    model["header"])),
         ("arpc_handle_tags.h", emit_handle_tags(model)),
     )
     for name, text in files:
@@ -1652,7 +2219,8 @@ def main():
     for _, why in skipped:
         reasons[why] = reasons.get(why, 0) + 1
     report = {
-        "generated": len(gen),
+        "generated": len(gen) + len(cb_api),
+        "generated_callback_api": cb_api,
         "total": len(model["functions"]),
         "records_materialised": sorted(e["record"]["name"] for e in need),
         # Record names start with an underscore, so a leading one cannot be

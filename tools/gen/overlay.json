@@ -124,8 +124,10 @@
     "alpm_extract_keyid.keys": "char *"
   },
   "record_list_elem": {
-    "_comment": "Element type of alpm_list_t* fields inside transparent structs.",
-    "_alpm_group_t.packages": "alpm_pkg_t *"
+    "_comment": "Element type of alpm_list_t* fields inside transparent structs, including the callback union variants.",
+    "_alpm_group_t.packages": "alpm_pkg_t *",
+    "_alpm_question_remove_pkgs_t.packages": "alpm_pkg_t *",
+    "_alpm_question_select_provider_t.providers": "alpm_pkg_t *"
   },
   "functions": {
     "alpm_initialize": {
@@ -210,25 +212,7 @@
     }
   },
   "skip": {
-    "_comment": "Implemented by hand in arpc_callbacks.c on both sides. Each callback has its own payload shape, so this is six specific things rather than a family the emitter could generate. The ctx getters go with them: the pointer never leaves the client, so there is nothing to ask the server for.",
-    "alpm_option_set_logcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_set_dlcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_set_fetchcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_set_eventcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_set_questioncb": "hand-written in arpc_callbacks.c",
-    "alpm_option_set_progresscb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_logcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_dlcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_fetchcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_eventcb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_questioncb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_progresscb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_logcb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_dlcb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_fetchcb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_eventcb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_questioncb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_progresscb_ctx": "hand-written in arpc_callbacks.c",
+    "_comment": "Implemented by hand rather than generated, with the file each lives in. The callbacks used to be here; they are generated now, from the model plus the tag mappings in `callbacks` below.",
     "alpm_filelist_contains": "hand-written in arpc_local.c",
     "alpm_pkg_mtree_open": "hand-written in arpc_mtree.c",
     "alpm_pkg_mtree_next": "hand-written in arpc_mtree.c",
@@ -330,6 +314,103 @@
     ],
     "alpm_logaction": "fmt"
   },
+  "callbacks": {
+    "_comment": [
+      "What a callback's signature cannot say. The setter, getter and ctx",
+      "getter are not restated here -- they are found in the model by type --",
+      "and the wire name is the setter's, minus alpm_option_set_ and cb.",
+      "",
+      "The tagged unions are the whole difficulty. Which member is live",
+      "depends on a tag value, and C cannot write that down; getting it wrong",
+      "means reading a pointer out of a member libalpm never filled. Every",
+      "value of the tag enum has to appear here, mapped or in type_only, and",
+      "emit.py fails the build if one does not. That is what stops a variant",
+      "added in a later libalpm from arriving silently empty.",
+      "",
+      "Where these mappings come from: alpm.h names the struct in its own doc",
+      "comment for six event types; hook, hook_run and pkg_retrieve are taken",
+      "from what pacman's frontend reads for them, since libalpm must fill",
+      "whatever the reference reader consumes. The DONE variants share their",
+      "START's member because hook.c reuses the struct it already populated."
+    ],
+    "alpm_cb_log": {
+      "format": {
+        "fmt": "args"
+      },
+      "doc": "The va_list cannot be marshalled, so the server consumes it into fmt and the text travels. args is a char* on Cygwin, which is exactly why this must be stated rather than inferred."
+    },
+    "alpm_cb_event": {
+      "union_param": "event",
+      "members": {
+        "ALPM_EVENT_PACKAGE_OPERATION_START": "package_operation",
+        "ALPM_EVENT_PACKAGE_OPERATION_DONE": "package_operation",
+        "ALPM_EVENT_OPTDEP_REMOVAL": "optdep_removal",
+        "ALPM_EVENT_SCRIPTLET_INFO": "scriptlet_info",
+        "ALPM_EVENT_DATABASE_MISSING": "database_missing",
+        "ALPM_EVENT_PACNEW_CREATED": "pacnew_created",
+        "ALPM_EVENT_PACSAVE_CREATED": "pacsave_created",
+        "ALPM_EVENT_HOOK_START": "hook",
+        "ALPM_EVENT_HOOK_DONE": "hook",
+        "ALPM_EVENT_HOOK_RUN_START": "hook_run",
+        "ALPM_EVENT_HOOK_RUN_DONE": "hook_run",
+        "ALPM_EVENT_PKG_RETRIEVE_START": "pkg_retrieve"
+      },
+      "type_only": [
+        "ALPM_EVENT_CHECKDEPS_START",
+        "ALPM_EVENT_CHECKDEPS_DONE",
+        "ALPM_EVENT_FILECONFLICTS_START",
+        "ALPM_EVENT_FILECONFLICTS_DONE",
+        "ALPM_EVENT_RESOLVEDEPS_START",
+        "ALPM_EVENT_RESOLVEDEPS_DONE",
+        "ALPM_EVENT_INTERCONFLICTS_START",
+        "ALPM_EVENT_INTERCONFLICTS_DONE",
+        "ALPM_EVENT_TRANSACTION_START",
+        "ALPM_EVENT_TRANSACTION_DONE",
+        "ALPM_EVENT_INTEGRITY_START",
+        "ALPM_EVENT_INTEGRITY_DONE",
+        "ALPM_EVENT_LOAD_START",
+        "ALPM_EVENT_LOAD_DONE",
+        "ALPM_EVENT_DB_RETRIEVE_START",
+        "ALPM_EVENT_DB_RETRIEVE_DONE",
+        "ALPM_EVENT_DB_RETRIEVE_FAILED",
+        "ALPM_EVENT_PKG_RETRIEVE_DONE",
+        "ALPM_EVENT_PKG_RETRIEVE_FAILED",
+        "ALPM_EVENT_DISKSPACE_START",
+        "ALPM_EVENT_DISKSPACE_DONE",
+        "ALPM_EVENT_KEYRING_START",
+        "ALPM_EVENT_KEYRING_DONE",
+        "ALPM_EVENT_KEY_DOWNLOAD_START",
+        "ALPM_EVENT_KEY_DOWNLOAD_DONE"
+      ]
+    },
+    "alpm_cb_question": {
+      "union_param": "question",
+      "answer": "answer",
+      "doc": "Every variant is {type, <answer>, ...payload}: the aliasing libalpm documents when it says `any` is always safe. emit.py checks that shape against each variant rather than trusting it.",
+      "members": {
+        "ALPM_QUESTION_INSTALL_IGNOREPKG": "install_ignorepkg",
+        "ALPM_QUESTION_REPLACE_PKG": "replace",
+        "ALPM_QUESTION_CONFLICT_PKG": "conflict",
+        "ALPM_QUESTION_CORRUPTED_PKG": "corrupted",
+        "ALPM_QUESTION_REMOVE_PKGS": "remove_pkgs",
+        "ALPM_QUESTION_SELECT_PROVIDER": "select_provider",
+        "ALPM_QUESTION_IMPORT_KEY": "import_key"
+      },
+      "type_only": []
+    },
+    "alpm_cb_download": {
+      "tag_param": "event",
+      "payload_param": "data",
+      "doc": "Not a union: a void* whose type is named by a sibling argument, so libalpm states which it is passing instead of leaving a tag to be read out of the thing itself.",
+      "types": {
+        "ALPM_DOWNLOAD_INIT": "alpm_download_event_init_t",
+        "ALPM_DOWNLOAD_PROGRESS": "alpm_download_event_progress_t",
+        "ALPM_DOWNLOAD_RETRY": "alpm_download_event_retry_t",
+        "ALPM_DOWNLOAD_COMPLETED": "alpm_download_event_completed_t"
+      },
+      "type_only": []
+    }
+  },
   "records_counted_array": {
     "_comment": [
       "A count plus a pointer to N elements, rather than a pointer to one.",
@@ -339,8 +420,14 @@
       "off the array field, so it does not need saying twice.",
       "These cross as a plain array; its length is the count."
     ],
-    "_alpm_filelist_t": { "count": "count", "items": "files" },
-    "_alpm_siglist_t": { "count": "count", "items": "results" }
+    "_alpm_filelist_t": {
+      "count": "count",
+      "items": "files"
+    },
+    "_alpm_siglist_t": {
+      "count": "count",
+      "items": "results"
+    }
   },
   "record_fields_uncarried": {
     "_comment": [

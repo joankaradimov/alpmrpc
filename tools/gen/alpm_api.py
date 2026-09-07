@@ -143,7 +143,7 @@ def extract(header, args):
                          "that did not parse cleanly")
 
     hdr_real = os.path.realpath(header)
-    funcs, records, enums = [], [], []
+    funcs, records, enums, callbacks = [], [], [], []
 
     for c in tu.cursor.get_children():
         if not c.location.file:
@@ -170,7 +170,11 @@ def extract(header, args):
                 "params": params,
             })
 
-        elif c.kind == cx.CursorKind.STRUCT_DECL and c.is_definition():
+        # A union is a record whose members overlap. Which one is live is not
+        # something clang can say -- that is the overlay's business -- but the
+        # members and their types are exactly a record's fields.
+        elif c.kind in (cx.CursorKind.STRUCT_DECL,
+                        cx.CursorKind.UNION_DECL) and c.is_definition():
             fields = []
             for f in c.get_children():
                 if f.kind != cx.CursorKind.FIELD_DECL:
@@ -178,7 +182,36 @@ def extract(header, args):
                 fk, fx = classify(f.type)
                 fields.append({"name": f.spelling, "c_type": f.type.spelling,
                                "kind": fk, **({"extra": fx} if fx else {})})
-            records.append({"name": c.spelling, "fields": fields})
+            records.append({"name": c.spelling, "fields": fields,
+                            "union": c.kind == cx.CursorKind.UNION_DECL})
+
+        # A callback is a function pointer typedef. Its signature is the
+        # whole of what a trampoline has to marshal, and clang has it -- the
+        # parameter names included, which the type alone does not carry.
+        elif c.kind == cx.CursorKind.TYPEDEF_DECL:
+            uc = c.underlying_typedef_type.get_canonical()
+            if uc.kind != cx.TypeKind.POINTER:
+                continue
+            proto = uc.get_pointee()
+            if proto.kind != cx.TypeKind.FUNCTIONPROTO:
+                continue
+            names = [p.spelling for p in c.get_children()
+                     if p.kind == cx.CursorKind.PARM_DECL]
+            params = []
+            for i, at in enumerate(proto.argument_types()):
+                pk, px = classify(at)
+                params.append({
+                    "name": names[i] if i < len(names) else "arg%d" % i,
+                    "c_type": at.spelling, "kind": pk,
+                    **({"extra": px} if px else {}),
+                })
+            rk, rx = classify(proto.get_result())
+            callbacks.append({
+                "name": c.spelling,
+                "ret": {"c_type": proto.get_result().spelling, "kind": rk,
+                        **({"extra": rx} if rx else {})},
+                "params": params,
+            })
 
         elif c.kind == cx.CursorKind.ENUM_DECL and c.is_definition():
             enums.append({
@@ -189,7 +222,8 @@ def extract(header, args):
             })
 
     return {"header": header, "functions": funcs,
-            "records": records, "enums": enums}
+            "records": records, "enums": enums,
+            "callbacks": callbacks}
 
 
 def main():

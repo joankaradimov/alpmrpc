@@ -136,6 +136,33 @@ long long   arpc_pkg_field_i64(uint64_t id, const char *field);
 void arpc_dispatch_callback(const aj_doc *d, aj_w *reply);
 void arpc_callbacks_purge(uint64_t handle);
 
+/* The setters, getters and dispatchers are generated, one per callback.
+ * What stays here is the registry of the caller's own function pointers --
+ * which never leave this process -- and telling the server whether to
+ * install a trampoline at all.
+ *
+ * Function pointers are held as void (*)(void) rather than void *: any
+ * function pointer converts to any other and back, which is not true of an
+ * object pointer. */
+int   arpc_cb_register(uint64_t handle, int kind, const char *wire,
+                       void (*fn)(void), void *ctx);
+void (*arpc_cb_fn(uint64_t handle, int kind))(void);
+void *arpc_cb_ctx(uint64_t handle, int kind);
+
+/* alpm_cb_log takes a va_list and there is no portable way to build one
+ * except by being variadic, so the one trampoline that needs it lives here.
+ * The server already formatted the text; this hands it over as a literal
+ * format string, which is what it would have produced anyway. */
+void arpc_cb_log_via(void (*fn)(void), void *ctx, int level, const char *msg);
+
+typedef struct {
+	const char *name;
+	long long (*call)(void (*fn)(void), void *ctx, const aj_doc *d,
+	                  int args);
+} arpc_cb_kind;
+
+extern const arpc_cb_kind arpc_cb_kinds[];
+
 /* Diagnostics. ALPMRPC_TRACE=1 dumps every frame to stderr. */
 const char *arpc_last_error(void);
 

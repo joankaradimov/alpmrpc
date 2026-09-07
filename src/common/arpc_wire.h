@@ -17,7 +17,10 @@ extern "C" {
 /* Bumped on any incompatible protocol change. It is mixed into the pipe
  * name, so a stale server from an older build is simply never contacted
  * rather than contacted and misunderstood. */
-#define ARPC_PROTO_VERSION 1
+/* 2: the callback wire names are derived from their setters now that both
+ * sides generate them, so the download callback travels as "dl" rather than
+ * "download". */
+#define ARPC_PROTO_VERSION 2
 
 /* Refuse absurd frames rather than trying to allocate them. */
 #define ARPC_MAX_FRAME (64u * 1024u * 1024u)

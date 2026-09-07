@@ -1,10 +1,12 @@
-/* Client half of the callback bridge.
+/* Client half of the callback bridge: the transport, and nothing else.
  *
  * libalpm runs on the server, but the callbacks a caller registers are
  * function pointers in *this* process. A pointer cannot cross the wire, so
  * the server installs its own trampoline with libalpm and calls back up the
- * pipe when it fires; this file holds the real pointers and dispatches to
- * them.
+ * pipe when it fires. The setters, the getters and the per-callback
+ * dispatchers are generated; what is left here is the registry those
+ * pointers live in, telling the server whether to install a trampoline, and
+ * routing an arriving frame to the right dispatcher.
  *
  * Callbacks arrive while a call is outstanding -- that is the whole point,
  * since a question has to be answered before the commit that asked it can
@@ -18,23 +20,21 @@
 #include "arpc_client.h"
 
 #include <alpm.h>
-#include <alpm_list.h>
 
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* One registration per handle. libalpm keeps callbacks per alpm_handle_t, so
- * this mirrors that rather than keeping one global set. */
+/* One registration per handle, because libalpm keeps callbacks per
+ * alpm_handle_t. Fixed width rather than generated: the emitter refuses to
+ * emit more kinds than this holds. */
+#define ARPC_CB_SLOTS 32
+
 typedef struct reg {
 	struct reg *next;
 	uint64_t handle;
-	alpm_cb_log log;          void *log_ctx;
-	alpm_cb_progress progress; void *progress_ctx;
-	alpm_cb_event event;      void *event_ctx;
-	alpm_cb_question question; void *question_ctx;
-	alpm_cb_download dl;      void *dl_ctx;
-	alpm_cb_fetch fetch;      void *fetch_ctx;
+	void (*fn[ARPC_CB_SLOTS])(void);
+	void *ctx[ARPC_CB_SLOTS];
 } reg;
 
 static reg *g_regs;
@@ -87,97 +87,35 @@ static int set_remote(uint64_t handle, const char *which, int enabled)
 	return r;
 }
 
-/* ---- the setters and getters ---- */
-
-#define SETTER(fn, field, type, wire)                                        \
-	int fn(alpm_handle_t *handle, type cb, void *ctx)                    \
-	{                                                                    \
-		reg *r = reg_for(ARPC_ID(handle), 1);                        \
-		if (!r)                                                      \
-			return -1;                                           \
-		r->field = cb;                                               \
-		r->field##_ctx = ctx;                                        \
-		return set_remote(ARPC_ID(handle), wire, cb != NULL);        \
-	}
-
-#define GETTER(fn, field, type)                                              \
-	type fn(alpm_handle_t *handle)                                       \
-	{                                                                    \
-		reg *r = reg_for(ARPC_ID(handle), 0);                        \
-		return r ? r->field : NULL;                                  \
-	}
-
-SETTER(alpm_option_set_logcb, log, alpm_cb_log, "log")
-GETTER(alpm_option_get_logcb, log, alpm_cb_log)
-
-SETTER(alpm_option_set_progresscb, progress, alpm_cb_progress, "progress")
-GETTER(alpm_option_get_progresscb, progress, alpm_cb_progress)
-
-SETTER(alpm_option_set_eventcb, event, alpm_cb_event, "event")
-GETTER(alpm_option_get_eventcb, event, alpm_cb_event)
-
-SETTER(alpm_option_set_questioncb, question, alpm_cb_question, "question")
-GETTER(alpm_option_get_questioncb, question, alpm_cb_question)
-
-SETTER(alpm_option_set_dlcb, dl, alpm_cb_download, "download")
-GETTER(alpm_option_get_dlcb, dl, alpm_cb_download)
-
-SETTER(alpm_option_set_fetchcb, fetch, alpm_cb_fetch, "fetch")
-GETTER(alpm_option_get_fetchcb, fetch, alpm_cb_fetch)
-
-/* The ctx getters never had anything to ask the server: libalpm hands the
- * pointer straight back, and the pointer is this process's, held right here
- * beside the function pointer it belongs to. */
-#define CTX_GETTER(fn, field)                                                \
-	void *fn(alpm_handle_t *handle)                                      \
-	{                                                                    \
-		reg *r = reg_for(ARPC_ID(handle), 0);                        \
-		return r ? r->field##_ctx : NULL;                            \
-	}
-
-CTX_GETTER(alpm_option_get_logcb_ctx, log)
-CTX_GETTER(alpm_option_get_progresscb_ctx, progress)
-CTX_GETTER(alpm_option_get_eventcb_ctx, event)
-CTX_GETTER(alpm_option_get_questioncb_ctx, question)
-CTX_GETTER(alpm_option_get_dlcb_ctx, dl)
-CTX_GETTER(alpm_option_get_fetchcb_ctx, fetch)
-
-/* ---- dispatch ---- */
-
-/* A pointer inside an event or a question is an id, same as everywhere else,
- * so the caller can hand it straight to alpm_pkg_get_*. Id 0 is NULL, which
- * is what an install's absent oldpkg arrives as. */
-#define ID_TO_PKG(d, obj, key) 	((alpm_pkg_t *)(uintptr_t)aj_i64((d), aj_member((d), (obj), (key)), 0))
-
-static void fill_depend(alpm_depend_t *dep, const aj_doc *d, int n)
+int arpc_cb_register(uint64_t handle, int kind, const char *wire,
+		     void (*fn)(void), void *ctx)
 {
-	if (n < 0 || aj_is_null(d, n))
-		return;
-	/* Cast away const: alpm_depend_t holds char*, and these point into the
-	 * parsed frame, which outlives the callback. */
-	dep->name = (char *)aj_str(d, aj_member(d, n, "name"), NULL);
-	dep->version = (char *)aj_str(d, aj_member(d, n, "version"), NULL);
-	dep->desc = (char *)aj_str(d, aj_member(d, n, "desc"), NULL);
-	dep->name_hash = (unsigned long)
-		aj_i64(d, aj_member(d, n, "name_hash"), 0);
-	dep->mod = (alpm_depmod_t)aj_i64(d, aj_member(d, n, "mod"), 0);
+	reg *r = reg_for(handle, 1);
+	if (!r || kind < 0 || kind >= ARPC_CB_SLOTS)
+		return -1;
+	r->fn[kind] = fn;
+	r->ctx[kind] = ctx;
+	return set_remote(handle, wire, fn != NULL);
 }
 
-static alpm_list_t *id_list(const aj_doc *d, int arr)
+void (*arpc_cb_fn(uint64_t handle, int kind))(void)
 {
-	if (arr < 0 || aj_is_null(d, arr))
-		return NULL;
-	alpm_list_t *out = NULL;
-	for (int e = aj_first(d, arr); e >= 0; e = aj_next(d, e))
-		alpm_list_append(&out, (void *)(uintptr_t)aj_i64(d, e, 0));
-	return out;
+	reg *r = reg_for(handle, 0);
+	return (r && kind >= 0 && kind < ARPC_CB_SLOTS) ? r->fn[kind] : NULL;
+}
+
+void *arpc_cb_ctx(uint64_t handle, int kind)
+{
+	reg *r = reg_for(handle, 0);
+	return (r && kind >= 0 && kind < ARPC_CB_SLOTS) ? r->ctx[kind] : NULL;
 }
 
 /* alpm_cb_log wants a va_list, and there is no portable way to build one
  * except by being variadic. The server already did the formatting, so this
- * passes it straight through as the whole format string. */
-static void log_trampoline(alpm_cb_log cb, void *ctx, alpm_loglevel_t lvl,
-			   const char *fmt, ...)
+ * passes the result straight through as the whole format string -- the text
+ * it would have produced anyway. */
+static void log_shim(alpm_cb_log cb, void *ctx, alpm_loglevel_t lvl,
+		     const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -185,240 +123,13 @@ static void log_trampoline(alpm_cb_log cb, void *ctx, alpm_loglevel_t lvl,
 	va_end(ap);
 }
 
-/* The server formatted the message already: alpm_cb_log takes a va_list, and
- * a va_list cannot be marshalled. Handing the callback a pre-formatted "%s"
- * gives it the text it would have produced anyway. */
-static void call_log(reg *r, const aj_doc *d, int args)
+void arpc_cb_log_via(void (*fn)(void), void *ctx, int level, const char *msg)
 {
-	if (!r || !r->log)
-		return;
-	alpm_loglevel_t lvl =
-		(alpm_loglevel_t)aj_i64(d, aj_member(d, args, "level"), 0);
-	const char *msg = aj_str(d, aj_member(d, args, "msg"), "");
-	log_trampoline(r->log, r->log_ctx, lvl, "%s", msg);
+	log_shim((alpm_cb_log)fn, ctx, (alpm_loglevel_t)level, "%s",
+		 msg ? msg : "");
 }
 
-static void call_progress(reg *r, const aj_doc *d, int args)
-{
-	if (!r || !r->progress)
-		return;
-	r->progress(r->progress_ctx,
-		    (alpm_progress_t)aj_i64(d, aj_member(d, args, "progress"), 0),
-		    aj_str(d, aj_member(d, args, "pkg"), ""),
-		    (int)aj_i64(d, aj_member(d, args, "percent"), 0),
-		    (size_t)aj_i64(d, aj_member(d, args, "howmany"), 0),
-		    (size_t)aj_i64(d, aj_member(d, args, "current"), 0));
-}
-
-/* The download payload is picked by the event argument, not by a field in
- * it, so which struct to build is stated rather than inferred. */
-static void call_dl(reg *r, const aj_doc *d, int args)
-{
-	if (!r || !r->dl)
-		return;
-
-	alpm_download_event_type_t ev = (alpm_download_event_type_t)
-		aj_i64(d, aj_member(d, args, "event"), 0);
-	const char *filename = aj_str(d, aj_member(d, args, "filename"), NULL);
-
-	alpm_download_event_init_t init;
-	alpm_download_event_progress_t prog;
-	alpm_download_event_retry_t retry;
-	alpm_download_event_completed_t done;
-	void *data = NULL;
-
-	switch (ev) {
-	case ALPM_DOWNLOAD_INIT:
-		init.optional = (int)aj_i64(d, aj_member(d, args, "optional"), 0);
-		data = &init;
-		break;
-	case ALPM_DOWNLOAD_PROGRESS:
-		prog.downloaded = (off_t)
-			aj_i64(d, aj_member(d, args, "downloaded"), 0);
-		prog.total = (off_t)aj_i64(d, aj_member(d, args, "total"), 0);
-		data = &prog;
-		break;
-	case ALPM_DOWNLOAD_RETRY:
-		retry.resume = (int)aj_i64(d, aj_member(d, args, "resume"), 0);
-		data = &retry;
-		break;
-	case ALPM_DOWNLOAD_COMPLETED:
-		done.total = (off_t)aj_i64(d, aj_member(d, args, "total"), 0);
-		done.result = (int)aj_i64(d, aj_member(d, args, "result"), 0);
-		data = &done;
-		break;
-	}
-
-	r->dl(r->dl_ctx, filename, ev, data);
-}
-
-/* The caller does the downloading here, so this one has an answer that
- * matters: 0 fetched, 1 already current, -1 failed. */
-static long long call_fetch(reg *r, const aj_doc *d, int args)
-{
-	if (!r || !r->fetch)
-		return -1;
-	return r->fetch(r->fetch_ctx,
-			aj_str(d, aj_member(d, args, "url"), NULL),
-			aj_str(d, aj_member(d, args, "localpath"), NULL),
-			(int)aj_i64(d, aj_member(d, args, "force"), 0));
-}
-
-/* Rebuild the event and hand it to the caller.
- *
- * alpm_event_t is a union selected by its type, so this fills exactly the
- * member the server marshalled for that type and leaves the rest zeroed --
- * see the mapping and where it comes from in the server's arpc_callbacks.c.
- * A type that carried no payload arrives as a well-formed event with just
- * its type set, which is what libalpm raises for it.
- *
- * Strings point into the parsed frame, which outlives the callback, and an
- * absent one stays NULL rather than becoming "": a hook with no Description
- * has a NULL desc and callers test it. */
-static void call_event(reg *r, const aj_doc *d, int args)
-{
-	if (!r || !r->event)
-		return;
-
-	alpm_event_t e;
-	alpm_depend_t optdep;
-	memset(&e, 0, sizeof(e));
-	memset(&optdep, 0, sizeof(optdep));
-	e.type = (alpm_event_type_t)aj_i64(d, aj_member(d, args, "type"), 0);
-
-	switch (e.type) {
-	case ALPM_EVENT_PACKAGE_OPERATION_START:
-	case ALPM_EVENT_PACKAGE_OPERATION_DONE:
-		e.package_operation.operation = (alpm_package_operation_t)
-			aj_i64(d, aj_member(d, args, "operation"), 0);
-		e.package_operation.oldpkg = ID_TO_PKG(d, args, "oldpkg");
-		e.package_operation.newpkg = ID_TO_PKG(d, args, "newpkg");
-		break;
-	case ALPM_EVENT_OPTDEP_REMOVAL:
-		e.optdep_removal.pkg = ID_TO_PKG(d, args, "pkg");
-		fill_depend(&optdep, d, aj_member(d, args, "optdep"));
-		e.optdep_removal.optdep = &optdep;
-		break;
-	case ALPM_EVENT_SCRIPTLET_INFO:
-		e.scriptlet_info.line =
-			aj_str(d, aj_member(d, args, "line"), NULL);
-		break;
-	case ALPM_EVENT_DATABASE_MISSING:
-		e.database_missing.dbname =
-			aj_str(d, aj_member(d, args, "dbname"), NULL);
-		break;
-	case ALPM_EVENT_PACNEW_CREATED:
-		e.pacnew_created.from_noupgrade = (int)
-			aj_i64(d, aj_member(d, args, "from_noupgrade"), 0);
-		e.pacnew_created.oldpkg = ID_TO_PKG(d, args, "oldpkg");
-		e.pacnew_created.newpkg = ID_TO_PKG(d, args, "newpkg");
-		e.pacnew_created.file =
-			aj_str(d, aj_member(d, args, "file"), NULL);
-		break;
-	case ALPM_EVENT_PACSAVE_CREATED:
-		e.pacsave_created.oldpkg = ID_TO_PKG(d, args, "oldpkg");
-		e.pacsave_created.file =
-			aj_str(d, aj_member(d, args, "file"), NULL);
-		break;
-	case ALPM_EVENT_HOOK_START:
-	case ALPM_EVENT_HOOK_DONE:
-		e.hook.when = (alpm_hook_when_t)
-			aj_i64(d, aj_member(d, args, "when"), 0);
-		break;
-	case ALPM_EVENT_HOOK_RUN_START:
-	case ALPM_EVENT_HOOK_RUN_DONE:
-		e.hook_run.name = aj_str(d, aj_member(d, args, "name"), NULL);
-		e.hook_run.desc = aj_str(d, aj_member(d, args, "desc"), NULL);
-		e.hook_run.position = (size_t)
-			aj_i64(d, aj_member(d, args, "position"), 0);
-		e.hook_run.total = (size_t)
-			aj_i64(d, aj_member(d, args, "total"), 0);
-		break;
-	case ALPM_EVENT_PKG_RETRIEVE_START:
-		e.pkg_retrieve.num = (size_t)
-			aj_i64(d, aj_member(d, args, "num"), 0);
-		e.pkg_retrieve.total_size = (off_t)
-			aj_i64(d, aj_member(d, args, "total_size"), 0);
-		break;
-	default:
-		break;
-	}
-
-	r->event(r->event_ctx, &e);
-}
-
-/* Rebuild the question, hand it to the caller, and read back what they set.
- *
- * Every variant begins {type; int <answer>; ...}, so the answer is readable
- * through q.any.answer whichever one this is -- the same aliasing libalpm
- * relies on. Pointers inside the question are ids cast to pointers, exactly
- * as everywhere else, so the caller can pass them straight to alpm_pkg_get_*. */
-static long long call_question(reg *r, const aj_doc *d, int args)
-{
-	if (!r || !r->question)
-		return 0;
-
-	alpm_question_t q;
-	memset(&q, 0, sizeof(q));
-	q.type = (alpm_question_type_t)aj_i64(d, aj_member(d, args, "type"), 0);
-
-	alpm_depend_t dep;
-	alpm_conflict_t cfl;
-	alpm_list_t *pkgs = NULL;
-	memset(&dep, 0, sizeof(dep));
-	memset(&cfl, 0, sizeof(cfl));
-
-	switch (q.type) {
-	case ALPM_QUESTION_INSTALL_IGNOREPKG:
-		q.install_ignorepkg.pkg = ID_TO_PKG(d, args, "pkg");
-		break;
-	case ALPM_QUESTION_REPLACE_PKG:
-		q.replace.oldpkg = ID_TO_PKG(d, args, "oldpkg");
-		q.replace.newpkg = ID_TO_PKG(d, args, "newpkg");
-		q.replace.newdb = (alpm_db_t *)(uintptr_t)
-			aj_i64(d, aj_member(d, args, "newdb"), 0);
-		break;
-	case ALPM_QUESTION_CONFLICT_PKG: {
-		int cn = aj_member(d, args, "conflict");
-		cfl.package1 = ID_TO_PKG(d, cn, "package1");
-		cfl.package2 = ID_TO_PKG(d, cn, "package2");
-		fill_depend(&dep, d, aj_member(d, cn, "reason"));
-		cfl.reason = &dep;
-		q.conflict.conflict = &cfl;
-		break;
-	}
-	case ALPM_QUESTION_CORRUPTED_PKG:
-		q.corrupted.filepath =
-			aj_str(d, aj_member(d, args, "filepath"), "");
-		q.corrupted.reason = (alpm_errno_t)
-			aj_i64(d, aj_member(d, args, "reason"), 0);
-		break;
-	case ALPM_QUESTION_REMOVE_PKGS:
-		pkgs = id_list(d, aj_member(d, args, "packages"));
-		q.remove_pkgs.packages = pkgs;
-		break;
-	case ALPM_QUESTION_SELECT_PROVIDER:
-		pkgs = id_list(d, aj_member(d, args, "providers"));
-		q.select_provider.providers = pkgs;
-		fill_depend(&dep, d, aj_member(d, args, "depend"));
-		q.select_provider.depend = &dep;
-		break;
-	case ALPM_QUESTION_IMPORT_KEY:
-		q.import_key.uid = aj_str(d, aj_member(d, args, "uid"), "");
-		q.import_key.fingerprint =
-			aj_str(d, aj_member(d, args, "fingerprint"), "");
-		break;
-	default:
-		break;
-	}
-
-	r->question(r->question_ctx, &q);
-
-	/* The strings above point into the parsed frame and the structs are on
-	 * this stack, so only the lists were allocated. */
-	alpm_list_free(pkgs);
-	return q.any.answer;
-}
+/* ---- dispatch ---- */
 
 void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 {
@@ -427,21 +138,16 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 	uint64_t handle = (uint64_t)aj_i64(d, aj_member(d, 0, "handle"), 0);
 	int args = aj_member(d, 0, "args");
 
-	reg *r = reg_for(handle, 0);
 	long long ret = 0;
-
-	if (!strcmp(which, "log"))
-		call_log(r, d, args);
-	else if (!strcmp(which, "progress"))
-		call_progress(r, d, args);
-	else if (!strcmp(which, "event"))
-		call_event(r, d, args);
-	else if (!strcmp(which, "question"))
-		ret = call_question(r, d, args);
-	else if (!strcmp(which, "download"))
-		call_dl(r, d, args);
-	else if (!strcmp(which, "fetch"))
-		ret = call_fetch(r, d, args);
+	for (int i = 0; arpc_cb_kinds[i].name; i++) {
+		if (strcmp(arpc_cb_kinds[i].name, which))
+			continue;
+		void (*fn)(void) = arpc_cb_fn(handle, i);
+		if (fn)
+			ret = arpc_cb_kinds[i].call(fn, arpc_cb_ctx(handle, i),
+						    d, args);
+		break;
+	}
 	/* An unknown callback is answered rather than ignored: the server is
 	 * blocked waiting, and a silent drop would deadlock the transaction. */
 

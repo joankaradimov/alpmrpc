@@ -125,6 +125,22 @@ void arpc_cb_set_conn(arpc_conn *c);
 void arpc_cb_purge(uint64_t handle);
 int  arpc_cb_set(arpc_req *rq, arpc_res *rs);
 
+/* The trampolines themselves are generated, one per callback, because a
+ * payload is a struct whose fields the model already has. They ask the
+ * transport only these two things. `kind` is an index into arpc_cb_kinds. */
+int       arpc_cb_wanted(uint64_t handle, int kind);
+long long arpc_cb_send(int kind, uint64_t handle, aj_w *args, long long dflt);
+
+/* Generated: the wire name of each callback and how to install its
+ * trampoline with libalpm. NULL-terminated. The handle is void * so this
+ * header does not have to pull in alpm.h. */
+typedef struct {
+	const char *name;
+	int (*install)(void *handle, int enabled, void *ctx);
+} arpc_cb_kind;
+
+extern const arpc_cb_kind arpc_cb_kinds[];
+
 /* A package's whole mtree, as bytes. struct archive is a libarchive
  * object the caller reads with libarchive, so it is materialised on the
  * client rather than proxied; see src/server/arpc_mtree.c. */

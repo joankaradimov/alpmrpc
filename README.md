@@ -36,10 +36,11 @@ drift from the library the server links against.
               tools/gen/overlay.json ─────┴──> arpc_handle_tags.h
 
 `tools/gen/overlay.json` is the only hand-maintained input: it records what a
-C header cannot express — pointer direction and list ownership. String
-ownership is *not* in it, because libalpm's const-ness already determines it
-(`char *` is caller-owned, `const char *` is borrowed); `emit.py` asserts that
-invariant against each header it parses.
+C header cannot express — pointer direction, list ownership, and which union
+member a callback's tag selects. String ownership is *not* in it, because
+libalpm's const-ness already determines it (`char *` is caller-owned,
+`const char *` is borrowed); `emit.py` asserts that invariant against each
+header it parses, and checks the tag mappings against the enums the same way.
 
 `cmake --build build --target coverage` prints what is generated and, for
 everything else, why it is not.
@@ -100,6 +101,15 @@ everything else, why it is not.
   pointer *into* the caller's own filelist, and a round trip would return one
   into libalpm's copy. It is libalpm's own `bsearch`, in
   `src/client/arpc_local.c`.
+- **The callback marshalling is generated too, and the tag mapping is
+  checked.** A payload is a struct whose fields the model already has; the
+  only thing a header cannot say is which union member a tag value selects.
+  That is an overlay table, and `emit.py` requires every value of the tag
+  enum to appear in it — mapped, or listed as carrying only its type — and
+  fails the build naming any that does not. Written by hand, a variant added
+  by a later libalpm would have fallen quietly into `default:` and arrived
+  empty; the callbacks were the last place on this wire where that could
+  still happen. What stays hand-written is the transport either side of it.
 - **Callbacks run nested inside the call that triggered them.** libalpm
   calls back from the middle of an operation, and a question has to be
   answered before the transaction that asked it can continue. So the server
@@ -189,10 +199,9 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-All 193 functions are on the wire: 171 generated, and 22 written by hand —
-the eighteen callback setters, getters and ctx getters,
-`alpm_filelist_contains`, and the three mtree functions. Nothing is refused.
-`coverage.json` names the hand-written ones and the file each lives in.
+All 193 functions are on the wire: 189 generated, and four written by hand —
+`alpm_filelist_contains` and the three mtree functions. Nothing is refused.
+`coverage.json` names the four and the file each lives in.
 
 One *field* does not cross, and that is stated rather than silent:
 `alpm_pgpkey_t.data`, the gpgme key object itself. See the design note above.
