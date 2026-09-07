@@ -46,6 +46,19 @@ static void my_log(void *ctx, alpm_loglevel_t level, const char *fmt,
 	vsnprintf(last_msg, sizeof(last_msg), fmt, args);
 }
 
+static void my_dl(void *ctx, const char *filename,
+		  alpm_download_event_type_t event, void *data)
+{
+	(void)ctx; (void)filename; (void)event; (void)data;
+}
+
+static int my_fetch(void *ctx, const char *url, const char *localpath,
+		    int force)
+{
+	(void)ctx; (void)url; (void)localpath; (void)force;
+	return -1;
+}
+
 static void my_event(void *ctx, alpm_event_t *e)
 {
 	(void)ctx;
@@ -140,13 +153,26 @@ int main(void)
 	      && !strcmp(last_dbname, "alpmrpc-absent"),
 	      "its dbname came through the union", last_dbname);
 
-	printf("\n-- callbacks that are not marshalled yet refuse --\n");
-	/* Registering and then silently never firing would be worse than
-	 * failing here, so these report failure rather than pretending. */
-	check(alpm_option_set_dlcb(h, NULL, NULL) == -1,
-	      "alpm_option_set_dlcb() reports failure", "not yet marshalled");
-	check(alpm_option_set_fetchcb(h, NULL, NULL) == -1,
-	      "alpm_option_set_fetchcb() reports failure", NULL);
+	printf("\n-- the download callbacks register too --\n");
+	/* Both of these returned -1 for as long as they were unmarshalled.
+	 * Returning 0 is what says a trampoline is installed; whether one
+	 * fires needs something to download, which e2e_transaction arranges. */
+	check(alpm_option_set_dlcb(h, my_dl, &marker) == 0,
+	      "alpm_option_set_dlcb()", "trampoline installed");
+	check(alpm_option_set_fetchcb(h, my_fetch, &marker) == 0,
+	      "alpm_option_set_fetchcb()", "trampoline installed");
+	check(alpm_option_get_dlcb(h) == my_dl,
+	      "alpm_option_get_dlcb() round-trips the pointer", NULL);
+
+	printf("\n-- and hand back the ctx they were given --\n");
+	/* These never had anything to ask the server: the pointer is the
+	 * caller's own and never left this process. */
+	check(alpm_option_get_dlcb_ctx(h) == &marker,
+	      "alpm_option_get_dlcb_ctx()", NULL);
+	check(alpm_option_get_eventcb_ctx(h) == &marker,
+	      "alpm_option_get_eventcb_ctx()", NULL);
+	check(alpm_option_get_logcb_ctx(h) == NULL,
+	      "alpm_option_get_logcb_ctx() after unregistering", "NULL");
 
 	printf("\n-- questions install a real trampoline --\n");
 	/* This returned -1 before questioncb was carried. It succeeding is what

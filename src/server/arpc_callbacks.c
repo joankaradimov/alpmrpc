@@ -32,7 +32,7 @@ void arpc_cb_set_conn(arpc_conn *c) { g_conn = c; }
 typedef struct cbreg {
 	struct cbreg *next;
 	uint64_t handle;
-	int log, progress, event, question;
+	int log, progress, event, question, dl, fetch;
 } cbreg;
 
 static cbreg *g_regs;
@@ -169,6 +169,90 @@ static void tr_progress(void *ctx, alpm_progress_t progress, const char *pkg,
 	ajw_free(&a);
 }
 
+/* A download's payload struct is chosen by an argument rather than by a
+ * field, so unlike an event there is nothing to work out: libalpm says which
+ * one it is passing. */
+static void tr_dl(void *ctx, const char *filename,
+		  alpm_download_event_type_t event, void *data)
+{
+	uint64_t h = ctx_handle(ctx);
+	cbreg *r = reg_for(h, 0);
+	if (!r || !r->dl)
+		return;
+
+	aj_w a;
+	ajw_init(&a);
+	ajw_obj_begin(&a);
+	ajw_key(&a, "filename"); ajw_str(&a, filename);
+	ajw_key(&a, "event");    ajw_i64(&a, (long long)event);
+
+	if (data) {
+		switch (event) {
+		case ALPM_DOWNLOAD_INIT: {
+			alpm_download_event_init_t *d = data;
+			ajw_key(&a, "optional"); ajw_i64(&a, d->optional);
+			break;
+		}
+		case ALPM_DOWNLOAD_PROGRESS: {
+			alpm_download_event_progress_t *d = data;
+			ajw_key(&a, "downloaded");
+			ajw_i64(&a, (long long)d->downloaded);
+			ajw_key(&a, "total");
+			ajw_i64(&a, (long long)d->total);
+			break;
+		}
+		case ALPM_DOWNLOAD_RETRY: {
+			alpm_download_event_retry_t *d = data;
+			ajw_key(&a, "resume"); ajw_i64(&a, d->resume);
+			break;
+		}
+		case ALPM_DOWNLOAD_COMPLETED: {
+			alpm_download_event_completed_t *d = data;
+			ajw_key(&a, "total");
+			ajw_i64(&a, (long long)d->total);
+			ajw_key(&a, "result"); ajw_i64(&a, d->result);
+			break;
+		}
+		}
+	}
+	ajw_obj_end(&a);
+
+	cb_call("download", h, &a, 0);
+	ajw_free(&a);
+}
+
+/* The one callback where the client does the work rather than watching it:
+ * with a fetchcb registered libalpm stops downloading anything itself and
+ * asks the caller to put the file at localpath.
+ *
+ * localpath is the server's path, because every path here is -- the caller
+ * already had to speak Cygwin paths to alpm_initialize. A native caller that
+ * wants this has to be able to write there.
+ *
+ * A dead pipe answers -1 rather than 0. Reporting a download that did not
+ * happen would have libalpm carry on to a file that is not there; an error
+ * is the failure it can act on. */
+static int tr_fetch(void *ctx, const char *url, const char *localpath,
+		    int force)
+{
+	uint64_t h = ctx_handle(ctx);
+	cbreg *r = reg_for(h, 0);
+	if (!r || !r->fetch)
+		return -1;
+
+	aj_w a;
+	ajw_init(&a);
+	ajw_obj_begin(&a);
+	ajw_key(&a, "url");       ajw_str(&a, url);
+	ajw_key(&a, "localpath"); ajw_str(&a, localpath);
+	ajw_key(&a, "force");     ajw_i64(&a, force);
+	ajw_obj_end(&a);
+
+	long long r2 = cb_call("fetch", h, &a, -1);
+	ajw_free(&a);
+	return (int)r2;
+}
+
 static void tr_event(void *ctx, alpm_event_t *e);
 static void tr_question(void *ctx, alpm_question_t *q);
 
@@ -206,6 +290,14 @@ int arpc_cb_set(arpc_req *rq, arpc_res *rs)
 		r->question = enabled;
 		rc = alpm_option_set_questioncb(h, enabled ? tr_question : NULL,
 						(void *)(uintptr_t)hid);
+	} else if (!strcmp(which, "download")) {
+		r->dl = enabled;
+		rc = alpm_option_set_dlcb(h, enabled ? tr_dl : NULL,
+					  (void *)(uintptr_t)hid);
+	} else if (!strcmp(which, "fetch")) {
+		r->fetch = enabled;
+		rc = alpm_option_set_fetchcb(h, enabled ? tr_fetch : NULL,
+					     (void *)(uintptr_t)hid);
 	} else {
 		return arpc_fail(rs, ARPC_E_INVALID_PARAMS,
 				 "arpc.set_callback: unknown callback");

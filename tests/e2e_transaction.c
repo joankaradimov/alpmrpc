@@ -58,6 +58,17 @@ static char hook_desc[256];
 static int inside_commit;
 static int question_inside_commit;
 
+static int db_retrieve_start, pkg_retrieve_start;
+static long long pkg_retrieve_num, pkg_retrieve_size;
+
+static int progress_calls;
+static char progress_pkg[128];
+
+static int dl_init, dl_completed, dl_calls;
+static char dl_file[256];
+static int fetch_calls;
+static char fetch_url[512], fetch_localpath[512];
+
 static void on_event(void *ctx, alpm_event_t *e)
 {
 	(void)ctx;
@@ -83,9 +94,59 @@ static void on_event(void *ctx, alpm_event_t *e)
 			snprintf(hook_desc, sizeof(hook_desc), "%s",
 				 e->hook_run.desc);
 		break;
+	case ALPM_EVENT_DB_RETRIEVE_START:
+		db_retrieve_start++;
+		break;
+	case ALPM_EVENT_PKG_RETRIEVE_START:
+		/* The one event variant nothing had exercised, because it
+		 * only fires when libalpm actually has to fetch a package. */
+		pkg_retrieve_start++;
+		pkg_retrieve_num = (long long)e->pkg_retrieve.num;
+		pkg_retrieve_size = (long long)e->pkg_retrieve.total_size;
+		break;
 	default:
 		break;
 	}
+}
+
+static void on_progress(void *ctx, alpm_progress_t what, const char *pkg,
+			int percent, size_t howmany, size_t current)
+{
+	(void)ctx; (void)what; (void)percent; (void)howmany; (void)current;
+	progress_calls++;
+	if (pkg && !progress_pkg[0])
+		snprintf(progress_pkg, sizeof(progress_pkg), "%s", pkg);
+}
+
+static void on_dl(void *ctx, const char *filename,
+		  alpm_download_event_type_t event, void *data)
+{
+	(void)ctx;
+	dl_calls++;
+	if (filename && !dl_file[0])
+		snprintf(dl_file, sizeof(dl_file), "%s", filename);
+	if (event == ALPM_DOWNLOAD_INIT && data) {
+		dl_init++;
+	} else if (event == ALPM_DOWNLOAD_COMPLETED && data) {
+		alpm_download_event_completed_t *c = data;
+		if (c->result >= 0)
+			dl_completed++;
+	}
+}
+
+/* Registering this takes downloading away from libalpm entirely, so it is
+ * the caller that would have to fetch. Refusing is enough to prove the
+ * arguments arrived and the answer was believed. */
+static int on_fetch(void *ctx, const char *url, const char *localpath,
+		    int force)
+{
+	(void)ctx;
+	(void)force;
+	fetch_calls++;
+	snprintf(fetch_url, sizeof(fetch_url), "%s", url ? url : "");
+	snprintf(fetch_localpath, sizeof(fetch_localpath), "%s",
+		 localpath ? localpath : "");
+	return -1;
 }
 
 /* A conflict is answered yes: remove the installed package so the new one
@@ -116,14 +177,9 @@ static const char *trans_err(alpm_handle_t *h)
 	return alpm_strerror(alpm_errno(h));
 }
 
-static int install(alpm_handle_t *h, const char *pkgfile, const char **stage)
+static int add_and_commit(alpm_handle_t *h, alpm_pkg_t *p, const char **stage)
 {
-	alpm_pkg_t *p = NULL;
 	alpm_list_t *data = NULL;
-
-	*stage = "alpm_pkg_load";
-	if (alpm_pkg_load(h, pkgfile, 1, 0, &p) != 0 || !p)
-		return -1;
 
 	*stage = "alpm_trans_init";
 	if (alpm_trans_init(h, 0) != 0)
@@ -155,6 +211,16 @@ static int install(alpm_handle_t *h, const char *pkgfile, const char **stage)
 
 	*stage = NULL;
 	return 0;
+}
+
+/* A package file, the pacman -U path: load it, then the same transaction. */
+static int install(alpm_handle_t *h, const char *pkgfile, const char **stage)
+{
+	alpm_pkg_t *p = NULL;
+	*stage = "alpm_pkg_load";
+	if (alpm_pkg_load(h, pkgfile, 1, 0, &p) != 0 || !p)
+		return -1;
+	return add_and_commit(h, p, stage);
 }
 
 /* ---- the root, from this process rather than through libalpm ---- */
@@ -245,6 +311,8 @@ int main(int argc, char **argv)
 	      "alpm_option_set_eventcb()", NULL);
 	check(alpm_option_set_questioncb(h, on_question, NULL) == 0,
 	      "alpm_option_set_questioncb()", NULL);
+	check(alpm_option_set_progresscb(h, on_progress, NULL) == 0,
+	      "alpm_option_set_progresscb()", NULL);
 	check(installed_count(h) == 0, "the scratch root starts empty", NULL);
 
 	/* ---- install one package ---- */
@@ -259,6 +327,9 @@ int main(int argc, char **argv)
 	check(installed_count(h) == 1, "one package is now installed", NULL);
 	check(op_install == 1, "ALPM_EVENT_PACKAGE_OPERATION_START (install)",
 	      NULL);
+	/* progresscb has been carried since callbacks went in, but nothing
+	 * had ever made libalpm report progress at anything. */
+	check(progress_calls > 0, "the progress callback fired", progress_pkg);
 
 	/* ---- the fork, checked against what the shell left behind ---- */
 
@@ -309,6 +380,77 @@ int main(int argc, char **argv)
 	      "the remove scriptlet ran too", NULL);
 	check(count_lines(log) == 3, "three scriptlet runs in all",
 	      "install, remove, install");
+
+	/* ---- the download path ---- */
+
+	printf("\n-- a file:// repo, so downloading happens with no network --\n");
+	char server[1024], buf[256];
+	snprintf(server, sizeof(server), "file://%s/repo", posix_root);
+
+	check(alpm_option_set_dlcb(h, on_dl, NULL) == 0,
+	      "alpm_option_set_dlcb()", NULL);
+
+	alpm_db_t *sync = alpm_register_syncdb(h, "alpmrpc", 0);
+	check(sync != NULL, "alpm_register_syncdb()", "alpmrpc");
+	check(sync && alpm_db_add_server(sync, server) == 0,
+	      "alpm_db_add_server()", server);
+
+	alpm_list_t *dbs = NULL;
+	alpm_list_append(&dbs, sync);
+	int up = alpm_db_update(h, dbs, 1);
+	alpm_list_free(dbs);
+
+	check(up == 0, "alpm_db_update() fetched the database",
+	      up == 0 ? NULL : trans_err(h));
+	check(db_retrieve_start > 0, "ALPM_EVENT_DB_RETRIEVE_START arrived",
+	      NULL);
+	snprintf(buf, sizeof(buf), "%d call%s, first for %s", dl_calls,
+		 dl_calls == 1 ? "" : "s", dl_file);
+	check(dl_calls > 0, "the download callback fired", buf);
+	check(dl_init > 0 && dl_completed > 0,
+	      "with INIT and COMPLETED, payloads and all", NULL);
+
+	printf("\n-- installing from the repo, which has to fetch first --\n");
+	/* alpmrpc-extra is only in the repo, never in the cache, so libalpm
+	 * has to download it -- which is the one thing that raises
+	 * ALPM_EVENT_PKG_RETRIEVE_START. */
+	alpm_pkg_t *extra = alpm_db_get_pkg(sync, "alpmrpc-extra");
+	check(extra != NULL, "alpm_db_get_pkg() off the sync db",
+	      "alpmrpc-extra");
+	if (extra) {
+		rc = add_and_commit(h, extra, &stage);
+		check(rc == 0, "the transaction committed",
+		      rc == 0 ? NULL : trans_err(h));
+		if (rc != 0)
+			printf("       failed at %s\n", stage);
+		snprintf(buf, sizeof(buf), "%lld package%s, %lld bytes",
+			 pkg_retrieve_num, pkg_retrieve_num == 1 ? "" : "s",
+			 pkg_retrieve_size);
+		check(pkg_retrieve_start > 0,
+		      "ALPM_EVENT_PKG_RETRIEVE_START arrived", buf);
+		check(pkg_retrieve_num == 1 && pkg_retrieve_size > 0,
+		      "carrying a count and a size that make sense", NULL);
+		check(installed_count(h) == 2, "two packages installed now",
+		      NULL);
+	}
+
+	printf("\n-- a fetchcb takes downloading away from libalpm --\n");
+	check(alpm_option_set_fetchcb(h, on_fetch, NULL) == 0,
+	      "alpm_option_set_fetchcb()", NULL);
+	dbs = NULL;
+	alpm_list_append(&dbs, sync);
+	up = alpm_db_update(h, dbs, 1);
+	alpm_list_free(dbs);
+
+	check(fetch_calls > 0, "libalpm asked this process to do the download",
+	      fetch_url);
+	check(strstr(fetch_url, "alpmrpc.db") != NULL,
+	      "with the url it wanted fetched", fetch_url);
+	check(fetch_localpath[0] == '/',
+	      "and a server-side path to put it in", fetch_localpath);
+	check(up != 0, "refusing it failed the update, rather than passing",
+	      NULL);
+	alpm_option_set_fetchcb(h, NULL, NULL);
 
 	printf("\n-- the connection survived all of it --\n");
 	check(events > 0, "events were delivered throughout", NULL);

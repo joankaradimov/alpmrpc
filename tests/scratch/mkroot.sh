@@ -15,9 +15,16 @@
 # scriptlet, and the root carries a hook, so a commit forks twice over.
 set -euo pipefail
 
+# This runs under MSYS2's bash but is launched from CMake, so the PATH it
+# inherits is whatever configured the build -- which is a Windows one and
+# need not have /usr/bin on it. bsdtar was found there anyway; repo-add was
+# not, and the repo then quietly did not exist.
+PATH=/usr/bin:/bin:$PATH
+
 ROOT=${1:?usage: mkroot.sh <root>}
 ARCH=x86_64
 VER=1.0-1
+REPO=alpmrpc
 
 # Absolute, because libalpm is handed these paths and a relative one would be
 # resolved against wherever the server happens to be running.
@@ -67,9 +74,13 @@ EOF
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# mkpkg <name> <conflicts-or-empty>
+# mkpkg <name> <where: cache|repo> <conflicts-or-empty>
+#
+# A package in the cache is installable from a file; one only in the repo has
+# to be downloaded first, which is the difference between exercising the
+# download callbacks and not.
 mkpkg() {
-	local name=$1 conflicts=${2:-}
+	local name=$1 where=$2 conflicts=${3:-}
 	local stage="$WORK/$name"
 	rm -rf "$stage"
 	mkdir -p "$stage/usr/share/alpmrpc-scratch"
@@ -106,15 +117,35 @@ pre_remove() {
 }
 EOF
 
-	local out="$ROOT/var/cache/pacman/pkg/$name-$VER-$ARCH.pkg.tar.zst"
+	local file="$name-$VER-$ARCH.pkg.tar.zst"
 	# .PKGINFO first, which is where libalpm expects to find it.
-	bsdtar --zstd -cf "$out" -C "$stage" .PKGINFO .INSTALL usr
-	echo "  $out"
+	bsdtar --zstd -cf "$WORK/$file" -C "$stage" .PKGINFO .INSTALL usr
+
+	# Everything is in the repo, so it can be installed by name; only some
+	# of it is in the cache, so the rest has to be fetched.
+	cp "$WORK/$file" "$ROOT/repo/$file"
+	if [ "$where" = cache ]; then
+		cp "$WORK/$file" "$ROOT/var/cache/pacman/pkg/$file"
+	fi
+	echo "  $file ($where)"
 }
 
+mkdir -p "$ROOT/repo"
+
 echo "packages:"
-mkpkg alpmrpc-base
-mkpkg alpmrpc-rival alpmrpc-base
+mkpkg alpmrpc-base  cache
+mkpkg alpmrpc-rival cache alpmrpc-base
+mkpkg alpmrpc-extra repo
+
+# A file:// repo, so the download path runs with no network at all. repo-add
+# leaves alpmrpc.db as a symlink to the tarball; that is replaced with a copy
+# because what reads it is libcurl, through the Cygwin file:// handler, and a
+# link is one more thing that has to survive that.
+repo-add --quiet "$ROOT/repo/$REPO.db.tar.gz" "$ROOT/repo"/*.pkg.tar.zst \
+	> /dev/null
+rm -f "$ROOT/repo/$REPO.db"
+cp "$ROOT/repo/$REPO.db.tar.gz" "$ROOT/repo/$REPO.db"
+echo "repo:  $ROOT/repo/$REPO.db"
 
 # The server is a Cygwin process, so every path handed to libalpm is a POSIX
 # path on its side, while the test reads the scriptlet and hook logs itself

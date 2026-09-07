@@ -189,7 +189,7 @@
     }
   },
   "skip": {
-    "_comment": "Implemented by hand in arpc_callbacks.c on both sides. Each callback has its own payload shape, so this is six specific things rather than a family the emitter could generate.",
+    "_comment": "Implemented by hand in arpc_callbacks.c on both sides. Each callback has its own payload shape, so this is six specific things rather than a family the emitter could generate. The ctx getters go with them: the pointer never leaves the client, so there is nothing to ask the server for.",
     "alpm_option_set_logcb": "hand-written in arpc_callbacks.c",
     "alpm_option_set_dlcb": "hand-written in arpc_callbacks.c",
     "alpm_option_set_fetchcb": "hand-written in arpc_callbacks.c",
@@ -201,7 +201,13 @@
     "alpm_option_get_fetchcb": "hand-written in arpc_callbacks.c",
     "alpm_option_get_eventcb": "hand-written in arpc_callbacks.c",
     "alpm_option_get_questioncb": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_progresscb": "hand-written in arpc_callbacks.c"
+    "alpm_option_get_progresscb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_logcb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_dlcb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_fetchcb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_eventcb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_questioncb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_progresscb_ctx": "hand-written in arpc_callbacks.c"
   },
   "spike": {
     "_comment": [

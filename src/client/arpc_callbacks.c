@@ -119,26 +119,28 @@ GETTER(alpm_option_get_eventcb, event, alpm_cb_event)
 SETTER(alpm_option_set_questioncb, question, alpm_cb_question, "question")
 GETTER(alpm_option_get_questioncb, question, alpm_cb_question)
 
-/* Not yet marshalled. The pointer is stored so the getter round-trips, but
- * the server is told not to install a trampoline -- and the setter reports
- * failure, because a callback that is registered and then silently never
- * fires is a worse outcome than one that refuses up front. */
-#define UNIMPLEMENTED_SETTER(fn, field, type)                                \
-	int fn(alpm_handle_t *handle, type cb, void *ctx)                    \
-	{                                                                    \
-		reg *r = reg_for(ARPC_ID(handle), 1);                        \
-		if (r) {                                                     \
-			r->field = cb;                                       \
-			r->field##_ctx = ctx;                                \
-		}                                                            \
-		return -1;                                                   \
-	}
-
-UNIMPLEMENTED_SETTER(alpm_option_set_dlcb, dl, alpm_cb_download)
+SETTER(alpm_option_set_dlcb, dl, alpm_cb_download, "download")
 GETTER(alpm_option_get_dlcb, dl, alpm_cb_download)
 
-UNIMPLEMENTED_SETTER(alpm_option_set_fetchcb, fetch, alpm_cb_fetch)
+SETTER(alpm_option_set_fetchcb, fetch, alpm_cb_fetch, "fetch")
 GETTER(alpm_option_get_fetchcb, fetch, alpm_cb_fetch)
+
+/* The ctx getters never had anything to ask the server: libalpm hands the
+ * pointer straight back, and the pointer is this process's, held right here
+ * beside the function pointer it belongs to. */
+#define CTX_GETTER(fn, field)                                                \
+	void *fn(alpm_handle_t *handle)                                      \
+	{                                                                    \
+		reg *r = reg_for(ARPC_ID(handle), 0);                        \
+		return r ? r->field##_ctx : NULL;                            \
+	}
+
+CTX_GETTER(alpm_option_get_logcb_ctx, log)
+CTX_GETTER(alpm_option_get_progresscb_ctx, progress)
+CTX_GETTER(alpm_option_get_eventcb_ctx, event)
+CTX_GETTER(alpm_option_get_questioncb_ctx, question)
+CTX_GETTER(alpm_option_get_dlcb_ctx, dl)
+CTX_GETTER(alpm_option_get_fetchcb_ctx, fetch)
 
 /* ---- dispatch ---- */
 
@@ -206,6 +208,60 @@ static void call_progress(reg *r, const aj_doc *d, int args)
 		    (int)aj_i64(d, aj_member(d, args, "percent"), 0),
 		    (size_t)aj_i64(d, aj_member(d, args, "howmany"), 0),
 		    (size_t)aj_i64(d, aj_member(d, args, "current"), 0));
+}
+
+/* The download payload is picked by the event argument, not by a field in
+ * it, so which struct to build is stated rather than inferred. */
+static void call_dl(reg *r, const aj_doc *d, int args)
+{
+	if (!r || !r->dl)
+		return;
+
+	alpm_download_event_type_t ev = (alpm_download_event_type_t)
+		aj_i64(d, aj_member(d, args, "event"), 0);
+	const char *filename = aj_str(d, aj_member(d, args, "filename"), NULL);
+
+	alpm_download_event_init_t init;
+	alpm_download_event_progress_t prog;
+	alpm_download_event_retry_t retry;
+	alpm_download_event_completed_t done;
+	void *data = NULL;
+
+	switch (ev) {
+	case ALPM_DOWNLOAD_INIT:
+		init.optional = (int)aj_i64(d, aj_member(d, args, "optional"), 0);
+		data = &init;
+		break;
+	case ALPM_DOWNLOAD_PROGRESS:
+		prog.downloaded = (off_t)
+			aj_i64(d, aj_member(d, args, "downloaded"), 0);
+		prog.total = (off_t)aj_i64(d, aj_member(d, args, "total"), 0);
+		data = &prog;
+		break;
+	case ALPM_DOWNLOAD_RETRY:
+		retry.resume = (int)aj_i64(d, aj_member(d, args, "resume"), 0);
+		data = &retry;
+		break;
+	case ALPM_DOWNLOAD_COMPLETED:
+		done.total = (off_t)aj_i64(d, aj_member(d, args, "total"), 0);
+		done.result = (int)aj_i64(d, aj_member(d, args, "result"), 0);
+		data = &done;
+		break;
+	}
+
+	r->dl(r->dl_ctx, filename, ev, data);
+}
+
+/* The caller does the downloading here, so this one has an answer that
+ * matters: 0 fetched, 1 already current, -1 failed. */
+static long long call_fetch(reg *r, const aj_doc *d, int args)
+{
+	if (!r || !r->fetch)
+		return -1;
+	return r->fetch(r->fetch_ctx,
+			aj_str(d, aj_member(d, args, "url"), NULL),
+			aj_str(d, aj_member(d, args, "localpath"), NULL),
+			(int)aj_i64(d, aj_member(d, args, "force"), 0));
 }
 
 /* Rebuild the event and hand it to the caller.
@@ -382,6 +438,10 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 		call_event(r, d, args);
 	else if (!strcmp(which, "question"))
 		ret = call_question(r, d, args);
+	else if (!strcmp(which, "download"))
+		call_dl(r, d, args);
+	else if (!strcmp(which, "fetch"))
+		ret = call_fetch(r, d, args);
 	/* An unknown callback is answered rather than ignored: the server is
 	 * blocked waiting, and a silent drop would deadlock the transaction. */
 

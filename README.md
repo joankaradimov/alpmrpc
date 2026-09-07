@@ -92,6 +92,13 @@ everything else, why it is not.
   It serves those and keeps waiting, which is the same loop the client runs
   in the other direction. The nesting is strict, so each side's reply is
   simply the next frame that is not a fresh request.
+- **Paths are the server's.** They cross unchanged in both directions, so a
+  caller passes Cygwin paths to `alpm_initialize` and gets them back from
+  `alpm_option_get_root`. `fetchcb` is where this becomes visible rather than
+  academic: the `localpath` libalpm wants a file written to is a path in the
+  server's filesystem, and a native caller has to be able to reach it. No
+  translation happens here, because guessing at one would be worse than the
+  caller doing it knowingly.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. Caller-owned lists are
@@ -130,9 +137,11 @@ setters and getters. `coverage.json` lists everything else with a reason for
 each; what is left is small and specific — the two counted-array records,
 the opaque `void *` cursors (changelog, mtree), and `alpm_logaction`'s `...`.
 
-Carried callbacks: `logcb`, `progresscb`, `eventcb`, `questioncb`. `dlcb` and
-`fetchcb` are not, and their setters return -1 rather than accepting a
-callback that would then silently never fire.
+All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
+`questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to
+fire. `fetchcb` is the odd one: registering it takes downloading away from
+libalpm and asks the caller to do it, so it is the only callback where the
+client does work rather than watching it.
 
 Both paths work and are measured. A real transaction has been driven end to
 end against the throwaway root, which settled the two things that were
