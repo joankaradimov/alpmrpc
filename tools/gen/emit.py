@@ -218,7 +218,7 @@ def select(model):
             if why:
                 break
             k = p["kind"]
-            if k in ("ptr_enum", "ptr_scalar"):
+            if k in ("ptr_enum", "ptr_scalar", "ptr_handle"):
                 if p["name"] not in outs:
                     why = "pointer param with undeclared direction: " + p["name"]
             elif k == "ptr_list":
@@ -703,6 +703,7 @@ def emit_server(gen, need, rin, src_header):
                 temps.append((pn, e["name"]))
 
         out_lists = []
+        out_handles = []
         for op in out_params_of(n):
             for p in fn["params"]:
                 if p["name"] != op:
@@ -711,6 +712,13 @@ def emit_server(gen, need, rin, src_header):
                     o.append("\talpm_list_t *%s_v = NULL;\n" % op)
                     args.append("&%s_v" % op)
                     out_lists.append((op, param_elem(n, op)))
+                elif p["kind"] == "ptr_handle":
+                    # alpm_pkg_t ** -> alpm_pkg_t *: one level of
+                    # indirection off, not every trailing star.
+                    inner = p["c_type"][:-1].strip()
+                    o.append("\t%s %s_v = NULL;\n" % (inner, op))
+                    args.append("&%s_v" % op)
+                    out_handles.append((op, handle_tag(inner)))
                 else:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\t%s %s_v = 0;\n" % (inner, op))
@@ -778,8 +786,17 @@ def emit_server(gen, need, rin, src_header):
                 o.append("\talpm_list_free(r);\n")
 
         out_list_names = [x[0] for x in out_lists]
+        out_handle_tags = dict(out_handles)
         for op in out_params_of(n):
             if op in out_list_names:
+                continue
+            if op in out_handle_tags:
+                # A handle handed back through a pointer is filed exactly
+                # like a returned one: an id under the same owner, so it
+                # dies with that owner and cannot be mistaken for a pointer.
+                o.append("\tarpc_out_i64(rs, " + qq(op)
+                         + ", (long long)arpc_handle_put(%s_v, %s, %s));\n"
+                         % (op, out_handle_tags[op], owner))
                 continue
             o.append("\tarpc_out_i64(rs, " + qq(op) + ", (long long)%s_v);\n"
                      % op)
@@ -1025,6 +1042,16 @@ def emit_client(gen, need, rin, src_header):
                     o.append("\tif (%s)\n\t\t*%s = build_list_%s("
                              "arpc_doc(&c),\n\t\t\t\tarpc_out_node(&c, "
                              % (op, op, e["name"]) + qq(op) + "));\n")
+                elif p["kind"] == "ptr_handle":
+                    inner = p["c_type"][:-1].strip()
+                    o.append("\tif (%s)\n\t\t*%s = (%s)(uintptr_t)"
+                             "arpc_out_i64(&c, " % (op, op, inner)
+                             + qq(op) + ");\n")
+                    if spec.get("creates"):
+                        # The connection has to outlive what this made, the
+                        # same as a create that returns its handle.
+                        o.append("\tif (%s && *%s)\n\t\tarpc_conn_ref();\n"
+                                 % (op, op))
                 else:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\tif (%s)\n\t\t*%s = (%s)arpc_out_i64(&c, "
