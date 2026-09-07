@@ -203,6 +203,10 @@
     },
     "alpm_pkg_free": {
       "destroys": "pkg"
+    },
+    "alpm_pkg_changelog_close": {
+      "closes": "fp",
+      "doc": "Drops the cursor's id once libalpm has closed it. Unlike destroys, this releases one handle rather than an owner and everything under it."
     }
   },
   "skip": {
@@ -258,6 +262,33 @@
     "alpm_dep_from_string": "caller",
     "alpm_db_get_group": "borrowed",
     "alpm_pkg_get_files": "borrowed"
+  },
+  "opaque_handles": {
+    "_comment": [
+      "A `void *` that is not data but an object the server is holding open:",
+      "a cursor part-way through a changelog. The header says void, so",
+      "nothing in it can say which kind of object -- what is stated here is",
+      "the tag, which is what makes a stale or wrong-typed cursor fail a",
+      "lookup instead of reaching libalpm as a pointer.",
+      "The key is <function>.<param>, or <function>.@return.",
+      "mtree is deliberately not here. Its open and close would work exactly",
+      "like these, but alpm_pkg_mtree_next hands back a struct archive_entry",
+      "the client has no libarchive to read -- so declaring the cursor would",
+      "buy two thirds of an API nobody can use."
+    ],
+    "alpm_pkg_changelog_open.@return": "ARPC_H_CHANGELOG",
+    "alpm_pkg_changelog_read.fp": "ARPC_H_CHANGELOG",
+    "alpm_pkg_changelog_close.fp": "ARPC_H_CHANGELOG"
+  },
+  "out_buffers": {
+    "_comment": [
+      "A buffer the caller provides and the callee fills, sized by another",
+      "parameter, with the number of bytes actually written as the return",
+      "value -- the read() shape. The server allocates its own, hands that to",
+      "libalpm, and the bytes travel back base64 like any other bytes here.",
+      "The value is the parameter holding the size."
+    ],
+    "alpm_pkg_changelog_read.ptr": "size"
   },
   "byte_buffers": {
     "_comment": [

@@ -117,9 +117,20 @@ pre_remove() {
 }
 EOF
 
+	# libalpm copies this into the local db entry at install time, and it
+	# is what alpm_pkg_changelog_open reads back. Long enough that reading
+	# it in small chunks takes more than one read.
+	cat > "$stage/.CHANGELOG" <<EOF
+$VER:
+  - first release of $name
+  - a second line, so that a short read is not the whole file
+  - and a third
+EOF
+
 	local file="$name-$VER-$ARCH.pkg.tar.zst"
 	# .PKGINFO first, which is where libalpm expects to find it.
-	bsdtar --zstd -cf "$WORK/$file" -C "$stage" .PKGINFO .INSTALL usr
+	bsdtar --zstd -cf "$WORK/$file" -C "$stage" \
+		.PKGINFO .INSTALL .CHANGELOG usr
 
 	# Everything is in the repo, so it can be installed by name; only some
 	# of it is in the cache, so the rest has to be fetched.

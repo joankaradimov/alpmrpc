@@ -392,6 +392,62 @@ int main(int argc, char **argv)
 	check(fl != NULL && alpm_pkg_get_files(installed) == fl,
 	      "a repeat call is the same pointer", "borrowed, so cached");
 
+	/* ---- the changelog, which is a cursor and a stream of bytes ---- */
+
+	printf("\n-- reading the changelog through a cursor --\n");
+	/* The package file, not the installed one, and that is libalpm's
+	 * doing rather than a choice: a package added to the local db cache
+	 * by a transaction in this same session has no changelog reader
+	 * attached until the db is read again from disk, so
+	 * alpm_pkg_changelog_open on it returns NULL. A fresh process reads
+	 * the same installed package fine. The file-backed cursor is the same
+	 * mechanism and does not depend on that. */
+	alpm_pkg_t *fromfile = NULL;
+	alpm_pkg_load(h, base_pkg, 1, 0, &fromfile);
+	check(fromfile != NULL, "alpm_pkg_load() for the changelog", NULL);
+
+	void *cl = fromfile ? alpm_pkg_changelog_open(fromfile) : NULL;
+	check(cl != NULL, "alpm_pkg_changelog_open()",
+	      "an id, not a pointer this process could follow");
+	if (cl) {
+		/* Deliberately small, so the whole file cannot arrive in one
+		 * read and the cursor has to be where it was left. */
+		char chunk[16];
+		char whole[1024];
+		size_t total = 0, got;
+		int reads = 0;
+		while ((got = alpm_pkg_changelog_read(chunk, sizeof(chunk),
+						      fromfile, cl)) > 0) {
+			reads++;
+			if (total + got < sizeof(whole)) {
+				memcpy(whole + total, chunk, got);
+				total += got;
+			}
+			if (reads > 200)
+				break;
+		}
+		whole[total] = '\0';
+
+		snprintf(buf, sizeof(buf), "%zu bytes over %d reads", total,
+			 reads);
+		check(reads > 1, "it took more than one read", buf);
+		check(strstr(whole, "first release of alpmrpc-base") != NULL,
+		      "and the text came back whole", NULL);
+		check(strstr(whole, "and a third") != NULL,
+		      "including the last line, so nothing was lost between "
+		      "reads", NULL);
+
+		check(alpm_pkg_changelog_close(fromfile, cl) == 0,
+		      "alpm_pkg_changelog_close()", NULL);
+		/* The id is dropped when it closes, so this misses a lookup
+		 * rather than reaching a cursor libalpm has already freed. */
+		check(alpm_pkg_changelog_read(chunk, sizeof(chunk), fromfile,
+					      cl) == 0,
+		      "reading a closed cursor gets nothing", "the id is gone");
+	}
+	if (fromfile)
+		alpm_pkg_free(fromfile);
+
 	/* ---- the conflict, which is a question ---- */
 
 	printf("\n-- installing alpmrpc-rival, which conflicts --\n");

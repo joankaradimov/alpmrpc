@@ -182,6 +182,24 @@ def counted_array(rec):
     return ca
 
 
+def opaque_handle(fn, pname):
+    """A `void *` that is an object the server holds, not data.
+
+    The header says void and nothing more, so which kind of object it is --
+    and therefore which tag guards it -- can only be stated."""
+    return OVERLAY.get("opaque_handles", {}).get(fn["name"] + "." + pname)
+
+
+def out_buffer(fn, pname):
+    """A caller-provided buffer the callee fills, sized by another parameter,
+    with the bytes written as the return value. Returns that parameter."""
+    ln = OVERLAY.get("out_buffers", {}).get(fn["name"] + "." + pname)
+    if ln and not any(p["name"] == ln for p in fn["params"]):
+        raise SystemExit("overlay: %s has no size param %r for "
+                         "out_buffers.%s" % (fn["name"], ln, pname))
+    return ln
+
+
 def byte_buffer(fn, pname):
     """n bytes and a length, rather than text.
 
@@ -326,15 +344,22 @@ def select(model):
                     why = "list param with no element type: " + p["name"]
                 # A record-element list is fine now: the server can read a
                 # record back off the wire, so take_list_* can build one.
-            elif k in ("callback", "unsupported", "opaque_void",
-                       "foreign_handle"):
+            elif k == "opaque_void":
+                # void * is a server-held object or a buffer to fill, and
+                # the overlay is the only thing that can say which.
+                if not opaque_handle(fn, p["name"]) \
+                        and not out_buffer(fn, p["name"]):
+                    why = "unsupported type kind: " + k
+            elif k in ("callback", "unsupported", "foreign_handle"):
                 why = "unsupported type kind: " + k
             elif k not in ("void", "scalar", "enum", "string", "handle"):
                 why = "not yet generated: " + k
 
         if not why and fn["ret"]["kind"] not in (
                 "void", "scalar", "enum", "string", "handle", "list",
-                "struct_ptr"):
+                "struct_ptr") \
+                and not (fn["ret"]["kind"] == "opaque_void"
+                         and opaque_handle(fn, "@return")):
             why = "not yet generated: " + fn["ret"]["kind"]
 
         if why:
@@ -773,6 +798,7 @@ def emit_server(gen, need, rin, src_header):
         blen_owner = {byte_buffer(fn, p["name"]): p["name"]
                       for p in fn["params"] if byte_buffer(fn, p["name"])}
         byte_checks = []
+        out_buf = None
         for i, p in enumerate(fn["params"]):
             k, pn, ct = p["kind"], p["name"], p["c_type"]
             bb = byte_buffer(fn, pn)
@@ -811,6 +837,24 @@ def emit_server(gen, need, rin, src_header):
                          % (pn, e["name"], i))
                 args.append(pn)
                 temps.append((pn, e["name"]))
+            elif k == "opaque_void" and opaque_handle(fn, pn):
+                o.append("\tvoid *%s = arpc_arg_handle(rq, %d, %s);\n"
+                         % (pn, i, opaque_handle(fn, pn)))
+                args.append(pn)
+            elif k == "opaque_void" and out_buffer(fn, pn):
+                # Declared after the loop: it is sized by a parameter that
+                # has not been read yet at this point.
+                out_buf = (pn, out_buffer(fn, pn))
+                args.append(pn)
+
+        if out_buf:
+            bn, sn = out_buf
+            o.append("\t/* The caller's buffer is on the other side of the\n"
+                     "\t * pipe, so libalpm fills one here and the bytes go\n"
+                     "\t * back with the count. */\n")
+            o.append("\tunsigned char *%s = (%s > 0 && %s < (1 << 24))\n"
+                     "\t\t\t? (unsigned char *)malloc((size_t)%s) : NULL;\n"
+                     % (bn, sn, sn, sn))
 
         out_lists = []
         out_handles = []
@@ -843,6 +887,8 @@ def emit_server(gen, need, rin, src_header):
                     args.append("&%s_v" % op)
 
         o.append("\tif (arpc_req_bad(rq)")
+        if out_buf:
+            o.append("\n\t    || (%s > 0 && !%s)" % (out_buf[1], out_buf[0]))
         for bn, ln in byte_checks:
             # The length that travelled and the length that decoded have to
             # agree. They do by construction, so a disagreement means the
@@ -855,6 +901,8 @@ def emit_server(gen, need, rin, src_header):
             o.append("\t\tdrop_%s(%s);\n" % (te, tn))
         for tn in byte_temps:
             o.append("\t\tfree(%s);\n" % tn)
+        if out_buf:
+            o.append("\t\tfree(%s);\n" % out_buf[0])
         o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
                  + qq(n + ": bad arguments") + ");\n\t}\n")
 
@@ -878,10 +926,23 @@ def emit_server(gen, need, rin, src_header):
                      else "arpc_owner_of(arpc_arg_id(rq, %d))" % i)
             break
 
-        if rk == "void":
+        if rk == "opaque_void":
+            o.append("\tvoid *r = %s;\n" % call)
+            o.append("\t/* Not data: an object this server is holding open,\n"
+                     "\t * so it goes back as an id like any other handle. */\n")
+            o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
+                     % (opaque_handle(fn, "@return"), owner))
+        elif rk == "void":
             o.append("\t%s;\n\tarpc_ret_null(rs);\n" % call)
         elif rk in ("scalar", "enum"):
-            o.append("\tarpc_ret_i64(rs, (long long)%s);\n" % call)
+            if out_buf:
+                bn, _ = out_buf
+                o.append("\tsize_t r = (size_t)%s;\n" % call)
+                o.append("\tarpc_ret_i64(rs, (long long)r);\n")
+                o.append("\tarpc_out_bytes(rs, " + qq(bn) + ", %s, r);\n" % bn)
+                o.append("\tfree(%s);\n" % bn)
+            else:
+                o.append("\tarpc_ret_i64(rs, (long long)%s);\n" % call)
         elif rk == "string":
             if ret_string_owned(fn):
                 o.append("\tchar *r = %s;\n" % call)
@@ -962,6 +1023,13 @@ def emit_server(gen, need, rin, src_header):
 
         if spec.get("destroys"):
             o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
+        if spec.get("closes"):
+            ci = next(i for i, p in enumerate(fn["params"])
+                      if p["name"] == spec["closes"])
+            o.append("\t/* libalpm has closed it, so the id goes too: a later\n"
+                     "\t * use then misses instead of reaching a freed "
+                     "cursor. */\n")
+            o.append("\tarpc_handle_drop(arpc_arg_id(rq, %d));\n" % ci)
 
         o.append("\treturn 0;\n}\n\n")
 
@@ -1128,7 +1196,8 @@ def emit_client(gen, need, rin, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_client.h"\n')
     o.append("#include <alpm.h>\n#include <alpm_list.h>\n")
-    o.append("#include <stdarg.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n")
+    o.append("#include <stdarg.h>\n#include <stdio.h>\n"
+             "#include <stdlib.h>\n#include <string.h>\n\n")
     o.append("#if defined(__GNUC__) || defined(__clang__)\n"
              "#  define ARPC_MAYBE_UNUSED __attribute__((unused))\n"
              "#else\n"
@@ -1182,7 +1251,13 @@ def emit_client(gen, need, rin, src_header):
             "handle": "return NULL;",
             "list": "return NULL;",
             "struct_ptr": "return NULL;",
+            "opaque_void": "return NULL;",
         }[rk]
+        if rk == "scalar" and rct.split()[0] in ("size_t", "unsigned"):
+            # -1 in an unsigned return is not "failed", it is the largest
+            # count there is. These return a number of bytes, so nothing
+            # read is the honest answer.
+            fail = "return 0;"
 
         first_handle = None
         for p in fn["params"]:
@@ -1242,9 +1317,32 @@ def emit_client(gen, need, rin, src_header):
                     o.append("\tarpc_put_str_list(&c, %s);\n" % pn)
                 else:
                     o.append("\tarpc_put_handle_list(&c, %s);\n" % pn)
+            elif k == "opaque_void" and opaque_handle(fn, pn):
+                o.append("\tarpc_put_handle(&c, ARPC_ID(%s));\n" % pn)
+            elif k == "opaque_void" and out_buffer(fn, pn):
+                # This buffer is filled on the other side, so nothing goes
+                # out in it -- but its slot does, because the arguments are
+                # positional and the ones after it are read by index.
+                o.append("\tarpc_put_null(&c);\n")
 
         o.append("\tif (!arpc_invoke(&c)) {\n\t\tarpc_end(&c);\n\t\t%s\n\t}\n"
                  % fail)
+
+        for p in fn["params"]:
+            ob = out_buffer(fn, p["name"])
+            if not ob:
+                continue
+            pn = p["name"]
+            o.append("\tsize_t %s_n = 0;\n" % pn)
+            o.append("\tunsigned char *%s_v = arpc_out_bytes(&c, "
+                     % pn + qq(pn) + ", &%s_n);\n" % pn)
+            o.append("\t/* Never more than the caller asked for, whatever\n"
+                     "\t * came back. */\n")
+            o.append("\tif (%s && %s_v)\n" % (pn, pn))
+            o.append("\t\tmemcpy(%s, %s_v, %s_n < (size_t)%s\n"
+                     "\t\t\t\t? %s_n : (size_t)%s);\n"
+                     % (pn, pn, pn, ob, pn, ob))
+            o.append("\tfree(%s_v);\n" % pn)
 
         cli_byte_lens = {byte_buffer(fn, op) for op in out_params_of(n)
                          if byte_buffer(fn, op)}
@@ -1291,7 +1389,12 @@ def emit_client(gen, need, rin, src_header):
                 o.append("\tarpc_purge_owner(ARPC_ID(%s));\n" % first_handle)
                 o.append("\tarpc_conn_unref();\n")
 
-        if rk == "void":
+        if rk == "opaque_void":
+            o.append("\tvoid *r = (void *)(uintptr_t)arpc_ret_handle(&c);\n")
+            o.append("\tarpc_end(&c);\n")
+            teardown()
+            o.append("\treturn r;\n")
+        elif rk == "void":
             o.append("\tarpc_end(&c);\n")
             teardown()
         elif rk in ("scalar", "enum"):
@@ -1382,6 +1485,12 @@ def main():
         for t in [fn["ret"]] + fn["params"]:
             if t["kind"] == "handle":
                 HANDLE_TAGS.add(handle_tag(t["c_type"]))
+    # An opaque object has no type name to derive a tag from, so the overlay
+    # supplies it. It is still a tag like any other: a stale or wrong-typed
+    # id misses the lookup rather than reaching libalpm.
+    for tag in OVERLAY.get("opaque_handles", {}).values():
+        if isinstance(tag, str):
+            HANDLE_TAGS.add(tag)
 
     owned = set(f["name"] for f in model["functions"]
                 if f["ret"]["kind"] == "string" and ret_string_owned(f))

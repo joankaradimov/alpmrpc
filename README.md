@@ -103,6 +103,16 @@ everything else, why it is not.
   It serves those and keeps waiting, which is the same loop the client runs
   in the other direction. The nesting is strict, so each side's reply is
   simply the next frame that is not a fresh request.
+- **An opaque `void *` is an object, and gets a handle like anything else.**
+  A changelog cursor is a `FILE *` the server is holding part-way through a
+  file. The header says `void`, so which kind of object it is — and therefore
+  which tag guards it — is an overlay entry; after that it behaves like every
+  other handle, and closing it drops the id so a later read misses instead of
+  reaching a cursor libalpm has already freed. mtree is deliberately *not*
+  declared this way: its open and close would work identically, but
+  `alpm_pkg_mtree_next` hands back a `struct archive_entry` the client has no
+  libarchive to read, so declaring the cursor would buy two thirds of an API
+  nobody could use.
 - **Bytes are not text.** A signature has NULs in it, so a JSON string would
   carry the first byte and stop. The three functions that deal in raw bytes
   send them base64 (`src/common/arpc_b64.c`), and the length that comes back
@@ -157,11 +167,16 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-165 of 193 functions are generated, plus 19 written by hand — the eighteen
+168 of 193 functions are generated, plus 19 written by hand — the eighteen
 callback setters, getters and ctx getters, and `alpm_filelist_contains`.
-`coverage.json` lists the remaining nine with a reason for each, and they are
-now three specific things rather than a list: `alpm_siglist_t`'s embedded
-gpgme key, the changelog cursor, and mtree.
+
+That leaves six, and they are two reasons rather than a list. Three are the
+PGP signature-checking functions, refused because `alpm_siglist_t`'s element
+embeds an `alpm_pgpkey_t` whose `data` is the gpgme key itself; every other
+field would cross fine, which is exactly the trap. The other three are mtree,
+where `alpm_pkg_mtree_next` hands back a `struct archive_entry` and reading
+it would mean the shim depending on libarchive — which is the one thing this
+DLL is built not to do. `coverage.json` says so per function.
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to
