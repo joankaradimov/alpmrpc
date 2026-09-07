@@ -112,7 +112,25 @@ run it before and after anything that touches the wire.
 
 ## Status
 
-A spike. 13 of 193 functions are on the wire — enough to exercise every
-mechanism end to end (handles, both string ownership models, out-params,
-lifetime, type safety). The remaining work is listed in `coverage.json`;
-the largest buckets are `alpm_list_t` returns (53) and callbacks (12).
+158 of 193 functions are generated, plus the twelve hand-written callback
+setters and getters. `coverage.json` lists everything else with a reason for
+each; what is left is small and specific — the two counted-array records,
+the opaque `void *` cursors (changelog, mtree), and `alpm_logaction`'s `...`.
+
+Carried callbacks: `logcb`, `progresscb`, `eventcb`, `questioncb`. `dlcb` and
+`fetchcb` are not, and their setters return -1 rather than accepting a
+callback that would then silently never fire.
+
+The read path works and is measured. Two things are written but not proven,
+and are listed here as untested code rather than working code:
+
+- **No question has ever fired.** All eight variants are marshalled and
+  registration is tested — `alpm_option_set_questioncb` returning 0 is what
+  says a trampoline was installed — but a question needs libalpm to have
+  something to ask, and none of the cheap triggers arise on a healthy
+  up-to-date install. Demonstrating it needs a scratch pacman root built to
+  contain a conflict.
+- **libalpm `fork()`s for scriptlets and hooks, and that has never been
+  exercised through this bridge.** The single-threaded server exists to keep
+  that fork on the path Cygwin supports; that the arrangement works is a
+  design argument, not a measurement.

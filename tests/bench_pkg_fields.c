@@ -12,7 +12,8 @@ int main(void){
 	alpm_list_t*c=alpm_db_get_pkgcache(db);
 	size_t n=alpm_list_count(c);
 	printf("  %zu packages\n\n", n);
-	printf("  %-26s %10s %10s\n","field","first col","rest (x%zu)");
+	char rest[24];snprintf(rest,sizeof(rest),"rest (x%zu)",n?n-1:0);
+	printf("  %-26s %10s %10s\n","field","first col",rest);
 	#define COL(label, expr) do{                                    \
 		double t0=us(); alpm_list_t*i=c; (void)(expr); double t1=us(); \
 		for(i=i->next;i;i=i->next) (void)(expr);                   \

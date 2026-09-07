@@ -113,6 +113,12 @@ GETTER(alpm_option_get_logcb, log, alpm_cb_log)
 SETTER(alpm_option_set_progresscb, progress, alpm_cb_progress, "progress")
 GETTER(alpm_option_get_progresscb, progress, alpm_cb_progress)
 
+SETTER(alpm_option_set_eventcb, event, alpm_cb_event, "event")
+GETTER(alpm_option_get_eventcb, event, alpm_cb_event)
+
+SETTER(alpm_option_set_questioncb, question, alpm_cb_question, "question")
+GETTER(alpm_option_get_questioncb, question, alpm_cb_question)
+
 /* Not yet marshalled. The pointer is stored so the getter round-trips, but
  * the server is told not to install a trampoline -- and the setter reports
  * failure, because a callback that is registered and then silently never
@@ -128,12 +134,6 @@ GETTER(alpm_option_get_progresscb, progress, alpm_cb_progress)
 		return -1;                                                   \
 	}
 
-UNIMPLEMENTED_SETTER(alpm_option_set_eventcb, event, alpm_cb_event)
-GETTER(alpm_option_get_eventcb, event, alpm_cb_event)
-
-SETTER(alpm_option_set_questioncb, question, alpm_cb_question, "question")
-GETTER(alpm_option_get_questioncb, question, alpm_cb_question)
-
 UNIMPLEMENTED_SETTER(alpm_option_set_dlcb, dl, alpm_cb_download)
 GETTER(alpm_option_get_dlcb, dl, alpm_cb_download)
 
@@ -142,8 +142,9 @@ GETTER(alpm_option_get_fetchcb, fetch, alpm_cb_fetch)
 
 /* ---- dispatch ---- */
 
-/* A pointer inside a question is an id, same as everywhere else, so the
- * caller can hand it straight to alpm_pkg_get_*. */
+/* A pointer inside an event or a question is an id, same as everywhere else,
+ * so the caller can hand it straight to alpm_pkg_get_*. Id 0 is NULL, which
+ * is what an install's absent oldpkg arrives as. */
 #define ID_TO_PKG(d, obj, key) 	((alpm_pkg_t *)(uintptr_t)aj_i64((d), aj_member((d), (obj), (key)), 0))
 
 static void fill_depend(alpm_depend_t *dep, const aj_doc *d, int n)
@@ -205,6 +206,89 @@ static void call_progress(reg *r, const aj_doc *d, int args)
 		    (int)aj_i64(d, aj_member(d, args, "percent"), 0),
 		    (size_t)aj_i64(d, aj_member(d, args, "howmany"), 0),
 		    (size_t)aj_i64(d, aj_member(d, args, "current"), 0));
+}
+
+/* Rebuild the event and hand it to the caller.
+ *
+ * alpm_event_t is a union selected by its type, so this fills exactly the
+ * member the server marshalled for that type and leaves the rest zeroed --
+ * see the mapping and where it comes from in the server's arpc_callbacks.c.
+ * A type that carried no payload arrives as a well-formed event with just
+ * its type set, which is what libalpm raises for it.
+ *
+ * Strings point into the parsed frame, which outlives the callback, and an
+ * absent one stays NULL rather than becoming "": a hook with no Description
+ * has a NULL desc and callers test it. */
+static void call_event(reg *r, const aj_doc *d, int args)
+{
+	if (!r || !r->event)
+		return;
+
+	alpm_event_t e;
+	alpm_depend_t optdep;
+	memset(&e, 0, sizeof(e));
+	memset(&optdep, 0, sizeof(optdep));
+	e.type = (alpm_event_type_t)aj_i64(d, aj_member(d, args, "type"), 0);
+
+	switch (e.type) {
+	case ALPM_EVENT_PACKAGE_OPERATION_START:
+	case ALPM_EVENT_PACKAGE_OPERATION_DONE:
+		e.package_operation.operation = (alpm_package_operation_t)
+			aj_i64(d, aj_member(d, args, "operation"), 0);
+		e.package_operation.oldpkg = ID_TO_PKG(d, args, "oldpkg");
+		e.package_operation.newpkg = ID_TO_PKG(d, args, "newpkg");
+		break;
+	case ALPM_EVENT_OPTDEP_REMOVAL:
+		e.optdep_removal.pkg = ID_TO_PKG(d, args, "pkg");
+		fill_depend(&optdep, d, aj_member(d, args, "optdep"));
+		e.optdep_removal.optdep = &optdep;
+		break;
+	case ALPM_EVENT_SCRIPTLET_INFO:
+		e.scriptlet_info.line =
+			aj_str(d, aj_member(d, args, "line"), NULL);
+		break;
+	case ALPM_EVENT_DATABASE_MISSING:
+		e.database_missing.dbname =
+			aj_str(d, aj_member(d, args, "dbname"), NULL);
+		break;
+	case ALPM_EVENT_PACNEW_CREATED:
+		e.pacnew_created.from_noupgrade = (int)
+			aj_i64(d, aj_member(d, args, "from_noupgrade"), 0);
+		e.pacnew_created.oldpkg = ID_TO_PKG(d, args, "oldpkg");
+		e.pacnew_created.newpkg = ID_TO_PKG(d, args, "newpkg");
+		e.pacnew_created.file =
+			aj_str(d, aj_member(d, args, "file"), NULL);
+		break;
+	case ALPM_EVENT_PACSAVE_CREATED:
+		e.pacsave_created.oldpkg = ID_TO_PKG(d, args, "oldpkg");
+		e.pacsave_created.file =
+			aj_str(d, aj_member(d, args, "file"), NULL);
+		break;
+	case ALPM_EVENT_HOOK_START:
+	case ALPM_EVENT_HOOK_DONE:
+		e.hook.when = (alpm_hook_when_t)
+			aj_i64(d, aj_member(d, args, "when"), 0);
+		break;
+	case ALPM_EVENT_HOOK_RUN_START:
+	case ALPM_EVENT_HOOK_RUN_DONE:
+		e.hook_run.name = aj_str(d, aj_member(d, args, "name"), NULL);
+		e.hook_run.desc = aj_str(d, aj_member(d, args, "desc"), NULL);
+		e.hook_run.position = (size_t)
+			aj_i64(d, aj_member(d, args, "position"), 0);
+		e.hook_run.total = (size_t)
+			aj_i64(d, aj_member(d, args, "total"), 0);
+		break;
+	case ALPM_EVENT_PKG_RETRIEVE_START:
+		e.pkg_retrieve.num = (size_t)
+			aj_i64(d, aj_member(d, args, "num"), 0);
+		e.pkg_retrieve.total_size = (off_t)
+			aj_i64(d, aj_member(d, args, "total_size"), 0);
+		break;
+	default:
+		break;
+	}
+
+	r->event(r->event_ctx, &e);
 }
 
 /* Rebuild the question, hand it to the caller, and read back what they set.
@@ -294,6 +378,8 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 		call_log(r, d, args);
 	else if (!strcmp(which, "progress"))
 		call_progress(r, d, args);
+	else if (!strcmp(which, "event"))
+		call_event(r, d, args);
 	else if (!strcmp(which, "question"))
 		ret = call_question(r, d, args);
 	/* An unknown callback is answered rather than ignored: the server is
