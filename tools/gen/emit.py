@@ -182,6 +182,26 @@ def counted_array(rec):
     return ca
 
 
+def variadic_fmt(fn):
+    """A variadic function whose `...` the client can format away.
+
+    The wire has no way to carry `...`, but the client is where the arguments
+    are, so it formats them and the text travels. The server then calls
+    libalpm with a literal "%s" and that text -- never with the text as the
+    format, which would read a % that came out of the formatting as one.
+
+    This is the mirror of what the server does for logcb, which consumes a
+    va_list and sends what it produced."""
+    p = OVERLAY.get("variadic_format", {}).get(fn["name"])
+    if not p:
+        return None
+    if not any(f["name"] == p and f["kind"] == "string"
+               for f in fn["params"]):
+        raise SystemExit("overlay: %s has no string param %r for "
+                         "variadic_format" % (fn["name"], p))
+    return p
+
+
 def field_ctype(rec, fname):
     for f in rec["fields"]:
         if f["name"] == fname:
@@ -227,7 +247,7 @@ def select(model):
         outs = set(out_params_of(n))
         why = None
 
-        if fn.get("variadic"):
+        if fn.get("variadic") and not variadic_fmt(fn):
             why = "variadic: the wire has no way to carry ..."
 
         if fn["ret"]["kind"] == "list" and ret_elem(n) is None:
@@ -775,6 +795,13 @@ def emit_server(gen, need, rin, src_header):
         o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
                  + qq(n + ": bad arguments") + ");\n\t}\n")
 
+        # The client already formatted the `...` away, so what arrived is
+        # text. It goes to libalpm as an argument to a literal "%s", never as
+        # the format itself -- a % that came out of the formatting is data.
+        vfmt = variadic_fmt(fn)
+        if vfmt:
+            args = [('"%s", ' + a) if a == vfmt else a for a in args]
+
         call = "%s(%s)" % (n, ", ".join(args))
         rk, rct = fn["ret"]["kind"], fn["ret"]["c_type"]
 
@@ -1025,7 +1052,7 @@ def emit_client(gen, need, rin, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_client.h"\n')
     o.append("#include <alpm.h>\n#include <alpm_list.h>\n")
-    o.append("#include <stdlib.h>\n\n")
+    o.append("#include <stdarg.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n")
     o.append("#if defined(__GNUC__) || defined(__clang__)\n"
              "#  define ARPC_MAYBE_UNUSED __attribute__((unused))\n"
              "#else\n"
@@ -1039,6 +1066,9 @@ def emit_client(gen, need, rin, src_header):
         spec = OVERLAY["functions"].get(n, {})
         sig = ", ".join("%s %s" % (p["c_type"], p["name"])
                         for p in fn["params"]) or "void"
+        vfmt = variadic_fmt(fn)
+        if vfmt:
+            sig += ", ..."
 
         # Frees a struct this client materialised. The server has
         # libalpm's own copy, which is not ours to free, so this never
@@ -1087,6 +1117,17 @@ def emit_client(gen, need, rin, src_header):
 
         o.append("%s %s(%s)\n{\n\tarpc_call c;\n" % (rct, n, sig))
 
+        if vfmt:
+            o.append("\t/* The wire cannot carry `...`, and this is where\n"
+                     "\t * the arguments are, so they are formatted here and\n"
+                     "\t * the text travels. */\n")
+            o.append("\tchar arpc_fmtbuf[4096];\n")
+            o.append("\tva_list arpc_ap;\n")
+            o.append("\tva_start(arpc_ap, %s);\n" % vfmt)
+            o.append("\tvsnprintf(arpc_fmtbuf, sizeof(arpc_fmtbuf), "
+                     "%s ? %s : \"\", arpc_ap);\n" % (vfmt, vfmt))
+            o.append("\tva_end(arpc_ap);\n")
+
         # A borrowed list is looked up before the call, not after: libalpm
         # hands back the same pointer for repeated calls, and re-fetching
         # would either break that or free a list the caller still holds.
@@ -1104,7 +1145,8 @@ def emit_client(gen, need, rin, src_header):
         for p in fn["params"]:
             k, pn = p["kind"], p["name"]
             if k == "string":
-                o.append("\tarpc_put_str(&c, %s);\n" % pn)
+                o.append("\tarpc_put_str(&c, %s);\n"
+                         % ("arpc_fmtbuf" if pn == vfmt else pn))
             elif k in ("scalar", "enum"):
                 o.append("\tarpc_put_i64(&c, (long long)%s);\n" % pn)
             elif k == "handle":

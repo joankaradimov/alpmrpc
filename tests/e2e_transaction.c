@@ -477,6 +477,49 @@ int main(int argc, char **argv)
 		      NULL);
 	}
 
+	printf("\n-- alpm_fetch_pkgurl fetches by url --\n");
+	/* alpmrpc-spare exists only in the repo, so this is a real fetch
+	 * rather than a lookup of something already in the cache. */
+	char url[1200];
+	snprintf(url, sizeof(url),
+		 "%s/alpmrpc-spare-1.0-1-x86_64.pkg.tar.zst", server);
+	alpm_list_t *urls = NULL, *fetched = NULL;
+	alpm_list_append(&urls, url);
+	rc = alpm_fetch_pkgurl(h, urls, &fetched);
+	alpm_list_free(urls);
+
+	check(rc == 0, "alpm_fetch_pkgurl()", rc == 0 ? NULL : trans_err(h));
+	snprintf(buf, sizeof(buf), "%zu path%s", alpm_list_count(fetched),
+		 alpm_list_count(fetched) == 1 ? "" : "s");
+	check(alpm_list_count(fetched) == 1, "one local path came back", buf);
+	if (fetched) {
+		const char *got = (const char *)fetched->data;
+		check(got && strstr(got, "alpmrpc-spare") != NULL,
+		      "naming the file it fetched", got);
+	}
+	/* The overlay says caller-owned, so this is the documented idiom. */
+	alpm_list_free_inner(fetched, free);
+	alpm_list_free(fetched);
+
+	printf("\n-- alpm_logaction formats here and writes there --\n");
+	/* libalpm writes nothing without a logfile configured; pacman sets
+	 * one from its config, and there is no config here. */
+	char logfile[1024];
+	snprintf(logfile, sizeof(logfile), "%s/var/log/pacman.log", posix_root);
+	check(alpm_option_set_logfile(h, logfile) == 0,
+	      "alpm_option_set_logfile()", logfile);
+
+	/* The %% matters: the client formats it to a literal %, and if the
+	 * server then used that text as a format string rather than as an
+	 * argument to one, this is where it would go wrong. */
+	rc = alpm_logaction(h, "alpmrpc", "fetched %d file%s, %d%% done\n",
+			    1, "", 50);
+	check(rc == 0, "alpm_logaction()", NULL);
+	slurp(win_root, "var/log/pacman.log", log, sizeof(log));
+	check(strstr(log, "fetched 1 file, 50% done") != NULL,
+	      "arguments formatted, and the % survived as a %",
+	      "var/log/pacman.log");
+
 	printf("\n-- a fetchcb takes downloading away from libalpm --\n");
 	check(alpm_option_set_fetchcb(h, on_fetch, NULL) == 0,
 	      "alpm_option_set_fetchcb()", NULL);

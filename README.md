@@ -103,6 +103,13 @@ everything else, why it is not.
   It serves those and keeps waiting, which is the same loop the client runs
   in the other direction. The nesting is strict, so each side's reply is
   simply the next frame that is not a fresh request.
+- **`...` is formatted on whichever side has the arguments.** The wire cannot
+  carry a `va_list` in either direction, so neither side tries. `logcb` fires
+  on the server, so the server formats it and sends the text;
+  `alpm_logaction` is called on the client, so the client formats it and
+  sends the text. The receiving side then passes that text as an argument to
+  a literal `"%s"` — never as the format, or a `%` that came out of the
+  formatting would be read as a conversion.
 - **Paths are the server's.** They cross unchanged in both directions, so a
   caller passes Cygwin paths to `alpm_initialize` and gets them back from
   `alpm_option_get_root`. `fetchcb` is where this becomes visible rather than
@@ -143,11 +150,11 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-160 of 193 functions are generated, plus 19 written by hand — the eighteen
+162 of 193 functions are generated, plus 19 written by hand — the eighteen
 callback setters, getters and ctx getters, and `alpm_filelist_contains`.
 `coverage.json` lists everything else with a reason for each; what is left is
 small and specific — the signature buffers, `alpm_siglist_t`'s embedded gpgme
-key, the opaque cursors (changelog, mtree), and `alpm_logaction`'s `...`.
+key, and the opaque cursors (changelog, mtree).
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to

@@ -168,6 +168,12 @@
         "data_len"
       ]
     },
+    "alpm_fetch_pkgurl": {
+      "out_params": [
+        "fetched"
+      ],
+      "doc": "urls goes in and fetched comes back. Its element type and its caller ownership were already stated; only the direction was missing."
+    },
     "alpm_pkg_load": {
       "out_params": [
         "pkg"
@@ -241,6 +247,18 @@
     "alpm_dep_from_string": "caller",
     "alpm_db_get_group": "borrowed",
     "alpm_pkg_get_files": "borrowed"
+  },
+  "variadic_format": {
+    "_comment": [
+      "A variadic function whose `...` the client can format away, and the",
+      "name of the format parameter it formats into. The wire cannot carry",
+      "`...`, but the client is where the arguments are -- so it formats them",
+      "and the text travels. The server then calls libalpm with a literal",
+      "\"%s\" and that text, never with the text as the format.",
+      "This is the mirror of logcb, where the server consumes a va_list and",
+      "sends what it produced."
+    ],
+    "alpm_logaction": "fmt"
   },
   "records_counted_array": {
     "_comment": [

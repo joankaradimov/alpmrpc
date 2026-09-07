@@ -31,7 +31,7 @@ REPO=alpmrpc
 ROOT=$(cd "$(dirname "$ROOT")" && pwd)/$(basename "$ROOT")
 
 rm -rf "$ROOT"
-mkdir -p "$ROOT"/{tmp,etc/pacman.d/hooks,var/lib/pacman/local,var/cache/pacman/pkg,usr/bin,bin,usr/share}
+mkdir -p "$ROOT"/{tmp,etc/pacman.d/hooks,var/lib/pacman/local,var/cache/pacman/pkg,var/log,usr/bin,bin,usr/share}
 
 # libalpm reads this before it will touch a local db it did not create.
 echo 9 > "$ROOT/var/lib/pacman/local/ALPM_DB_VERSION"
@@ -136,6 +136,9 @@ echo "packages:"
 mkpkg alpmrpc-base  cache
 mkpkg alpmrpc-rival cache alpmrpc-base
 mkpkg alpmrpc-extra repo
+# Never installed and never cached: something for alpm_fetch_pkgurl to fetch
+# that has not already been fetched by something else.
+mkpkg alpmrpc-spare repo
 
 # A file:// repo, so the download path runs with no network at all. repo-add
 # leaves alpmrpc.db as a symlink to the tarball; that is replaced with a copy
