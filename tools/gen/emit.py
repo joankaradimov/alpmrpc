@@ -162,6 +162,38 @@ def is_batchable(fn):
     return fn["ret"]["kind"] in ("string", "scalar", "enum")
 
 
+def counted_array(rec):
+    """A record that is a count plus a pointer to N elements.
+
+    The field kinds cannot express that -- an array field looks exactly like
+    a pointer to one struct -- so the overlay names the two fields, and this
+    checks they are really there. A typo here would otherwise produce code
+    that materialises exactly one element, which is the bug the whole entry
+    exists to prevent."""
+    ca = OVERLAY.get("records_counted_array", {}).get(rec["name"])
+    if not ca:
+        return None
+    names = {f["name"] for f in rec["fields"]}
+    for key in ("count", "items"):
+        if ca[key] not in names:
+            raise SystemExit(
+                "overlay: %s has no field %r for records_counted_array.%s"
+                % (rec["name"], ca[key], key))
+    return ca
+
+
+def field_ctype(rec, fname):
+    for f in rec["fields"]:
+        if f["name"] == fname:
+            return f["c_type"]
+    return None
+
+
+def base_type(c_type):
+    """alpm_file_t * -> alpm_file_t, for naming the pointee."""
+    return c_type.replace("const", "").rstrip(" *").strip()
+
+
 def exported_record(name):
     """Marshallers shared with the hand-written callback layer, which cannot
     call a static in a generated file."""
@@ -409,6 +441,17 @@ def emit_server_helpers(need, elems):
                  % (e["name"], e["c_type"]))
         o.append("\tif (!v) {\n\t\tajw_null(w);\n\t\treturn;\n\t}\n")
         o.append("\t(void)owner;\n")
+        ca = counted_array(rec)
+        if ca:
+            sub = elem_of(field_ctype(rec, ca["items"]))
+            o.append("\t/* A count and an array, not one struct: it goes as\n"
+                     "\t * the array, whose length is the count. */\n")
+            o.append("\tajw_arr_begin(w);\n")
+            o.append("\tfor (size_t i = 0; i < v->%s; i++)\n" % ca["count"])
+            o.append("\t\tput_%s(w, &v->%s[i], owner);\n"
+                     % (sub["name"], ca["items"]))
+            o.append("\tajw_arr_end(w);\n}\n\n")
+            continue
         o.append("\tajw_obj_begin(w);\n")
         for f in rec["fields"]:
             o.append("\tajw_key(w, %s);\n" % qq(f["name"]))
@@ -859,6 +902,14 @@ def cli_get_value(o, target, kind, c_type, node, indent, recname=None,
 def emit_client_helpers(need, elems):
     o = []
     for e in need:
+        base = base_type(e["c_type"])
+        # fill/clear work on a struct that already exists, which is what a
+        # counted array's elements are: they live in one allocation, not one
+        # each. get/free are those two plus the allocation.
+        o.append("ARPC_MAYBE_UNUSED static void fill_%s(%s *v, "
+                 "const aj_doc *d, int n);\n" % (e["name"], base))
+        o.append("ARPC_MAYBE_UNUSED static void clear_%s(%s *v);\n"
+                 % (e["name"], base))
         o.append("ARPC_MAYBE_UNUSED static void *get_%s(const aj_doc *d, "
                  "int n);\n" % e["name"])
         # A record that only ever appears in caller-owned lists has no
@@ -873,30 +924,68 @@ def emit_client_helpers(need, elems):
     for e in need:
         rec = e["record"]
         ct = e["c_type"]
+        base = base_type(ct)
+        ca = counted_array(rec)
+
+        o.append("static void fill_%s(%s *v, const aj_doc *d, int n)\n{\n"
+                 % (e["name"], base))
+        if ca:
+            sub = elem_of(field_ctype(rec, ca["items"]))
+            o.append("\t/* One allocation for the whole array, filled in\n"
+                     "\t * place: the elements are values here, not\n"
+                     "\t * pointers, so there is nothing per-element to own."
+                     "\n\t * The count is whatever actually arrived, not what"
+                     "\n\t * was promised. */\n")
+            o.append("\tsize_t cnt = (size_t)aj_count(d, n);\n")
+            o.append("\tif (!cnt)\n\t\treturn;\n")
+            o.append("\tv->%s = (%s *)calloc(cnt, sizeof(*v->%s));\n"
+                     % (ca["items"], base_type(sub["c_type"]), ca["items"]))
+            o.append("\tif (!v->%s)\n\t\treturn;\n" % ca["items"])
+            o.append("\tsize_t i = 0;\n")
+            o.append("\tfor (int e = aj_first(d, n); e >= 0 && i < cnt;\n"
+                     "\t     e = aj_next(d, e), i++)\n")
+            o.append("\t\tfill_%s(&v->%s[i], d, e);\n"
+                     % (sub["name"], ca["items"]))
+            o.append("\tv->%s = i;\n" % ca["count"])
+        else:
+            for f in rec["fields"]:
+                node = "aj_member(d, n, %s)" % qq(f["name"])
+                cli_get_value(o, "v->" + f["name"], f["kind"], f["c_type"],
+                              node, 1, rec["name"], f["name"])
+        o.append("}\n\n")
+
         o.append("static void *get_%s(const aj_doc *d, int n)\n{\n" % e["name"])
         o.append("\tif (n < 0 || aj_is_null(d, n))\n\t\treturn NULL;\n")
         o.append("\t%s v = (%s)calloc(1, sizeof(*v));\n" % (ct, ct))
         o.append("\tif (!v)\n\t\treturn NULL;\n")
-        for f in rec["fields"]:
-            node = "aj_member(d, n, %s)" % qq(f["name"])
-            cli_get_value(o, "v->" + f["name"], f["kind"], f["c_type"], node,
-                          1, rec["name"], f["name"])
+        o.append("\tfill_%s(v, d, n);\n" % e["name"])
         o.append("\treturn v;\n}\n\n")
+
+        o.append("static void clear_%s(%s *v)\n{\n" % (e["name"], base))
+        o.append("\tif (!v)\n\t\treturn;\n")
+        if ca:
+            sub = elem_of(field_ctype(rec, ca["items"]))
+            o.append("\tfor (size_t i = 0; i < v->%s; i++)\n" % ca["count"])
+            o.append("\t\tclear_%s(&v->%s[i]);\n"
+                     % (sub["name"], ca["items"]))
+            o.append("\tfree(v->%s);\n" % ca["items"])
+        else:
+            for f in rec["fields"]:
+                if f["kind"] == "string":
+                    o.append("\tfree(v->%s);\n" % f["name"])
+                elif f["kind"] == "struct_ptr":
+                    sub = elem_of(f["c_type"])
+                    o.append("\tfree_%s(v->%s);\n" % (sub["name"], f["name"]))
+                elif f["kind"] == "list":
+                    sub = field_list_elem(rec["name"], f["name"])
+                    o.append("\tarpc_free_list(v->%s, %s);\n"
+                             % (f["name"], elem_free_fn(sub)))
+                # handle fields hold ids, not memory
+        o.append("}\n\n")
 
         o.append("static void free_%s(void *p)\n{\n" % e["name"])
         o.append("\t%s v = (%s)p;\n\tif (!v)\n\t\treturn;\n" % (ct, ct))
-        for f in rec["fields"]:
-            if f["kind"] == "string":
-                o.append("\tfree(v->%s);\n" % f["name"])
-            elif f["kind"] == "struct_ptr":
-                sub = elem_of(f["c_type"])
-                o.append("\tfree_%s(v->%s);\n" % (sub["name"], f["name"]))
-            elif f["kind"] == "list":
-                sub = field_list_elem(rec["name"], f["name"])
-                o.append("\tarpc_free_list(v->%s, %s);\n"
-                         % (f["name"], elem_free_fn(sub)))
-            # handle fields hold ids, not memory
-        o.append("\tfree(v);\n}\n\n")
+        o.append("\tclear_%s(v);\n\tfree(v);\n}\n\n" % e["name"])
 
     for e in elems:
         o.append("static alpm_list_t *build_list_%s(const aj_doc *d, int arr)\n"

@@ -349,6 +349,49 @@ int main(int argc, char **argv)
 	check(hook_starts > 0 && hook_runs > 0,
 	      "and was narrated by ALPM_EVENT_HOOK_*", hook_desc);
 
+	/* ---- the file list, which is a counted array ---- */
+
+	printf("\n-- the package's file list --\n");
+	char buf[256];
+	alpm_db_t *localdb = alpm_get_localdb(h);
+	alpm_pkg_t *installed = localdb ?
+		alpm_db_get_pkg(localdb, "alpmrpc-base") : NULL;
+	check(installed != NULL, "alpm_db_get_pkg() off the local db",
+	      "alpmrpc-base");
+
+	alpm_filelist_t *fl = installed ? alpm_pkg_get_files(installed) : NULL;
+	snprintf(buf, sizeof(buf), "%zu entries", fl ? fl->count : 0);
+	check(fl != NULL && fl->count > 1,
+	      "alpm_pkg_get_files() brought the whole array", buf);
+	/* The reason this record was refused for so long is that materialising
+	 * it field by field yields exactly one element and looks fine. So the
+	 * count is the test, and so is the last entry differing from the
+	 * first. */
+	if (fl && fl->count > 1) {
+		check(fl->files[fl->count - 1].name != NULL
+		      && strcmp(fl->files[0].name,
+				fl->files[fl->count - 1].name) != 0,
+		      "the last entry is not the first one repeated",
+		      fl->files[fl->count - 1].name);
+	}
+
+	const char *owned = "usr/share/alpmrpc-scratch/alpmrpc-base.txt";
+	alpm_file_t *found = alpm_filelist_contains(fl, owned);
+	check(found != NULL, "alpm_filelist_contains() finds a file it owns",
+	      owned);
+	if (found) {
+		check(found >= fl->files && found < fl->files + fl->count,
+		      "and returns a pointer into the caller's own array",
+		      "not a copy");
+		snprintf(buf, sizeof(buf), "%lld bytes", (long long)found->size);
+		check(found->size > 0, "with the rest of the entry filled in",
+		      buf);
+	}
+	check(alpm_filelist_contains(fl, "usr/share/alpmrpc-scratch/nope.txt")
+	      == NULL, "and does not find one it does not", NULL);
+	check(fl != NULL && alpm_pkg_get_files(installed) == fl,
+	      "a repeat call is the same pointer", "borrowed, so cached");
+
 	/* ---- the conflict, which is a question ---- */
 
 	printf("\n-- installing alpmrpc-rival, which conflicts --\n");
@@ -384,7 +427,7 @@ int main(int argc, char **argv)
 	/* ---- the download path ---- */
 
 	printf("\n-- a file:// repo, so downloading happens with no network --\n");
-	char server[1024], buf[256];
+	char server[1024];
 	snprintf(server, sizeof(server), "file://%s/repo", posix_root);
 
 	check(alpm_option_set_dlcb(h, on_dl, NULL) == 0,

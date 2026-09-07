@@ -207,7 +207,8 @@
     "alpm_option_get_fetchcb_ctx": "hand-written in arpc_callbacks.c",
     "alpm_option_get_eventcb_ctx": "hand-written in arpc_callbacks.c",
     "alpm_option_get_questioncb_ctx": "hand-written in arpc_callbacks.c",
-    "alpm_option_get_progresscb_ctx": "hand-written in arpc_callbacks.c"
+    "alpm_option_get_progresscb_ctx": "hand-written in arpc_callbacks.c",
+    "alpm_filelist_contains": "hand-written in arpc_local.c"
   },
   "spike": {
     "_comment": [
@@ -238,17 +239,31 @@
       "alpm_dep_free; alpm_db_get_group returns the db's own entry."
     ],
     "alpm_dep_from_string": "caller",
-    "alpm_db_get_group": "borrowed"
+    "alpm_db_get_group": "borrowed",
+    "alpm_pkg_get_files": "borrowed"
+  },
+  "records_counted_array": {
+    "_comment": [
+      "A count plus a pointer to N elements, rather than a pointer to one.",
+      "The field kinds cannot tell the difference -- `alpm_file_t *files` looks",
+      "exactly like a pointer to a single struct -- so which field holds the",
+      "count and which holds the array is stated here. The element type comes",
+      "off the array field, so it does not need saying twice.",
+      "These cross as a plain array; its length is the count."
+    ],
+    "_alpm_filelist_t": { "count": "count", "items": "files" }
   },
   "records_unsupported": {
     "_comment": [
-      "Records the materialiser must refuse rather than get wrong. Both are a",
-      "count plus a pointer to an array -- not a pointer to one struct, which",
-      "is what the generator would otherwise assume. Supporting them means",
-      "teaching it about counted arrays."
+      "Records the materialiser must refuse rather than get wrong.",
+      "alpm_siglist_t is a counted array too, and that part is now supported.",
+      "What still stops it is inside the element: alpm_sigresult_t embeds an",
+      "alpm_pgpkey_t by value, whose `data` is the gpgme key itself. Every",
+      "other field of that key would cross fine, so this would be a working",
+      "function with one silently NULL member -- which is the kind of nearly",
+      "right the rest of this generator refuses to produce."
     ],
-    "_alpm_filelist_t": "counted array (count + files), not a single struct",
-    "_alpm_siglist_t": "counted array (count + results), not a single struct"
+    "_alpm_siglist_t": "element embeds alpm_pgpkey_t, whose data is an opaque gpgme key"
   },
   "out_list_own": {
     "_comment": [

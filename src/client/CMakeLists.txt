@@ -13,6 +13,7 @@ set(ALPM_SOVERSION 14)
 add_library(alpm SHARED
   arpc_client.c
   arpc_callbacks.c
+  arpc_local.c
   vendor/alpm_list.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c

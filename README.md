@@ -71,12 +71,23 @@ everything else, why it is not.
   client materialises it; the client writes one and the server rebuilds a
   temporary for the duration of the call. As with lists, `const` marks the
   read-only inputs, and a non-const struct param is skipped rather than
-  guessed at. Two records are refused outright -- `alpm_filelist_t` and
-  `alpm_siglist_t` are a count plus an array, not a pointer to one struct,
-  and the generator would otherwise materialise exactly one element.
+  guessed at.
+- **A counted array is a record shape, not a struct pointer.**
+  `alpm_filelist_t` is a `count` and a pointer to *n* files, which in the
+  header looks exactly like a pointer to one — so materialising it field by
+  field would silently produce a list of length one. Which field is the
+  count and which is the array is an overlay entry; the array then crosses
+  as an array, and the elements land in a single allocation because that is
+  what they are. `alpm_siglist_t` is the same shape and still refused, for a
+  different reason: its element embeds an `alpm_pgpkey_t` whose `data` is
+  the gpgme key itself.
 - **`alpm_dep_free` and friends never reach the server.** They free a struct
   this client materialised; the server has libalpm's own copy, which is not
   ours to free. The generated stub calls the matching free helper locally.
+  `alpm_filelist_contains` stays here for the mirror reason: it must return a
+  pointer *into* the caller's own filelist, and a round trip would return one
+  into libalpm's copy. It is libalpm's own `bsearch`, in
+  `src/client/arpc_local.c`.
 - **Callbacks run nested inside the call that triggered them.** libalpm
   calls back from the middle of an operation, and a question has to be
   answered before the transaction that asked it can continue. So the server
@@ -132,10 +143,11 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-159 of 193 functions are generated, plus the twelve hand-written callback
-setters and getters. `coverage.json` lists everything else with a reason for
-each; what is left is small and specific — the two counted-array records,
-the opaque `void *` cursors (changelog, mtree), and `alpm_logaction`'s `...`.
+160 of 193 functions are generated, plus 19 written by hand — the eighteen
+callback setters, getters and ctx getters, and `alpm_filelist_contains`.
+`coverage.json` lists everything else with a reason for each; what is left is
+small and specific — the signature buffers, `alpm_siglist_t`'s embedded gpgme
+key, the opaque cursors (changelog, mtree), and `alpm_logaction`'s `...`.
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to
