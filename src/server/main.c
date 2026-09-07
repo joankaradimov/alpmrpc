@@ -234,9 +234,33 @@ static char *recv_framed(HANDLE pipe)
 	return buf;
 }
 
+/* A request frame carries a method; a callback's answer does not. */
+static int is_request(const char *frame)
+{
+	aj_doc d;
+	int req = 0;
+	if (aj_parse(&d, frame, strlen(frame)))
+		req = aj_member(&d, 0, "method") >= 0;
+	aj_free(&d);
+	return req;
+}
+
 /* Called from inside a libalpm callback, part-way through serving a request.
- * The client is in its own frame loop and answers this before its original
- * call can return, so a plain send-then-read is the correct shape. */
+ *
+ * What comes back is not always the answer. A callback is entitled to ask
+ * libalpm something before it can decide -- pacman's own conflict prompt
+ * calls alpm_pkg_get_name() on both packages to say which they are -- and on
+ * this side that arrives as an ordinary request while the callback is still
+ * outstanding. So this serves whatever requests turn up and keeps waiting,
+ * which is the mirror of the frame loop the client runs for a callback
+ * arriving while a call is outstanding. Reading one frame and calling it the
+ * answer looked right until a callback did any work, and then it desynced
+ * the pipe: the request was consumed as the answer, and every frame after it
+ * was one out of step.
+ *
+ * The nesting is strict, which is what makes "the next frame that is not a
+ * request" the right rule. Each exchange returns only once its own answer
+ * arrives, so answers unwind innermost first. */
 int arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
 		       char **reply_out)
 {
@@ -246,12 +270,29 @@ int arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
 	logf_("cb-> %s", frame);
 	if (!send_framed(c->pipe, frame, len))
 		return 0;
-	char *reply = recv_framed(c->pipe);
-	if (!reply)
-		return 0;
-	logf_("cb<- %s", reply);
-	*reply_out = reply;
-	return 1;
+
+	for (;;) {
+		char *f = recv_framed(c->pipe);
+		if (!f)
+			return 0;
+
+		if (!is_request(f)) {
+			logf_("cb<- %s", f);
+			*reply_out = f;
+			return 1;
+		}
+
+		logf_("--> nested %s", f);
+		char *rsp = arpc_handle_frame(f, strlen(f));
+		free(f);
+		if (!rsp)
+			return 0;
+		logf_("<-- nested %s", rsp);
+		int sent = send_framed(c->pipe, rsp, strlen(rsp));
+		free(rsp);
+		if (!sent)
+			return 0;
+	}
 }
 
 static void serve_connection(HANDLE pipe)

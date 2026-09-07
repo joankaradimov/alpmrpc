@@ -72,6 +72,9 @@ ExternalProject_Add(client
   CMAKE_ARGS
     -DALPMRPC_GEN_DIR=${ALPMRPC_GEN_DIR}
     -DALPMRPC_BUILD_TESTS=${ALPMRPC_BUILD_TESTS}
+    # Only the transaction test needs this, to build its fixture root with
+    # MSYS2's own bash. The client itself links nothing from there.
+    -DMSYS2_ROOT=${MSYS2_ROOT}
     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
     -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
   BUILD_ALWAYS 1)

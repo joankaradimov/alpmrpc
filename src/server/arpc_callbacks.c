@@ -83,11 +83,13 @@ static long long cb_call(const char *which, uint64_t handle, aj_w *args,
 	if (!g_conn)
 		return dflt;
 
+	long long seq = g_seq++;
+
 	aj_w w;
 	ajw_init(&w);
 	ajw_obj_begin(&w);
 	ajw_key(&w, "cb");     ajw_str(&w, which);
-	ajw_key(&w, "seq");    ajw_i64(&w, g_seq++);
+	ajw_key(&w, "seq");    ajw_i64(&w, seq);
 	ajw_key(&w, "handle"); ajw_i64(&w, (long long)handle);
 	ajw_key(&w, "args");
 	if (args && args->buf)
@@ -104,8 +106,16 @@ static long long cb_call(const char *which, uint64_t handle, aj_w *args,
 
 	aj_doc d;
 	long long r = dflt;
-	if (aj_parse(&d, reply, strlen(reply)))
-		r = aj_i64(&d, aj_member(&d, 0, "ret"), dflt);
+	if (aj_parse(&d, reply, strlen(reply))) {
+		/* Callbacks nest: one can ask libalpm something, and that can
+		 * raise another. So the answer is matched to the question
+		 * rather than assumed to be the next thing along -- a
+		 * mismatch means the pipe is a frame out of step, and taking
+		 * the number anyway would answer one question with another's
+		 * reply. */
+		if (aj_i64(&d, aj_member(&d, 0, "cbseq"), -1) == seq)
+			r = aj_i64(&d, aj_member(&d, 0, "ret"), dflt);
+	}
 	aj_free(&d);
 	free(reply);
 	return r;

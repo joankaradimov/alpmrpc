@@ -65,6 +65,35 @@ if(ALPMRPC_BUILD_TESTS)
   target_link_libraries(e2e_callbacks PRIVATE alpm)
   add_test(NAME e2e_callbacks COMMAND e2e_callbacks)
 
+  # A transaction has to be allowed to change something, so it runs against
+  # a throwaway root rather than the real installation. The fixture is built
+  # by MSYS2's bash: the packages are made with bsdtar, and the shell that
+  # goes inside the root -- scriptlets and hooks are chrooted there -- is
+  # MSYS2's own. Rebuilt before every run, because the test installs into it.
+  if(MSYS2_ROOT AND EXISTS "${MSYS2_ROOT}/usr/bin/bash.exe")
+    set(_scratch ${CMAKE_CURRENT_BINARY_DIR}/scratch)
+
+    add_test(NAME scratch_root
+             COMMAND "${MSYS2_ROOT}/usr/bin/bash.exe"
+                     "${_tests}/scratch/mkroot.sh" "${_scratch}")
+    set_tests_properties(scratch_root PROPERTIES FIXTURES_SETUP scratch)
+
+    add_executable(e2e_transaction ${_tests}/e2e_transaction.c)
+    target_link_libraries(e2e_transaction PRIVATE alpm)
+    add_test(NAME e2e_transaction COMMAND e2e_transaction "${_scratch}")
+    set_tests_properties(e2e_transaction PROPERTIES FIXTURES_REQUIRED scratch)
+
+    # Rebuilds the fixture itself between runs, so it is not part of ctest.
+    add_executable(bench_transaction ${_tests}/bench_transaction.c)
+    target_link_libraries(bench_transaction PRIVATE alpm)
+    set_target_properties(bench_transaction PROPERTIES
+      # bench_transaction <root> <mkroot.sh> <msys2 root>
+      FOLDER bench)
+  else()
+    message(STATUS
+      "No MSYS2 bash: skipping the transaction test, which needs a fixture root")
+  endif()
+
   add_executable(bench_pkg_fields ${_tests}/bench_pkg_fields.c)
   target_link_libraries(bench_pkg_fields PRIVATE alpm)
 

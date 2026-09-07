@@ -86,6 +86,12 @@ everything else, why it is not.
   not an optimisation -- it is the only shape a synchronous callback can
   take -- and it keeps the server single-threaded, which is what keeps
   libalpm's `fork()` on the path Cygwin supports.
+- **And a callback may call back.** pacman's own conflict prompt asks
+  libalpm the names of the two packages before it can phrase the question,
+  so a request can arrive while the server is blocked waiting for an answer.
+  It serves those and keeps waiting, which is the same loop the client runs
+  in the other direction. The nesting is strict, so each side's reply is
+  simply the next frame that is not a fresh request.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. Caller-owned lists are
@@ -106,13 +112,20 @@ everything else, why it is not.
 ## Tests
 
 `ctest` from the client build directory runs codec round-trip tests and the
-end-to-end test (which launches a server on demand). `bench_codec` reports
-round-trip cost, the codec's share of it, and throughput on a bulk payload --
-run it before and after anything that touches the wire.
+end-to-end tests (which launch a server on demand). The transaction test
+installs packages for real, so it runs against a throwaway root that
+`tests/scratch/mkroot.sh` rebuilds before every run -- two packages that
+conflict by name, each with a scriptlet, and a hook. That root carries its
+own `/bin/sh`, because scriptlets and hooks are `chroot`ed into it.
+
+`bench_codec` reports round-trip cost, the codec's share of it, and
+throughput on a bulk payload -- run it before and after anything that
+touches the wire. `bench_transaction` does the same for the write path; it
+rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-158 of 193 functions are generated, plus the twelve hand-written callback
+159 of 193 functions are generated, plus the twelve hand-written callback
 setters and getters. `coverage.json` lists everything else with a reason for
 each; what is left is small and specific — the two counted-array records,
 the opaque `void *` cursors (changelog, mtree), and `alpm_logaction`'s `...`.
@@ -121,16 +134,23 @@ Carried callbacks: `logcb`, `progresscb`, `eventcb`, `questioncb`. `dlcb` and
 `fetchcb` are not, and their setters return -1 rather than accepting a
 callback that would then silently never fire.
 
-The read path works and is measured. Two things are written but not proven,
-and are listed here as untested code rather than working code:
+Both paths work and are measured. A real transaction has been driven end to
+end against the throwaway root, which settled the two things that were
+previously written but unproven:
 
-- **No question has ever fired.** All eight variants are marshalled and
-  registration is tested — `alpm_option_set_questioncb` returning 0 is what
-  says a trampoline was installed — but a question needs libalpm to have
-  something to ask, and none of the cheap triggers arise on a healthy
-  up-to-date install. Demonstrating it needs a scratch pacman root built to
-  contain a conflict.
-- **libalpm `fork()`s for scriptlets and hooks, and that has never been
-  exercised through this bridge.** The single-threaded server exists to keep
-  that fork on the path Cygwin supports; that the arrangement works is a
-  design argument, not a measurement.
+- **A question fires, is answered, and the answer reaches libalpm.** An
+  `ALPM_QUESTION_CONFLICT_PKG` arrives with both packages as usable handles
+  — the callback calls `alpm_pkg_get_name` on them, which is a request
+  travelling *into* a server that is blocked waiting for that same
+  callback's answer — and saying yes is what makes libalpm remove one
+  package and install the other.
+- **libalpm forks and execs a shell, for a scriptlet and again for a hook,
+  and the bridge survives it.** That is what the single-threaded server was
+  arranged for. The test checks it against the files the shell left inside
+  the root rather than against anything libalpm reported.
+
+What it costs: the callback traffic of a two-package transaction is 46
+frames and 0.7 ms of a 1.8 s commit, 0.04%. A transaction is `fork`, `exec`
+and disk; the bridge is not what it is waiting for. Codecs are therefore
+still not worth revisiting — the read path said the codec is 2% of a call,
+and the write path does not disagree.
