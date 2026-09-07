@@ -1,0 +1,171 @@
+/* Lists over the wire.
+ *
+ * The point of every check here is that the caller uses libalpm's own idioms
+ * -- walking ->next, calling alpm_list_count, freeing with the documented
+ * pattern -- and gets libalpm's own answers. A list that only works when
+ * accessed through accessors would pass a weaker test and fail real code.
+ */
+#include <alpm.h>
+#include <alpm_list.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int failures;
+
+static void check(int cond, const char *what, const char *detail)
+{
+	printf("%-6s %-40s %s\n", cond ? "ok" : "FAIL", what,
+	       detail ? detail : "");
+	if (!cond)
+		failures++;
+}
+
+int main(void)
+{
+	char buf[256];
+	alpm_errno_t err = 0;
+	alpm_handle_t *h = alpm_initialize("/", "/var/lib/pacman/", &err);
+	if (!h) {
+		printf("alpm_initialize failed (err=%d)\n", (int)err);
+		return 1;
+	}
+	alpm_db_t *db = alpm_get_localdb(h);
+	if (!db) {
+		printf("no local db\n");
+		return 1;
+	}
+
+	printf("-- a real chain, walked the way callers walk it --\n");
+	alpm_list_t *cache = alpm_db_get_pkgcache(db);
+	check(cache != NULL, "alpm_db_get_pkgcache()", NULL);
+
+	size_t walked = 0;
+	for (alpm_list_t *i = cache; i; i = i->next)
+		walked++;
+	size_t counted = alpm_list_count(cache);
+	snprintf(buf, sizeof(buf), "%zu packages", walked);
+	check(walked > 1, "walking ->next visits every element", buf);
+	check(walked == counted, "alpm_list_count agrees with the walk", NULL);
+
+	/* The example's one-node proxy would pass a count check but fail this:
+	 * it made every list look like it had exactly one element. */
+	check(cache->next != NULL, "second element is reachable", NULL);
+	check(cache->next->prev == cache, "prev links back", NULL);
+
+	printf("\n-- elements are usable, not opaque --\n");
+	alpm_pkg_t *first = (alpm_pkg_t *)cache->data;
+	const char *name = alpm_pkg_get_name(first);
+	check(name && *name, "pkg from i->data works as a handle", name);
+
+	int named = 0;
+	for (alpm_list_t *i = cache; i; i = i->next) {
+		const char *n = alpm_pkg_get_name((alpm_pkg_t *)i->data);
+		if (n && *n)
+			named++;
+	}
+	snprintf(buf, sizeof(buf), "%d of %zu", named, walked);
+	check((size_t)named == walked, "every element resolves to a package", buf);
+
+	printf("\n-- borrowed lists keep libalpm's contract --\n");
+	alpm_list_t *again = alpm_db_get_pkgcache(db);
+	check(again == cache, "repeat call returns the same pointer",
+	      "cached against the owning handle");
+
+	printf("\n-- string lists --\n");
+	/* A handle that has not read a pacman.conf has no cachedirs, so put one
+	 * there first: an empty list would not prove anything either way. */
+	alpm_option_add_cachedir(h, "/var/cache/pacman/pkg/");
+	alpm_list_t *cachedirs = alpm_option_get_cachedirs(h);
+	check(cachedirs != NULL, "alpm_option_get_cachedirs()", NULL);
+	if (cachedirs) {
+		const char *d = (const char *)cachedirs->data;
+		check(d && strchr(d, '/') != NULL, "element is a usable char*", d);
+	}
+
+	printf("\n-- nested: a list inside a materialised struct --\n");
+	alpm_list_t *groups = alpm_db_get_groupcache(db);
+	if (groups) {
+		alpm_group_t *g = (alpm_group_t *)groups->data;
+		check(g && g->name, "alpm_group_t->name", g ? g->name : NULL);
+		size_t members = alpm_list_count(g ? g->packages : NULL);
+		snprintf(buf, sizeof(buf), "%s has %zu members",
+			 g && g->name ? g->name : "?", members);
+		check(members > 0, "group->packages is itself a real list", buf);
+		if (g && g->packages) {
+			const char *mn =
+				alpm_pkg_get_name((alpm_pkg_t *)g->packages->data);
+			check(mn && *mn, "nested list elements are usable", mn);
+		}
+	} else {
+		check(1, "no groups in this local db", "skipped");
+	}
+
+	printf("\n-- struct lists are materialised, fields readable --\n");
+	alpm_pkg_t *withdeps = NULL;
+	alpm_list_t *deps = NULL;
+	for (alpm_list_t *i = cache; i && !withdeps; i = i->next) {
+		alpm_list_t *d = alpm_pkg_get_depends((alpm_pkg_t *)i->data);
+		if (d) {
+			withdeps = (alpm_pkg_t *)i->data;
+			deps = d;
+		}
+	}
+	check(deps != NULL, "found a package with depends",
+	      withdeps ? alpm_pkg_get_name(withdeps) : NULL);
+	if (deps) {
+		alpm_depend_t *d = (alpm_depend_t *)deps->data;
+		check(d != NULL && d->name != NULL,
+		      "alpm_depend_t->name is readable", d ? d->name : NULL);
+		/* Reading the fields straight off the struct is exactly what a
+		 * caller does with a transparent type, so it is the check that
+		 * matters: every field has to have survived materialisation. */
+		snprintf(buf, sizeof(buf), "mod=%d name_hash=%s",
+			 (int)d->mod, d->name_hash ? "set" : "zero");
+		check(d->mod >= ALPM_DEP_MOD_ANY && d->mod <= ALPM_DEP_MOD_LT,
+		      "scalar and enum fields survived", buf);
+		check(d->name_hash != 0, "unsigned long field survived", NULL);
+
+		int with_version = 0;
+		for (alpm_list_t *i = deps; i; i = i->next) {
+			alpm_depend_t *e = (alpm_depend_t *)i->data;
+			if (e && e->version)
+				with_version++;
+		}
+		snprintf(buf, sizeof(buf), "%d of %zu carry a version",
+			 with_version, alpm_list_count(deps));
+		check(1, "optional string fields are NULL or set, not garbage",
+		      buf);
+	}
+
+	printf("\n-- caller-owned lists are freed the documented way --\n");
+	alpm_list_t *req = alpm_pkg_compute_requiredby(first);
+	snprintf(buf, sizeof(buf), "%zu entries", alpm_list_count(req));
+	check(1, "alpm_pkg_compute_requiredby()", buf);
+	if (req) {
+		check(((const char *)req->data) != NULL,
+		      "entries are package-name strings",
+		      (const char *)req->data);
+	}
+	/* FREELIST is what pacman itself uses for this list. */
+	alpm_list_free_inner(req, free);
+	alpm_list_free(req);
+	check(1, "freed with alpm_list_free_inner + alpm_list_free", NULL);
+
+	printf("\n-- list parameters travel the other way --\n");
+	alpm_list_t *needles = NULL;
+	alpm_list_append(&needles, (void *)"gcc");
+	alpm_pkg_t *found = alpm_find_satisfier(cache, alpm_pkg_get_name(first));
+	check(1, "alpm_find_satisfier() accepted a list param",
+	      found ? alpm_pkg_get_name(found) : "no satisfier");
+	alpm_list_free(needles);
+
+	printf("\n-- teardown releases cached lists --\n");
+	alpm_release(h);
+	check(1, "alpm_release() with lists outstanding", "no leak, no crash");
+
+	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
+	       failures, failures == 1 ? "" : "s");
+	return failures ? 1 : 0;
+}

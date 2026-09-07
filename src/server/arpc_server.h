@@ -32,6 +32,16 @@ long long   arpc_arg_i64(arpc_req *rq, int i);
 void       *arpc_arg_handle(arpc_req *rq, int i, arpc_handle_tag tag);
 uint64_t    arpc_arg_id(arpc_req *rq, int i);
 int         arpc_req_bad(const arpc_req *rq);
+void        arpc_req_mark_bad(arpc_req *rq);
+
+/* Raw node access. Generated list code walks the request tree directly
+ * rather than going through a typed accessor per element. */
+int         arpc_arg_node(arpc_req *rq, int i);
+int         arpc_node_is_null(const arpc_req *rq, int n);
+int         arpc_node_count(const arpc_req *rq, int n);
+int         arpc_node_elem(const arpc_req *rq, int arr, int k);
+long long   arpc_node_i64(const arpc_req *rq, int n);
+char       *arpc_node_strdup(const arpc_req *rq, int n);
 
 /* ---- response ---- */
 
@@ -48,6 +58,12 @@ void arpc_ret_i64(arpc_res *rs, long long v);
 void arpc_ret_str(arpc_res *rs, const char *s);
 void arpc_ret_handle(arpc_res *rs, uint64_t id);
 void arpc_out_i64(arpc_res *rs, const char *name, long long v);
+
+/* Open the "ret" slot and hand back the writer, so generated code can emit a
+ * composite value (an array, an object) straight into the response instead of
+ * building it somewhere else and copying it in. */
+void  arpc_ret_begin(arpc_res *rs);
+aj_w *arpc_res_writer(arpc_res *rs);
 int  arpc_fail(arpc_res *rs, int code, const char *msg);
 
 /* ---- handle table ----

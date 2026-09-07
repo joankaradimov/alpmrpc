@@ -194,48 +194,120 @@ static void disconnect(void)
 
 /* ---------------------------------------------------- borrowed-string cache */
 
-typedef struct interned {
-	struct interned *next;
+/* One cache for everything libalpm hands back as borrowed: strings and
+ * lists both stay valid as long as the object they came from, so both are
+ * keyed by (owning handle, function name) and released together when that
+ * handle is. */
+typedef struct owned {
+	struct owned *next;
 	uint64_t owner;
-	const char *key;
-	char *value;
-} interned;
+	const char *key;        /* generated literal; static lifetime */
+	void *value;
+	alpm_list_fn_free elem_free;
+	int is_list;
+} owned;
 
-static interned *g_interned;
+static owned *g_owned;
+
+static void release_owned(owned *o)
+{
+	if (o->is_list)
+		arpc_free_list((alpm_list_t *)o->value, o->elem_free);
+	else
+		free(o->value);
+	free(o);
+}
+
+static owned *find_owned(uint64_t owner, const char *key)
+{
+	for (owned *p = g_owned; p; p = p->next)
+		if (p->owner == owner && !strcmp(p->key, key))
+			return p;
+	return NULL;
+}
+
+char *arpc_dup(const char *s)
+{
+	return s ? _strdup(s) : NULL;
+}
+
+void arpc_free_list(alpm_list_t *l, alpm_list_fn_free elem_free)
+{
+	if (!l)
+		return;
+	if (elem_free)
+		alpm_list_free_inner(l, elem_free);
+	alpm_list_free(l);
+}
 
 static const char *intern(uint64_t owner, const char *key, const char *value)
 {
-	for (interned *p = g_interned; p; p = p->next) {
-		if (p->owner != owner || strcmp(p->key, key))
-			continue;
-		if (value && p->value && !strcmp(p->value, value))
-			return p->value;
+	owned *p = find_owned(owner, key);
+	if (p && !p->is_list) {
+		if (value && p->value && !strcmp((char *)p->value, value))
+			return (char *)p->value;
 		free(p->value);
-		p->value = value ? _strdup(value) : NULL;
-		return p->value;
+		p->value = arpc_dup(value);
+		return (char *)p->value;
 	}
-	interned *n = (interned *)calloc(1, sizeof(*n));
+	owned *n = (owned *)calloc(1, sizeof(*n));
 	if (!n)
 		return NULL;
 	n->owner = owner;
-	n->key = key;                   /* generated literal; static lifetime */
-	n->value = value ? _strdup(value) : NULL;
-	n->next = g_interned;
-	g_interned = n;
-	return n->value;
+	n->key = key;
+	n->value = arpc_dup(value);
+	n->next = g_owned;
+	g_owned = n;
+	return (char *)n->value;
+}
+
+alpm_list_t *arpc_cached_list(uint64_t owner, const char *key)
+{
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	owned *p = find_owned(owner, key);
+	alpm_list_t *r = (p && p->is_list) ? (alpm_list_t *)p->value : NULL;
+	LeaveCriticalSection(&g_lock);
+	return r;
+}
+
+void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
+		     alpm_list_fn_free elem_free)
+{
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	owned *p = find_owned(owner, key);
+	if (p && p->is_list) {
+		/* Only reachable if two threads raced past the pre-call
+		 * lookup. Keep the newcomer and drop the loser. */
+		arpc_free_list((alpm_list_t *)p->value, p->elem_free);
+		p->value = list;
+		p->elem_free = elem_free;
+	} else {
+		owned *n = (owned *)calloc(1, sizeof(*n));
+		if (n) {
+			n->owner = owner;
+			n->key = key;
+			n->value = list;
+			n->elem_free = elem_free;
+			n->is_list = 1;
+			n->next = g_owned;
+			g_owned = n;
+		}
+	}
+	LeaveCriticalSection(&g_lock);
 }
 
 void arpc_purge_owner(uint64_t owner)
 {
 	lock_init_once();
 	EnterCriticalSection(&g_lock);
-	interned **pp = &g_interned;
+	owned **pp = &g_owned;
 	while (*pp) {
 		if ((*pp)->owner == owner) {
-			interned *dead = *pp;
+			owned *dead = *pp;
 			*pp = dead->next;
-			free(dead->value);
-			free(dead);
+			release_owned(dead);
 		} else {
 			pp = &(*pp)->next;
 		}
@@ -350,6 +422,30 @@ void arpc_put_str(arpc_call *c, const char *s)    { ajw_str(&c->req, s); }
 void arpc_put_i64(arpc_call *c, long long v)      { ajw_i64(&c->req, v); }
 void arpc_put_handle(arpc_call *c, uint64_t id)   { ajw_i64(&c->req, (long long)id); }
 
+void arpc_put_str_list(arpc_call *c, const alpm_list_t *l)
+{
+	if (!l) {
+		ajw_null(&c->req);      /* NULL and empty are distinct on the wire */
+		return;
+	}
+	ajw_arr_begin(&c->req);
+	for (; l; l = l->next)
+		ajw_str(&c->req, (const char *)l->data);
+	ajw_arr_end(&c->req);
+}
+
+void arpc_put_handle_list(arpc_call *c, const alpm_list_t *l)
+{
+	if (!l) {
+		ajw_null(&c->req);
+		return;
+	}
+	ajw_arr_begin(&c->req);
+	for (; l; l = l->next)
+		ajw_i64(&c->req, (long long)ARPC_ID(l->data));
+	ajw_arr_end(&c->req);
+}
+
 int arpc_invoke(arpc_call *c)
 {
 	ajw_arr_end(&c->req);
@@ -395,6 +491,16 @@ void arpc_end(arpc_call *c)
 		LeaveCriticalSection(&g_lock);
 		c->held_lock = 0;
 	}
+}
+
+const aj_doc *arpc_doc(const arpc_call *c)
+{
+	return &c->rsp;
+}
+
+int arpc_ret_node(const arpc_call *c)
+{
+	return aj_member(&c->rsp, c->result, "ret");
 }
 
 long long arpc_ret_i64(arpc_call *c)

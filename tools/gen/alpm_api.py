@@ -78,10 +78,13 @@ def classify(t):
         if pc.kind == cx.TypeKind.VOID:
             return "opaque_void", {}
 
-        # alpm_list_t*
+        # alpm_list_t*, but NOT alpm_list_t** -- the latter is an out-param
+        # and must not be mistaken for a list being passed in. Requiring the
+        # pointee to be the record itself is what separates them.
         decl = pc.get_declaration()
         name = (decl.spelling if decl else "") or pointee.spelling
-        if "alpm_list_t" in pointee.spelling or name == "__alpm_list_t":
+        if pc.kind == cx.TypeKind.RECORD and (
+                "alpm_list_t" in pointee.spelling or name == "__alpm_list_t"):
             return "list", {}
 
         if pc.kind == cx.TypeKind.RECORD:
@@ -154,6 +157,7 @@ def extract(header, args):
                 })
             funcs.append({
                 "name": c.spelling,
+                "variadic": bool(c.type.is_function_variadic()),
                 "ret": {"c_type": c.result_type.spelling, "kind": rk,
                         **({"extra": rx} if rx else {})},
                 "params": params,

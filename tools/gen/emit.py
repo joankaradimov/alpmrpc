@@ -4,6 +4,12 @@
 Nothing here is alpm-specific beyond the overlay: the emitter works off the
 model's type kinds. Putting another libalpm function on the wire is a matter
 of the header containing it, not of editing this file.
+
+Lists are the interesting part. alpm_list_t is a transparent doubly-linked
+list that callers walk with ->next, so the client cannot proxy it -- it has
+to hand back a real chain. The server serialises a whole list into one JSON
+array and the client materialises it, which also means a list costs one
+round trip rather than one per element.
 """
 import argparse
 import json
@@ -12,8 +18,9 @@ import re
 import sys
 
 OVERLAY = {}
+RECORDS = {}
 
-# --- ownership inference ---------------------------------------------------
+# --- ownership and type inference ------------------------------------------
 
 
 def ret_string_owned(fn):
@@ -23,12 +30,12 @@ def ret_string_owned(fn):
     return "const" not in fn["ret"]["c_type"]
 
 
-def list_ownership(fn):
-    spec = OVERLAY["functions"].get(fn["name"], {})
+def list_ownership(name):
+    spec = OVERLAY["functions"].get(name, {})
     if "list_own" in spec and "ret" in spec["list_own"]:
         return spec["list_own"]["ret"]
     for rule in OVERLAY["rules"]["list_ownership"]:
-        if rule.get("match") and re.match(rule["match"], fn["name"]):
+        if rule.get("match") and re.match(rule["match"], name):
             return rule["own"]
     return "borrowed"
 
@@ -42,6 +49,62 @@ def handle_tag(c_type):
     if base.endswith("_t"):
         base = base[:-2]
     return "ARPC_H_" + re.sub(r"[^A-Za-z0-9]", "_", base).upper()
+
+
+def short(c_type):
+    """alpm_depend_t * -> depend; used to name generated helpers."""
+    base = c_type.replace("const", "").replace("*", "").strip().lstrip("_")
+    if base.startswith("alpm_"):
+        base = base[len("alpm_"):]
+    if base.endswith("_t"):
+        base = base[:-2]
+    return re.sub(r"[^A-Za-z0-9]", "_", base)
+
+
+def find_record(c_type):
+    base = c_type.replace("const", "").replace("*", "").strip()
+    for cand in (base, "_" + base):
+        if cand in RECORDS:
+            return RECORDS[cand]
+    return None
+
+
+def elem_of(type_str):
+    """Classify a list element type into how it crosses the wire."""
+    if type_str is None:
+        return None
+    t = type_str.strip()
+    if t in ("char *", "const char *"):
+        return {"kind": "string", "c_type": "char *", "name": "str"}
+    rec = find_record(t)
+    if rec is not None:
+        return {"kind": "record", "c_type": t.replace("const ", ""),
+                "record": rec, "name": short(t)}
+    if handle_tag(t) in HANDLE_TAGS:
+        return {"kind": "handle", "c_type": t.replace("const ", ""),
+                "tag": handle_tag(t), "name": short(t)}
+    return None
+
+
+HANDLE_TAGS = set()
+
+
+def ret_elem(name):
+    return elem_of(OVERLAY.get("list_elem", {}).get(name))
+
+
+def param_elem(fname, pname):
+    return elem_of(OVERLAY.get("param_list_elem", {}).get(
+        "%s.%s" % (fname, pname)))
+
+
+def field_list_elem(recname, fname):
+    return elem_of(OVERLAY.get("record_list_elem", {}).get(
+        "%s.%s" % (recname, fname)))
+
+
+def out_params_of(name):
+    return OVERLAY["functions"].get(name, {}).get("out_params", [])
 
 
 # --- selection -------------------------------------------------------------
@@ -60,32 +123,40 @@ def select(model):
             skipped.append((n, skip_map[n]))
             continue
 
-        # A pointer-to-scalar/enum param is generatable exactly when the
-        # overlay declares it an out-param; otherwise its direction is
-        # genuinely unknown and guessing would be worse than skipping.
         outs = set(out_params_of(n))
-        kinds = [fn["ret"]["kind"]]
-        for p in fn["params"]:
-            if p["kind"] in ("ptr_enum", "ptr_scalar") and p["name"] in outs:
-                continue
-            kinds.append(p["kind"])
+        why = None
 
-        bad = [k for k in kinds if k in ("callback", "unsupported",
-                                        "opaque_void", "foreign_handle")]
-        if bad:
-            skipped.append((n, "unsupported type kind: " + bad[0]))
-            continue
-        todo = [k for k in kinds
-                if k not in ("void", "scalar", "enum", "string", "handle")]
-        if todo:
-            skipped.append((n, "not yet generated: " + todo[0]))
-            continue
-        undeclared = [p["name"] for p in fn["params"]
-                      if p["kind"] in ("ptr_enum", "ptr_scalar")
-                      and p["name"] not in outs]
-        if undeclared:
-            skipped.append((n, "pointer param with undeclared direction: "
-                            + undeclared[0]))
+        if fn.get("variadic"):
+            why = "variadic: the wire has no way to carry ..."
+
+        if fn["ret"]["kind"] == "list" and ret_elem(n) is None:
+            why = "list return with no element type in the overlay"
+        for p in fn["params"]:
+            if why:
+                break
+            k = p["kind"]
+            if k in ("ptr_enum", "ptr_scalar"):
+                if p["name"] not in outs:
+                    why = "pointer param with undeclared direction: " + p["name"]
+            elif k == "list":
+                pe = param_elem(n, p["name"])
+                if pe is None:
+                    why = "list param with no element type: " + p["name"]
+                elif pe["kind"] == "record":
+                    why = ("list param of records needs a server-side reader: "
+                           + p["name"])
+            elif k in ("callback", "unsupported", "opaque_void",
+                       "foreign_handle"):
+                why = "unsupported type kind: " + k
+            elif k not in ("void", "scalar", "enum", "string", "handle"):
+                why = "not yet generated: " + k
+
+        if not why and fn["ret"]["kind"] not in (
+                "void", "scalar", "enum", "string", "handle", "list"):
+            why = "not yet generated: " + fn["ret"]["kind"]
+
+        if why:
+            skipped.append((n, why))
             continue
         if allow and n not in allow:
             skipped.append((n, "not in spike allowlist"))
@@ -100,6 +171,37 @@ def select(model):
     return gen, skipped
 
 
+def records_needed(gen):
+    """Every record reachable from a generated list, transitively."""
+    need, queue = {}, []
+    for fn in gen:
+        e = ret_elem(fn["name"])
+        if e and e["kind"] == "record":
+            queue.append(e)
+        for p in fn["params"]:
+            if p["kind"] == "list":
+                pe = param_elem(fn["name"], p["name"])
+                if pe and pe["kind"] == "record":
+                    queue.append(pe)
+    while queue:
+        e = queue.pop()
+        rec = e["record"]
+        if rec["name"] in need:
+            continue
+        need[rec["name"]] = e
+        for f in rec["fields"]:
+            if f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                if sub and sub["kind"] == "record":
+                    queue.append(sub)
+            elif f["kind"] == "list":
+                sub = field_list_elem(rec["name"], f["name"])
+                if sub and sub["kind"] == "record":
+                    queue.append(sub)
+    # deepest first, so a helper is defined before it is used
+    return list(need.values())
+
+
 # --- emission --------------------------------------------------------------
 
 BANNER = ("/* GENERATED by tools/gen/emit.py from %s -- DO NOT EDIT.\n"
@@ -108,20 +210,148 @@ BANNER = ("/* GENERATED by tools/gen/emit.py from %s -- DO NOT EDIT.\n"
 Q = '"'
 
 
-def out_params_of(name):
-    return OVERLAY["functions"].get(name, {}).get("out_params", [])
+def qq(s):
+    return Q + s + Q
 
 
-def emit_server(gen, src_header):
+# ---- server ----
+
+
+def srv_put_value(o, expr, kind, c_type, owner, indent, recname=None,
+                  fname=None):
+    """Emit one value of the given kind into the writer."""
+    t = "\t" * indent
+    if kind == "string":
+        o.append("%sajw_str(w, %s);\n" % (t, expr))
+    elif kind in ("scalar", "enum"):
+        o.append("%sajw_i64(w, (long long)%s);\n" % (t, expr))
+    elif kind == "handle":
+        o.append("%sajw_i64(w, (long long)arpc_handle_put(%s, %s, owner));\n"
+                 % (t, expr, handle_tag(c_type)))
+    elif kind == "struct_ptr":
+        sub = elem_of(c_type)
+        o.append("%sput_%s(w, %s, owner);\n" % (t, sub["name"], expr))
+    elif kind == "list":
+        sub = field_list_elem(recname, fname)
+        o.append("%sput_list_%s(w, %s, owner);\n" % (t, sub["name"], expr))
+    else:
+        o.append("%sajw_null(w);\t/* unsupported field kind: %s */\n"
+                 % (t, kind))
+
+
+def emit_server_helpers(need, elems):
+    o = []
+    # forward declarations: records reference each other, and a record field
+    # can be a list, so both families need declaring up front
+    for e in elems:
+        o.append("static void put_list_%s(aj_w *w, const alpm_list_t *l, "
+                 "uint64_t owner);\n" % e["name"])
+    for e in need:
+        o.append("static void put_%s(aj_w *w, const %s v, uint64_t owner);\n"
+                 % (e["name"], e["c_type"]))
+    o.append("\n")
+
+    for e in need:
+        rec = e["record"]
+        o.append("static void put_%s(aj_w *w, const %s v, uint64_t owner)\n{\n"
+                 % (e["name"], e["c_type"]))
+        o.append("\tif (!v) {\n\t\tajw_null(w);\n\t\treturn;\n\t}\n")
+        o.append("\t(void)owner;\n")
+        o.append("\tajw_obj_begin(w);\n")
+        for f in rec["fields"]:
+            o.append("\tajw_key(w, %s);\n" % qq(f["name"]))
+            srv_put_value(o, "v->" + f["name"], f["kind"], f["c_type"],
+                          "owner", 1, rec["name"], f["name"])
+        o.append("\tajw_obj_end(w);\n}\n\n")
+    return "".join(o)
+
+
+def collect_elems(gen, need):
+    """Every list element type that appears anywhere in the generated set."""
+    elems, seen = [], set()
+
+    def add(e):
+        if e and e["name"] not in seen:
+            seen.add(e["name"])
+            elems.append(e)
+
+    for fn in gen:
+        add(ret_elem(fn["name"]))
+        for p in fn["params"]:
+            if p["kind"] == "list":
+                add(param_elem(fn["name"], p["name"]))
+    for e in need:
+        for f in e["record"]["fields"]:
+            if f["kind"] == "list":
+                add(field_list_elem(e["record"]["name"], f["name"]))
+    return elems
+
+
+def emit_server_list_writers(elems):
+    """One array writer per element type actually used."""
+    o = []
+    for e in elems:
+        o.append("static void put_list_%s(aj_w *w, const alpm_list_t *l, "
+                 "uint64_t owner)\n{\n" % e["name"])
+        o.append("\tif (!l) {\n\t\tajw_null(w);\n\t\treturn;\n\t}\n")
+        o.append("\t(void)owner;\n\tajw_arr_begin(w);\n")
+        o.append("\tfor (; l; l = l->next) {\n")
+        if e["kind"] == "string":
+            o.append("\t\tajw_str(w, (const char *)l->data);\n")
+        elif e["kind"] == "handle":
+            o.append("\t\tajw_i64(w, (long long)arpc_handle_put(l->data, "
+                     "%s, owner));\n" % e["tag"])
+        else:
+            o.append("\t\tput_%s(w, (const %s)l->data, owner);\n"
+                     % (e["name"], e["c_type"]))
+        o.append("\t}\n\tajw_arr_end(w);\n}\n\n")
+
+    # rebuilding an incoming list, for list-typed parameters
+    for e in elems:
+        if e["kind"] not in ("string", "handle"):
+            continue
+        o.append("/* Caller-owned temporary: every libalpm function taking a\n"
+                 " * list either copies it or takes it const, so the server\n"
+                 " * frees this after the call. */\n")
+        o.append("static alpm_list_t *take_list_%s(arpc_req *rq, int i)\n{\n"
+                 % e["name"])
+        o.append("\tint arr = arpc_arg_node(rq, i);\n")
+        o.append("\tif (arr < 0 || arpc_node_is_null(rq, arr))\n\t\treturn NULL;\n")
+        o.append("\talpm_list_t *out = NULL;\n")
+        o.append("\tint n = arpc_node_count(rq, arr);\n")
+        o.append("\tfor (int k = 0; k < n; k++) {\n")
+        o.append("\t\tint e = arpc_node_elem(rq, arr, k);\n")
+        if e["kind"] == "string":
+            o.append("\t\tchar *s = arpc_node_strdup(rq, e);\n")
+            o.append("\t\talpm_list_append(&out, s);\n")
+        else:
+            o.append("\t\tvoid *p = arpc_handle_get("
+                     "(uint64_t)arpc_node_i64(rq, e), %s);\n" % e["tag"])
+            o.append("\t\tif (!p) {\n\t\t\tarpc_req_mark_bad(rq);\n"
+                     "\t\t\tbreak;\n\t\t}\n")
+            o.append("\t\talpm_list_append(&out, p);\n")
+        o.append("\t}\n\treturn out;\n}\n\n")
+        o.append("static void drop_list_%s(alpm_list_t *l)\n{\n" % e["name"])
+        if e["kind"] == "string":
+            o.append("\talpm_list_free_inner(l, free);\n")
+        o.append("\talpm_list_free(l);\n}\n\n")
+    return "".join(o)
+
+
+def emit_server(gen, need, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_server.h"\n')
-    o.append("#include <alpm.h>\n#include <stdlib.h>\n\n")
+    o.append("#include <alpm.h>\n#include <alpm_list.h>\n#include <stdlib.h>\n\n")
+    elems = collect_elems(gen, need)
+    o.append(emit_server_helpers(need, elems))
+    o.append(emit_server_list_writers(elems))
 
     for fn in gen:
         n = fn["name"]
+        spec = OVERLAY["functions"].get(n, {})
         o.append("static int h_%s(arpc_req *rq, arpc_res *rs)\n{\n" % n)
 
-        args = []
+        args, temps = [], []
         for i, p in enumerate(fn["params"]):
             k, pn, ct = p["kind"], p["name"], p["c_type"]
             if k == "string":
@@ -134,6 +364,12 @@ def emit_server(gen, src_header):
                 o.append("\t%s %s = (%s)arpc_arg_handle(rq, %d, %s);\n"
                          % (ct, pn, ct, i, handle_tag(ct)))
                 args.append(pn)
+            elif k == "list":
+                e = param_elem(n, pn)
+                o.append("\talpm_list_t *%s = take_list_%s(rq, %d);\n"
+                         % (pn, e["name"], i))
+                args.append(pn)
+                temps.append((pn, e["name"]))
 
         for op in out_params_of(n):
             for p in fn["params"]:
@@ -142,13 +378,24 @@ def emit_server(gen, src_header):
                     o.append("\t%s %s_v = 0;\n" % (inner, op))
                     args.append("&%s_v" % op)
 
-        o.append("\tif (arpc_req_bad(rq))\n\t\treturn arpc_fail(rs, "
-                 "ARPC_E_INVALID_PARAMS,\n\t\t\t" + Q + n +
-                 ": bad arguments" + Q + ");\n")
+        o.append("\tif (arpc_req_bad(rq)) {\n")
+        for tn, te in temps:
+            o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
+        o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
+                 + qq(n + ": bad arguments") + ");\n\t}\n")
 
         call = "%s(%s)" % (n, ", ".join(args))
-        rk = fn["ret"]["kind"]
-        rct = fn["ret"]["c_type"]
+        rk, rct = fn["ret"]["kind"], fn["ret"]["c_type"]
+
+        # the owner a returned handle or list element should be filed under
+        owner = "0"
+        for i, p in enumerate(fn["params"]):
+            if p["kind"] != "handle":
+                continue
+            owner = ("arpc_arg_id(rq, %d)" % i
+                     if handle_tag(p["c_type"]) == "ARPC_H_HANDLE"
+                     else "arpc_owner_of(arpc_arg_id(rq, %d))" % i)
+            break
 
         if rk == "void":
             o.append("\t%s;\n\tarpc_ret_null(rs);\n" % call)
@@ -162,42 +409,148 @@ def emit_server(gen, src_header):
             else:
                 o.append("\tarpc_ret_str(rs, %s);\n" % call)
         elif rk == "handle":
-            owner = "0"
-            for i, p in enumerate(fn["params"]):
-                if p["kind"] != "handle":
-                    continue
-                if handle_tag(p["c_type"]) == "ARPC_H_HANDLE":
-                    owner = "arpc_arg_id(rq, %d)" % i
-                else:
-                    owner = "arpc_owner_of(arpc_arg_id(rq, %d))" % i
-                break
             o.append("\t%s r = %s;\n" % (rct, call))
             o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
                      % (handle_tag(rct), owner))
+        elif rk == "list":
+            e = ret_elem(n)
+            own = list_ownership(n)
+            o.append("\talpm_list_t *r = %s;\n" % call)
+            o.append("\tarpc_ret_begin(rs);\n")
+            o.append("\tput_list_%s(arpc_res_writer(rs), r, %s);\n"
+                     % (e["name"], owner))
+            if own == "caller":
+                o.append("\t/* overlay says caller-owned: the server is that "
+                         "caller */\n")
+                if e["kind"] == "string":
+                    o.append("\talpm_list_free_inner(r, free);\n")
+                o.append("\talpm_list_free(r);\n")
 
         for op in out_params_of(n):
-            o.append("\tarpc_out_i64(rs, " + Q + op + Q +
-                     ", (long long)%s_v);\n" % op)
+            o.append("\tarpc_out_i64(rs, " + qq(op) + ", (long long)%s_v);\n"
+                     % op)
 
-        if OVERLAY["functions"].get(n, {}).get("destroys"):
+        for tn, te in temps:
+            o.append("\tdrop_list_%s(%s);\n" % (te, tn))
+
+        if spec.get("destroys"):
             o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
 
         o.append("\treturn 0;\n}\n\n")
 
     o.append("const arpc_method arpc_methods[] = {\n")
     for fn in gen:
-        o.append("\t{ " + Q + fn["name"] + Q + ", h_%s },\n" % fn["name"])
+        o.append("\t{ " + qq(fn["name"]) + ", h_%s },\n" % fn["name"])
     o.append("\t{ NULL, NULL }\n};\n")
     return "".join(o)
 
 
-def emit_client(gen, src_header):
+# ---- client ----
+
+
+def cli_get_value(o, target, kind, c_type, node, indent, recname=None,
+                  fname=None):
+    t = "\t" * indent
+    if kind == "string":
+        o.append("%s%s = arpc_dup(aj_str(d, %s, NULL));\n" % (t, target, node))
+    elif kind in ("scalar", "enum"):
+        o.append("%s%s = (%s)aj_i64(d, %s, 0);\n" % (t, target, c_type, node))
+    elif kind == "handle":
+        o.append("%s%s = (%s)(uintptr_t)aj_i64(d, %s, 0);\n"
+                 % (t, target, c_type, node))
+    elif kind == "struct_ptr":
+        sub = elem_of(c_type)
+        o.append("%s%s = (%s)get_%s(d, %s);\n"
+                 % (t, target, c_type, sub["name"], node))
+    elif kind == "list":
+        sub = field_list_elem(recname, fname)
+        o.append("%s%s = build_list_%s(d, %s);\n" % (t, target, sub["name"], node))
+
+
+def emit_client_helpers(need, elems):
+    o = []
+    for e in need:
+        o.append("static void *get_%s(const aj_doc *d, int n);\n" % e["name"])
+        # A record that only ever appears in caller-owned lists has no
+        # caching path, so its free helper can legitimately go unused.
+        o.append("ARPC_MAYBE_UNUSED static void free_%s(void *p);\n"
+                 % e["name"])
+    for e in elems:
+        o.append("static alpm_list_t *build_list_%s(const aj_doc *d, int arr);\n"
+                 % e["name"])
+    o.append("\n")
+
+    for e in need:
+        rec = e["record"]
+        ct = e["c_type"]
+        o.append("static void *get_%s(const aj_doc *d, int n)\n{\n" % e["name"])
+        o.append("\tif (n < 0 || aj_is_null(d, n))\n\t\treturn NULL;\n")
+        o.append("\t%s v = (%s)calloc(1, sizeof(*v));\n" % (ct, ct))
+        o.append("\tif (!v)\n\t\treturn NULL;\n")
+        for f in rec["fields"]:
+            node = "aj_member(d, n, %s)" % qq(f["name"])
+            cli_get_value(o, "v->" + f["name"], f["kind"], f["c_type"], node,
+                          1, rec["name"], f["name"])
+        o.append("\treturn v;\n}\n\n")
+
+        o.append("static void free_%s(void *p)\n{\n" % e["name"])
+        o.append("\t%s v = (%s)p;\n\tif (!v)\n\t\treturn;\n" % (ct, ct))
+        for f in rec["fields"]:
+            if f["kind"] == "string":
+                o.append("\tfree(v->%s);\n" % f["name"])
+            elif f["kind"] == "struct_ptr":
+                sub = elem_of(f["c_type"])
+                o.append("\tfree_%s(v->%s);\n" % (sub["name"], f["name"]))
+            elif f["kind"] == "list":
+                sub = field_list_elem(rec["name"], f["name"])
+                o.append("\tarpc_free_list(v->%s, %s);\n"
+                         % (f["name"], elem_free_fn(sub)))
+            # handle fields hold ids, not memory
+        o.append("\tfree(v);\n}\n\n")
+
+    for e in elems:
+        o.append("static alpm_list_t *build_list_%s(const aj_doc *d, int arr)\n"
+                 "{\n" % e["name"])
+        o.append("\tif (arr < 0 || aj_is_null(d, arr))\n\t\treturn NULL;\n")
+        o.append("\talpm_list_t *out = NULL;\n")
+        o.append("\tint n = aj_count(d, arr);\n")
+        o.append("\tfor (int i = 0; i < n; i++) {\n")
+        o.append("\t\tint e = aj_elem(d, arr, i);\n")
+        if e["kind"] == "string":
+            o.append("\t\talpm_list_append(&out, arpc_dup(aj_str(d, e, NULL)));\n")
+        elif e["kind"] == "handle":
+            o.append("\t\talpm_list_append(&out, "
+                     "(void *)(uintptr_t)aj_i64(d, e, 0));\n")
+        else:
+            o.append("\t\talpm_list_append(&out, get_%s(d, e));\n" % e["name"])
+        o.append("\t}\n\treturn out;\n}\n\n")
+    return "".join(o)
+
+
+def elem_free_fn(e):
+    if e["kind"] == "string":
+        return "free"
+    if e["kind"] == "handle":
+        return "NULL"          # ids, nothing to release
+    return "free_" + e["name"]
+
+
+def emit_client(gen, need, src_header):
+    elems = collect_elems(gen, need)
     o = [BANNER % src_header]
     o.append('#include "arpc_client.h"\n')
-    o.append("#include <alpm.h>\n#include <stdlib.h>\n\n")
+    o.append("#include <alpm.h>\n#include <alpm_list.h>\n")
+    o.append("#include <stdlib.h>\n\n")
+    o.append("#if defined(__GNUC__) || defined(__clang__)\n"
+             "#  define ARPC_MAYBE_UNUSED __attribute__((unused))\n"
+             "#else\n"
+             "#  define ARPC_MAYBE_UNUSED\n"
+             "#endif\n\n")
+    o.append(emit_client_helpers(need, elems))
 
     for fn in gen:
         n, rk, rct = fn["name"], fn["ret"]["kind"], fn["ret"]["c_type"]
+        spec = OVERLAY["functions"].get(n, {})
         sig = ", ".join("%s %s" % (p["c_type"], p["name"])
                         for p in fn["params"]) or "void"
         fail = {
@@ -206,10 +559,27 @@ def emit_client(gen, src_header):
             "enum": "return (%s)0;" % rct,
             "string": "return NULL;",
             "handle": "return NULL;",
+            "list": "return NULL;",
         }[rk]
 
+        first_handle = None
+        for p in fn["params"]:
+            if p["kind"] == "handle":
+                first_handle = p["name"]
+                break
+        owner = "ARPC_ID(%s)" % first_handle if first_handle else "0"
+
         o.append("%s %s(%s)\n{\n\tarpc_call c;\n" % (rct, n, sig))
-        o.append("\tif (!arpc_begin(&c, " + Q + n + Q + "))\n\t\t%s\n" % fail)
+
+        # A borrowed list is looked up before the call, not after: libalpm
+        # hands back the same pointer for repeated calls, and re-fetching
+        # would either break that or free a list the caller still holds.
+        if rk == "list" and list_ownership(n) == "borrowed":
+            o.append("\talpm_list_t *cached = arpc_cached_list(%s, %s);\n"
+                     % (owner, qq(n)))
+            o.append("\tif (cached)\n\t\treturn cached;\n")
+
+        o.append("\tif (!arpc_begin(&c, " + qq(n) + "))\n\t\t%s\n" % fail)
 
         for p in fn["params"]:
             k, pn = p["kind"], p["name"]
@@ -219,6 +589,12 @@ def emit_client(gen, src_header):
                 o.append("\tarpc_put_i64(&c, (long long)%s);\n" % pn)
             elif k == "handle":
                 o.append("\tarpc_put_handle(&c, ARPC_ID(%s));\n" % pn)
+            elif k == "list":
+                e = param_elem(n, pn)
+                if e["kind"] == "string":
+                    o.append("\tarpc_put_str_list(&c, %s);\n" % pn)
+                else:
+                    o.append("\tarpc_put_handle_list(&c, %s);\n" % pn)
 
         o.append("\tif (!arpc_invoke(&c)) {\n\t\tarpc_end(&c);\n\t\t%s\n\t}\n"
                  % fail)
@@ -228,22 +604,10 @@ def emit_client(gen, src_header):
                 if p["name"] == op:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\tif (%s)\n\t\t*%s = (%s)arpc_out_i64(&c, "
-                             % (op, op, inner) + Q + op + Q + ");\n")
-
-        # Connection lifetime is driven by the overlay rather than guessed:
-        # the pipe is held open exactly while the caller holds libalpm
-        # handles, and the server's idle timer does the rest.
-        spec = OVERLAY["functions"].get(n, {})
-        destroys = spec.get("destroys")
-        creates = spec.get("creates")
-        first_handle = None
-        for p in fn["params"]:
-            if p["kind"] == "handle":
-                first_handle = p["name"]
-                break
+                             % (op, op, inner) + qq(op) + ");\n")
 
         def teardown():
-            if destroys and first_handle:
+            if spec.get("destroys") and first_handle:
                 o.append("\tarpc_purge_owner(ARPC_ID(%s));\n" % first_handle)
                 o.append("\tarpc_conn_unref();\n")
 
@@ -262,21 +626,32 @@ def emit_client(gen, src_header):
                 teardown()
                 o.append("\treturn r;\n")
             else:
-                owner = "0"
-                for p in fn["params"]:
-                    if p["kind"] == "handle":
-                        owner = "ARPC_ID(%s)" % p["name"]
-                        break
                 o.append("\tconst char *r = arpc_intern_str(&c, %s, " % owner
-                         + Q + n + Q + ");\n")
+                         + qq(n) + ");\n")
                 o.append("\tarpc_end(&c);\n")
                 teardown()
                 o.append("\treturn r;\n")
         elif rk == "handle":
-            o.append("\t%s r = (%s)(uintptr_t)arpc_ret_handle(&c);\n" % (rct, rct))
+            o.append("\t%s r = (%s)(uintptr_t)arpc_ret_handle(&c);\n"
+                     % (rct, rct))
             o.append("\tarpc_end(&c);\n")
-            if creates:
+            if spec.get("creates"):
                 o.append("\tif (r)\n\t\tarpc_conn_ref();\n")
+            teardown()
+            o.append("\treturn r;\n")
+        elif rk == "list":
+            e = ret_elem(n)
+            o.append("\talpm_list_t *r = build_list_%s(arpc_doc(&c), "
+                     "arpc_ret_node(&c));\n" % e["name"])
+            o.append("\tarpc_end(&c);\n")
+            if list_ownership(n) == "borrowed":
+                o.append("\t/* Borrowed: lives as long as its owner, and the\n"
+                         "\t * caller must not free it. */\n")
+                o.append("\tarpc_cache_list(%s, %s, r, %s);\n"
+                         % (owner, qq(n), elem_free_fn(e)))
+            else:
+                o.append("\t/* Caller-owned: freed by the caller, per the\n"
+                         "\t * usual libalpm idiom for this function. */\n")
             teardown()
             o.append("\treturn r;\n")
         o.append("}\n\n")
@@ -284,22 +659,17 @@ def emit_client(gen, src_header):
 
 
 def emit_handle_tags(model):
-    tags = set()
-    for fn in model["functions"]:
-        for t in [fn["ret"]] + fn["params"]:
-            if t["kind"] == "handle":
-                tags.add(handle_tag(t["c_type"]))
     o = [BANNER % "api_model.json"]
     o.append("#ifndef ARPC_HANDLE_TAGS_H\n#define ARPC_HANDLE_TAGS_H\n\n")
     o.append("typedef enum {\n\tARPC_H_NONE = 0,\n")
-    for i, t in enumerate(sorted(tags), 1):
+    for i, t in enumerate(sorted(HANDLE_TAGS), 1):
         o.append("\t%s = %d,\n" % (t, i))
     o.append("} arpc_handle_tag;\n\n#endif\n")
     return "".join(o)
 
 
 def main():
-    global OVERLAY
+    global OVERLAY, RECORDS, HANDLE_TAGS
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--overlay", required=True)
@@ -311,6 +681,12 @@ def main():
     with open(a.overlay, encoding="utf-8") as fh:
         OVERLAY = json.load(fh)
     OVERLAY.setdefault("functions", {})
+    RECORDS = {r["name"]: r for r in model["records"]}
+
+    for fn in model["functions"]:
+        for t in [fn["ret"]] + fn["params"]:
+            if t["kind"] == "handle":
+                HANDLE_TAGS.add(handle_tag(t["c_type"]))
 
     owned = set(f["name"] for f in model["functions"]
                 if f["ret"]["kind"] == "string" and ret_string_owned(f))
@@ -322,11 +698,12 @@ def main():
               % (sorted(owned), sorted(expected)), file=sys.stderr)
 
     gen, skipped = select(model)
+    need = records_needed(gen)
     os.makedirs(a.outdir, exist_ok=True)
 
     files = (
-        ("arpc_dispatch.c", emit_server(gen, model["header"])),
-        ("arpc_stubs.c", emit_client(gen, model["header"])),
+        ("arpc_dispatch.c", emit_server(gen, need, model["header"])),
+        ("arpc_stubs.c", emit_client(gen, need, model["header"])),
         ("arpc_handle_tags.h", emit_handle_tags(model)),
     )
     for name, text in files:
@@ -339,14 +716,16 @@ def main():
     report = {
         "generated": len(gen),
         "total": len(model["functions"]),
+        "records_materialised": sorted(e["record"]["name"] for e in need),
         "skipped": {"count": len(skipped), "by_reason": reasons,
                     "detail": dict(skipped)},
     }
-    with open(os.path.join(a.outdir, "coverage.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(a.outdir, "coverage.json"), "w",
+              encoding="utf-8") as fh:
         json.dump(report, fh, indent=1, sort_keys=True)
 
-    print("emit: generated %d/%d functions"
-          % (len(gen), len(model["functions"])))
+    print("emit: generated %d/%d functions, %d record materialisers"
+          % (len(gen), len(model["functions"]), len(need)))
     for why, cnt in sorted(reasons.items(), key=lambda kv: -kv[1]):
         print("emit:   skipped %3d  %s" % (cnt, why))
 

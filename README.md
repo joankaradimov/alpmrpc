@@ -51,6 +51,17 @@ everything else, why it is not.
   server's handle id cast to a pointer and is never dereferenced. Ids are
   monotonic and type-tagged, so a stale or wrong-typed id fails a lookup
   instead of reaching libalpm as a bad pointer.
+- **Lists are real.** `alpm_list_t` is transparent -- callers walk `->next`
+  and call `alpm_list_count`/`alpm_list_free` directly -- so it cannot be
+  proxied. The server serialises a whole list into one array and the client
+  materialises a genuine chain, linking the real `alpm_list.c` (vendored, see
+  `src/client/vendor/`). A list therefore costs one round trip, not one per
+  element. Transparent element structs are materialised field by field,
+  recursively: `alpm_group_t` arrives with its `packages` list attached.
+- **Borrowed lists are cached against their owner** and looked up *before*
+  the call, because libalpm hands back the same pointer for repeated calls
+  and a caller may still be holding an earlier one. Caller-owned lists are
+  built fresh and freed by the caller with the usual idiom.
 - **The server is single-threaded**, which keeps libalpm's `fork()` for
   scriptlets and hooks on the path Cygwin actually supports.
 - `ALPMRPC_TRACE=1` dumps every frame. `alpmrpcd --stdio` runs the dispatch

@@ -187,6 +187,46 @@ void *arpc_arg_handle(arpc_req *rq, int i, arpc_handle_tag tag)
 }
 
 int arpc_req_bad(const arpc_req *rq) { return rq->bad; }
+void arpc_req_mark_bad(arpc_req *rq) { rq->bad = 1; }
+
+/* ---- raw node access, used by generated list code ---- */
+
+int arpc_arg_node(arpc_req *rq, int i)
+{
+	return arg_node(rq, i);
+}
+
+int arpc_node_is_null(const arpc_req *rq, int n)
+{
+	return aj_is_null(rq->doc, n);
+}
+
+int arpc_node_count(const arpc_req *rq, int n)
+{
+	return aj_count(rq->doc, n);
+}
+
+int arpc_node_elem(const arpc_req *rq, int arr, int k)
+{
+	return aj_elem(rq->doc, arr, k);
+}
+
+long long arpc_node_i64(const arpc_req *rq, int n)
+{
+	return aj_i64(rq->doc, n, 0);
+}
+
+char *arpc_node_strdup(const arpc_req *rq, int n)
+{
+	const char *s = aj_str(rq->doc, n, NULL);
+	if (!s)
+		return NULL;
+	size_t len = strlen(s) + 1;
+	char *out = (char *)malloc(len);
+	if (out)
+		memcpy(out, s, len);
+	return out;
+}
 
 /* -------------------------------------------------------------- response */
 
@@ -213,6 +253,17 @@ void arpc_ret_handle(arpc_res *rs, uint64_t id)
 {
 	set_ret(rs);
 	ajw_i64(&rs->out, (long long)id);
+}
+
+void arpc_ret_begin(arpc_res *rs)
+{
+	set_ret(rs);
+}
+
+aj_w *arpc_res_writer(arpc_res *rs)
+{
+	ensure_obj(rs);
+	return &rs->out;
 }
 
 void arpc_out_i64(arpc_res *rs, const char *name, long long v)

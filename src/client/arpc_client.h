@@ -15,6 +15,10 @@
 #include "arpc_json.h"
 #include "arpc_wire.h"
 
+/* alpm_list.h is standalone by design and the client links the
+ * real implementation, so lists here are genuine alpm lists. */
+#include <alpm_list.h>
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -58,6 +62,34 @@ char *arpc_take_str(arpc_call *c);
 void arpc_conn_ref(void);
 void arpc_conn_unref(void);
 void arpc_purge_owner(uint64_t owner);
+
+/* ---- lists ----
+ *
+ * alpm_list_t is transparent: callers walk ->next and call alpm_list_count,
+ * alpm_list_free and friends directly. So a list cannot be proxied -- the
+ * client materialises a real chain from one array on the wire, which also
+ * makes a list cost one round trip instead of one per element.
+ */
+
+/* Raw response access, for generated materialisers. */
+const aj_doc *arpc_doc(const arpc_call *c);
+int           arpc_ret_node(const arpc_call *c);
+
+/* strdup that tolerates NULL, matching libalpm's use of NULL for absent. */
+char *arpc_dup(const char *s);
+
+void arpc_free_list(alpm_list_t *l, alpm_list_fn_free elem_free);
+
+/* Borrowed lists are cached against their owner, because libalpm returns the
+ * same pointer for repeated calls and callers may still hold an earlier one.
+ * The lookup happens before the call, so a repeat costs no round trip. */
+alpm_list_t *arpc_cached_list(uint64_t owner, const char *key);
+void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
+                     alpm_list_fn_free elem_free);
+
+/* List parameters, serialised from the caller's own list. */
+void arpc_put_str_list(arpc_call *c, const alpm_list_t *l);
+void arpc_put_handle_list(arpc_call *c, const alpm_list_t *l);
 
 /* Diagnostics. ALPMRPC_TRACE=1 dumps every frame to stderr. */
 const char *arpc_last_error(void);

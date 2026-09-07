@@ -2,25 +2,115 @@
   "_comment": [
     "Hand-maintained annotations that a C header cannot express.",
     "Everything inferable from alpm.h itself (string ownership via const-ness,",
-    "handle-ness via incomplete struct types) is NOT recorded here -- emit.py",
-    "derives it. This file is only for what clang genuinely cannot see.",
-    "Keep it small; if an entry could be a rule, make it a rule."
+    "handle-ness via incomplete struct types, struct field layout) is NOT",
+    "recorded here -- emit.py derives it. This file is only for what clang",
+    "genuinely cannot see. Keep it small; if an entry could be a rule, make it",
+    "a rule."
   ],
-
   "rules": {
     "_comment": "Applied in order; first match wins. Overridden by 'functions'.",
     "list_ownership": [
-      { "match": "^alpm_pkg_compute_", "own": "caller" },
-      { "match": "^alpm_checkdeps$",   "own": "caller" },
-      { "match": "^alpm_checkconflicts$", "own": "caller" },
-      { "match": "^alpm_find_group_pkgs$", "own": "caller" },
-      { "match": ".*", "own": "borrowed" }
+      {
+        "match": "^alpm_pkg_compute_",
+        "own": "caller"
+      },
+      {
+        "match": "^alpm_checkdeps$",
+        "own": "caller"
+      },
+      {
+        "match": "^alpm_checkconflicts$",
+        "own": "caller"
+      },
+      {
+        "match": "^alpm_find_group_pkgs$",
+        "own": "caller"
+      },
+      {
+        "match": ".*",
+        "own": "borrowed"
+      }
     ]
   },
-
+  "list_elem": {
+    "_comment": [
+      "alpm_list_t is untyped in C, so the element type of every list that",
+      "crosses the wire has to be stated. Getting one of these wrong is a",
+      "type confusion the compiler cannot catch, so they are grouped by",
+      "element type rather than alphabetically -- it makes a wrong entry",
+      "stand out.",
+      "",
+      "Note the two compute_* functions return package NAMES, not packages,",
+      "despite their neighbours in this list returning alpm_pkg_t*."
+    ],
+    "alpm_db_get_servers": "char *",
+    "alpm_db_get_cache_servers": "char *",
+    "alpm_option_get_cachedirs": "char *",
+    "alpm_option_get_hookdirs": "char *",
+    "alpm_option_get_overwrite_files": "char *",
+    "alpm_option_get_noupgrades": "char *",
+    "alpm_option_get_noextracts": "char *",
+    "alpm_option_get_ignorepkgs": "char *",
+    "alpm_option_get_ignoregroups": "char *",
+    "alpm_option_get_architectures": "char *",
+    "alpm_pkg_get_licenses": "char *",
+    "alpm_pkg_get_groups": "char *",
+    "alpm_pkg_compute_requiredby": "char *",
+    "alpm_pkg_compute_optionalfor": "char *",
+    "alpm_db_get_pkgcache": "alpm_pkg_t *",
+    "alpm_find_group_pkgs": "alpm_pkg_t *",
+    "alpm_trans_get_add": "alpm_pkg_t *",
+    "alpm_trans_get_remove": "alpm_pkg_t *",
+    "alpm_get_syncdbs": "alpm_db_t *",
+    "alpm_pkg_get_depends": "alpm_depend_t *",
+    "alpm_pkg_get_optdepends": "alpm_depend_t *",
+    "alpm_pkg_get_checkdepends": "alpm_depend_t *",
+    "alpm_pkg_get_makedepends": "alpm_depend_t *",
+    "alpm_pkg_get_conflicts": "alpm_depend_t *",
+    "alpm_pkg_get_provides": "alpm_depend_t *",
+    "alpm_pkg_get_replaces": "alpm_depend_t *",
+    "alpm_option_get_assumeinstalled": "alpm_depend_t *",
+    "alpm_pkg_get_backup": "alpm_backup_t *",
+    "alpm_pkg_get_xdata": "alpm_pkg_xdata_t *",
+    "alpm_db_get_groupcache": "alpm_group_t *",
+    "alpm_checkdeps": "alpm_depmissing_t *",
+    "alpm_checkconflicts": "alpm_conflict_t *"
+  },
+  "param_list_elem": {
+    "_comment": "Element type of alpm_list_t* parameters, same problem.",
+    "alpm_db_update.dbs": "alpm_db_t *",
+    "alpm_db_search.needles": "char *",
+    "alpm_db_set_servers.servers": "char *",
+    "alpm_db_set_cache_servers.servers": "char *",
+    "alpm_find_group_pkgs.dbs": "alpm_db_t *",
+    "alpm_option_set_cachedirs.cachedirs": "char *",
+    "alpm_option_set_hookdirs.hookdirs": "char *",
+    "alpm_option_set_overwrite_files.globs": "char *",
+    "alpm_option_set_noupgrades.noupgrade": "char *",
+    "alpm_option_set_noextracts.noextract": "char *",
+    "alpm_option_set_ignorepkgs.ignorepkgs": "char *",
+    "alpm_option_set_assumeinstalled.deps": "alpm_depend_t *",
+    "alpm_checkdeps.pkglist": "alpm_pkg_t *",
+    "alpm_checkdeps.remove": "alpm_pkg_t *",
+    "alpm_checkdeps.upgrade": "alpm_pkg_t *",
+    "alpm_checkconflicts.pkglist": "alpm_pkg_t *",
+    "alpm_find_dbs_satisfier.dbs": "alpm_db_t *",
+    "alpm_find_satisfier.pkgs": "alpm_pkg_t *",
+    "alpm_option_set_architectures.arches": "char *",
+    "alpm_option_set_ignoregroups.ignoregrps": "char *",
+    "alpm_pkg_find.haystack": "alpm_pkg_t *",
+    "alpm_sync_get_new_version.dbs_sync": "alpm_db_t *",
+    "alpm_fetch_pkgurl.urls": "char *"
+  },
+  "record_list_elem": {
+    "_comment": "Element type of alpm_list_t* fields inside transparent structs.",
+    "_alpm_group_t.packages": "alpm_pkg_t *"
+  },
   "functions": {
     "alpm_initialize": {
-      "out_params": ["err"],
+      "out_params": [
+        "err"
+      ],
       "creates": "handle",
       "doc": "err is an out-param, not an input."
     },
@@ -28,56 +118,79 @@
       "destroys": "handle",
       "doc": "Invalidates every handle owned by this alpm_handle_t."
     },
-    "alpm_db_search":            { "out_params": ["ret"], "list_own": { "ret": "caller" } },
-    "alpm_db_get_usage":         { "out_params": ["usage"] },
-    "alpm_pkg_check_pgp_signature": { "out_params": ["siglist"] },
-    "alpm_db_check_pgp_signature":  { "out_params": ["siglist"] },
-    "alpm_decode_signature":     { "out_params": ["data", "data_len"] },
-    "alpm_pkg_load":             { "out_params": ["pkg"], "creates": "pkg" },
-    "alpm_trans_prepare":        { "out_params": ["data"] },
-    "alpm_trans_commit":         { "out_params": ["data"] },
-    "alpm_pkg_free":             { "destroys": "pkg" },
-    "alpm_dep_free":             { "destroys": "dep" }
+    "alpm_db_search": {
+      "out_params": [
+        "ret"
+      ],
+      "list_own": {
+        "ret": "caller"
+      }
+    },
+    "alpm_db_get_usage": {
+      "out_params": [
+        "usage"
+      ]
+    },
+    "alpm_pkg_check_pgp_signature": {
+      "out_params": [
+        "siglist"
+      ]
+    },
+    "alpm_db_check_pgp_signature": {
+      "out_params": [
+        "siglist"
+      ]
+    },
+    "alpm_decode_signature": {
+      "out_params": [
+        "data",
+        "data_len"
+      ]
+    },
+    "alpm_pkg_load": {
+      "out_params": [
+        "pkg"
+      ],
+      "creates": "pkg"
+    },
+    "alpm_trans_prepare": {
+      "out_params": [
+        "data"
+      ]
+    },
+    "alpm_trans_commit": {
+      "out_params": [
+        "data"
+      ]
+    },
+    "alpm_pkg_free": {
+      "destroys": "pkg"
+    },
+    "alpm_dep_free": {
+      "destroys": "dep"
+    }
   },
-
   "skip": {
     "_comment": "Not generatable. Callbacks need hand-written bidirectional plumbing.",
-    "alpm_option_set_logcb":       "callback",
-    "alpm_option_set_dlcb":        "callback",
-    "alpm_option_set_fetchcb":     "callback",
-    "alpm_option_set_eventcb":     "callback",
-    "alpm_option_set_questioncb":  "callback",
-    "alpm_option_set_progresscb":  "callback",
-    "alpm_option_get_logcb":       "callback",
-    "alpm_option_get_dlcb":        "callback",
-    "alpm_option_get_fetchcb":     "callback",
-    "alpm_option_get_eventcb":     "callback",
-    "alpm_option_get_questioncb":  "callback",
-    "alpm_option_get_progresscb":  "callback"
+    "alpm_option_set_logcb": "callback",
+    "alpm_option_set_dlcb": "callback",
+    "alpm_option_set_fetchcb": "callback",
+    "alpm_option_set_eventcb": "callback",
+    "alpm_option_set_questioncb": "callback",
+    "alpm_option_set_progresscb": "callback",
+    "alpm_option_get_logcb": "callback",
+    "alpm_option_get_dlcb": "callback",
+    "alpm_option_get_fetchcb": "callback",
+    "alpm_option_get_eventcb": "callback",
+    "alpm_option_get_questioncb": "callback",
+    "alpm_option_get_progresscb": "callback"
   },
-
   "spike": {
     "_comment": [
-      "Spike allowlist. While non-empty, emit.py generates ONLY these.",
-      "Chosen to exercise every mechanism in the pipeline exactly once:",
-      "  no-arg / scalar / string-in / borrowed-string-out / owned-string-out /",
-      "  handle-create / handle-lookup / handle-destroy / enum out-param.",
-      "Empty this list to generate the full surface."
+      "Empty: the allowlist has served its purpose. Everything the emitter",
+      "can generate is now generated, and coverage.json says why the rest",
+      "is not."
     ],
-    "include": [
-      "alpm_version",
-      "alpm_capabilities",
-      "alpm_pkg_vercmp",
-      "alpm_compute_md5sum",
-      "alpm_compute_sha256sum",
-      "alpm_initialize",
-      "alpm_release",
-      "alpm_get_localdb",
-      "alpm_db_get_name",
-      "alpm_option_get_root",
-      "alpm_option_get_dbpath",
-      "alpm_errno",
-      "alpm_strerror"
-    ]
+    "include": []
   }
 }
