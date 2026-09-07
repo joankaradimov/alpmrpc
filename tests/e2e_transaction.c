@@ -646,6 +646,94 @@ int main(int argc, char **argv)
 		      "alpm_pkg_mtree_close()", NULL);
 	}
 
+	/* ---- a signature, which is a counted array of embedded keys ---- */
+
+	printf("\n-- checking a package signature --\n");
+	/* The fixture signs every package with a throwaway key and leaves the
+	 * public half in the root's gpgdir, which is the shape pacman-key
+	 * would have left. */
+	char fpr[128];
+	slurp(win_root, "signing-key", fpr, sizeof(fpr));
+	fpr[strcspn(fpr, "\r\n")] = '\0';
+
+	char gpgdir[1024];
+	snprintf(gpgdir, sizeof(gpgdir), "%s/etc/pacman.d/gnupg/", posix_root);
+	check(h2 && alpm_option_set_gpgdir(h2, gpgdir) == 0,
+	      "alpm_option_set_gpgdir()", NULL);
+
+	alpm_pkg_t *sp = NULL;
+	if (h2)
+		alpm_pkg_load(h2, base_pkg, 1, ALPM_SIG_PACKAGE, &sp);
+	check(sp != NULL, "alpm_pkg_load() with signatures required",
+	      sp ? NULL : trans_err(h2));
+
+	if (sp) {
+		alpm_siglist_t sl;
+		int src = alpm_pkg_check_pgp_signature(sp, &sl);
+		check(src == 0, "alpm_pkg_check_pgp_signature()",
+		      src == 0 ? NULL : trans_err(h2));
+
+		snprintf(buf, sizeof(buf), "%zu result%s", sl.count,
+			 sl.count == 1 ? "" : "s");
+		check(sl.count == 1, "the siglist is an array, not one entry",
+		      buf);
+
+		if (sl.count == 1) {
+			alpm_sigresult_t *r0 = &sl.results[0];
+			check(r0->status == ALPM_SIGSTATUS_VALID,
+			      "the signature is valid", NULL);
+			check(r0->validity == ALPM_SIGVALIDITY_FULL,
+			      "and fully trusted", NULL);
+			/* key is embedded by value, not through a pointer --
+			 * the field kind the generator learned for this. */
+			check(r0->key.fingerprint
+			      && !strcmp(r0->key.fingerprint, fpr),
+			      "the key's fingerprint crossed", r0->key.fingerprint);
+			check(r0->key.email
+			      && !strcmp(r0->key.email, "nobody@example.invalid"),
+			      "and the rest of the key with it", r0->key.uid);
+			/* The one field that does not cross. NULL here is the
+			 * stated answer, not an accident: it is the server's
+			 * gpgme key object. */
+			check(r0->key.data == NULL,
+			      "the gpgme key itself did not", "stated, not silent");
+		}
+
+		check(alpm_siglist_cleanup(&sl) == 0, "alpm_siglist_cleanup()",
+		      NULL);
+		check(sl.count == 0 && sl.results == NULL,
+		      "which emptied it, so a second call is harmless", NULL);
+		alpm_pkg_free(sp);
+	}
+
+	printf("\n-- and a database signature --\n");
+	/* Registered demanding a signature this time, so the update fetches
+	 * alpmrpc.db.sig alongside the db and there is something to check. */
+	alpm_db_t *sdb = h2 ?
+		alpm_register_syncdb(h2, "alpmrpc", ALPM_SIG_DATABASE) : NULL;
+	if (sdb)
+		alpm_db_add_server(sdb, server);
+
+	alpm_list_t *dbs2 = NULL;
+	alpm_list_append(&dbs2, sdb);
+	int up2 = sdb ? alpm_db_update(h2, dbs2, 1) : -1;
+	alpm_list_free(dbs2);
+	check(up2 == 0, "alpm_db_update() with a signature required",
+	      up2 == 0 ? NULL : trans_err(h2));
+
+	if (up2 == 0) {
+		alpm_siglist_t dsl;
+		int drc = alpm_db_check_pgp_signature(sdb, &dsl);
+		check(drc == 0, "alpm_db_check_pgp_signature()",
+		      drc == 0 ? NULL : trans_err(h2));
+		snprintf(buf, sizeof(buf), "%zu result%s", dsl.count,
+			 dsl.count == 1 ? "" : "s");
+		check(dsl.count == 1 && dsl.results[0].key.fingerprint
+		      && !strcmp(dsl.results[0].key.fingerprint, fpr),
+		      "signed by the same key", buf);
+		alpm_siglist_cleanup(&dsl);
+	}
+
 	if (h2)
 		alpm_release(h2);
 

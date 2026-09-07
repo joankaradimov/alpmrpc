@@ -91,6 +91,38 @@ def client_local_record(name):
     return elem_of(t) if t else None
 
 
+def client_local_clear_record(name):
+    """Releases the contents of a struct the caller owns, rather than the
+    struct itself: it was filled in place through an out-param."""
+    t = OVERLAY.get("client_local_clear", {}).get(name)
+    return elem_of(t) if t else None
+
+
+def uncarried(rec_name, field_name):
+    """A field that does not cross, and the stated reason it does not."""
+    return OVERLAY.get("record_fields_uncarried", {}).get(
+        rec_name + "." + field_name)
+
+
+def carried_fields(rec):
+    return [f for f in rec["fields"] if not uncarried(rec["name"], f["name"])]
+
+
+def libalpm_clear_fn(c_type):
+    """The libalpm function that releases this record's contents, for the
+    server's own copy of a struct it filled in place."""
+    want = elem_of(c_type)
+    if not want:
+        return None
+    for fname, t in OVERLAY.get("client_local_clear", {}).items():
+        if fname.startswith("_"):
+            continue
+        e = elem_of(t)
+        if e and e["name"] == want["name"]:
+            return fname
+    return None
+
+
 def libalpm_free_fn(c_type):
     """The libalpm function that frees this record. client_local already
     pairs the two, so the fact is stated once rather than twice."""
@@ -115,7 +147,14 @@ def elem_of(type_str):
         return {"kind": "string", "c_type": "char *", "name": "str"}
     rec = find_record(t)
     if rec is not None:
-        return {"kind": "record", "c_type": t.replace("const ", ""),
+        # A record reached through a by-value field arrives without its
+        # star. The helpers are all written against a pointer, and it is
+        # the same record either way, so normalise here rather than in
+        # every caller.
+        ct = t.replace("const ", "").strip()
+        if not ct.endswith("*"):
+            ct += " *"
+        return {"kind": "record", "c_type": ct,
                 "record": rec, "name": short(t)}
     if handle_tag(t) in HANDLE_TAGS:
         return {"kind": "handle", "c_type": t.replace("const ", ""),
@@ -294,7 +333,7 @@ def select(model):
 
         # A struct this client materialised is freed locally; nothing about
         # it needs to reach the server.
-        if not why and client_local_record(n):
+        if not why and (client_local_record(n) or client_local_clear_record(n)):
             gen.append(fn)
             continue
 
@@ -331,7 +370,7 @@ def select(model):
                 if r:
                     why = "unsupported record: " + r
                 elif p["name"] in outs:
-                    why = "struct out-param: " + p["name"]
+                    pass        # filled in place; see the out-param code
                 elif "const" not in p["c_type"]:
                     # As with lists, const marks the read-only inputs. A
                     # non-const struct param may be written through, and
@@ -387,8 +426,8 @@ def _close_over_records(queue):
         if rec["name"] in need:
             continue
         need[rec["name"]] = e
-        for f in rec["fields"]:
-            if f["kind"] == "struct_ptr":
+        for f in carried_fields(rec):
+            if f["kind"] in ("struct_ptr", "record_value"):
                 sub = elem_of(f["c_type"])
                 if sub and sub["kind"] == "record":
                     queue.append(sub)
@@ -405,10 +444,14 @@ def records_input(gen):
     each record is actually used in."""
     queue = []
     for fn in gen:
-        if client_local_record(fn["name"]):
-            continue        # a local free serialises nothing
+        if client_local_record(fn["name"]) or \
+                client_local_clear_record(fn["name"]):
+            continue        # a local free or clear serialises nothing
+        outs = set(out_params_of(fn["name"]))
         for p in fn["params"]:
             if p["kind"] == "struct_ptr":
+                if p["name"] in outs:
+                    continue        # comes back filled; never goes out
                 e = elem_of(p["c_type"])
                 if e and e["kind"] == "record":
                     queue.append(e)
@@ -430,7 +473,8 @@ def records_needed(gen):
             e = elem_of(fn["ret"]["c_type"])
             if e and e["kind"] == "record":
                 queue.append(e)
-        cl = client_local_record(fn["name"])
+        cl = (client_local_record(fn["name"])
+              or client_local_clear_record(fn["name"]))
         if cl:
             queue.append(cl)        # its free helper has to exist
         for p in fn["params"]:
@@ -438,14 +482,18 @@ def records_needed(gen):
                 pe = param_elem(fn["name"], p["name"])
                 if pe and pe["kind"] == "record":
                     queue.append(pe)
+            elif p["kind"] == "struct_ptr":
+                e = elem_of(p["c_type"])
+                if e and e["kind"] == "record":
+                    queue.append(e)
     while queue:
         e = queue.pop()
         rec = e["record"]
         if rec["name"] in need:
             continue
         need[rec["name"]] = e
-        for f in rec["fields"]:
-            if f["kind"] == "struct_ptr":
+        for f in carried_fields(rec):
+            if f["kind"] in ("struct_ptr", "record_value"):
                 sub = elem_of(f["c_type"])
                 if sub and sub["kind"] == "record":
                     queue.append(sub)
@@ -486,6 +534,11 @@ def srv_put_value(o, expr, kind, c_type, owner, indent, recname=None,
     elif kind == "struct_ptr":
         sub = elem_of(c_type)
         o.append("%sput_%s(w, %s, owner);\n" % (t, sub["name"], expr))
+    elif kind == "record_value":
+        # The same record as a struct_ptr field, held by value rather than
+        # through a pointer -- one address-of away.
+        sub = elem_of(c_type)
+        o.append("%sput_%s(w, &%s, owner);\n" % (t, sub["name"], expr))
     elif kind == "list":
         sub = field_list_elem(recname, fname)
         o.append("%sput_list_%s(w, %s, owner);\n" % (t, sub["name"], expr))
@@ -527,6 +580,10 @@ def emit_server_helpers(need, elems):
             continue
         o.append("\tajw_obj_begin(w);\n")
         for f in rec["fields"]:
+            why = uncarried(rec["name"], f["name"])
+            if why:
+                o.append("\t/* %s does not cross: %s */\n" % (f["name"], why))
+                continue
             o.append("\tajw_key(w, %s);\n" % qq(f["name"]))
             srv_put_value(o, "v->" + f["name"], f["kind"], f["c_type"],
                           "owner", 1, rec["name"], f["name"])
@@ -787,7 +844,7 @@ def emit_server(gen, need, rin, src_header):
 
     for fn in gen:
         n = fn["name"]
-        if client_local_record(n):
+        if client_local_record(n) or client_local_clear_record(n):
             continue    # handled entirely on the client; never reaches here
         spec = OVERLAY["functions"].get(n, {})
         o.append("static int h_%s(arpc_req *rq, arpc_res *rs)\n{\n" % n)
@@ -799,8 +856,14 @@ def emit_server(gen, need, rin, src_header):
                       for p in fn["params"] if byte_buffer(fn, p["name"])}
         byte_checks = []
         out_buf = None
+        outs_here = set(out_params_of(n))
         for i, p in enumerate(fn["params"]):
             k, pn, ct = p["kind"], p["name"], p["c_type"]
+            if pn in outs_here:
+                # Declared and passed by the out-param block below. Only a
+                # struct_ptr can reach here, being the one kind that is a
+                # legitimate input as well.
+                continue
             bb = byte_buffer(fn, pn)
             if bb and k == "string":
                 # An input buffer: base64 in, malloc'd bytes out, freed after
@@ -859,6 +922,7 @@ def emit_server(gen, need, rin, src_header):
         out_lists = []
         out_handles = []
         out_bytes = []
+        out_structs = []
         for op in out_params_of(n):
             for p in fn["params"]:
                 if p["name"] != op:
@@ -881,6 +945,16 @@ def emit_server(gen, need, rin, src_header):
                     o.append("\t%s %s_v = NULL;\n" % (inner, op))
                     args.append("&%s_v" % op)
                     out_handles.append((op, handle_tag(inner)))
+                elif p["kind"] == "struct_ptr":
+                    # A struct libalpm fills in place. The caller's copy is
+                    # on the other side of the pipe, so one is provided here
+                    # and serialised afterwards.
+                    o.append("\t%s %s_v;\n"
+                             % (base_type(p["c_type"]), op))
+                    o.append("\tmemset(&%s_v, 0, sizeof(%s_v));\n" % (op, op))
+                    args.append("&%s_v" % op)
+                    out_structs.append((op, elem_of(p["c_type"]),
+                                        libalpm_clear_fn(p["c_type"])))
                 else:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\t%s %s_v = 0;\n" % (inner, op))
@@ -982,8 +1056,17 @@ def emit_server(gen, need, rin, src_header):
         out_list_names = [x[0] for x in out_lists]
         out_handle_tags = dict(out_handles)
         out_byte_len = dict(out_bytes)
+        out_struct_map = {x[0]: x for x in out_structs}
         for op in out_params_of(n):
             if op in out_list_names:
+                continue
+            if op in out_struct_map:
+                _, e, clearfn = out_struct_map[op]
+                o.append("\tput_%s(arpc_out_writer(rs, " % e["name"]
+                         + qq(op) + "), &%s_v, %s);\n" % (op, owner))
+                o.append("\t/* libalpm filled it for its caller to release,\n"
+                         "\t * and here that caller is the server. */\n")
+                o.append("\t%s(&%s_v);\n" % (clearfn or "(void)", op))
                 continue
             if op in out_byte_len.values():
                 # The buffer's own length says how long it is; sending it
@@ -1041,7 +1124,8 @@ def emit_server(gen, need, rin, src_header):
         # single field for many packages at once.
         o.append("\t{ " + qq("arpc.pkg_fields") + ", h_arpc_pkg_fields },\n")
     for fn in gen:
-        if client_local_record(fn["name"]):
+        if client_local_record(fn["name"]) or \
+                client_local_clear_record(fn["name"]):
             continue
         o.append("\t{ " + qq(fn["name"]) + ", h_%s },\n" % fn["name"])
     o.append("\t{ NULL, NULL }\n};\n")
@@ -1065,6 +1149,9 @@ def cli_get_value(o, target, kind, c_type, node, indent, recname=None,
         sub = elem_of(c_type)
         o.append("%s%s = (%s)get_%s(d, %s);\n"
                  % (t, target, c_type, sub["name"], node))
+    elif kind == "record_value":
+        o.append("%sfill_%s(&%s, d, %s);\n"
+                 % (t, elem_of(c_type)["name"], target, node))
     elif kind == "list":
         sub = field_list_elem(recname, fname)
         o.append("%s%s = build_list_%s(d, %s);\n" % (t, target, sub["name"], node))
@@ -1120,6 +1207,14 @@ def emit_client_helpers(need, elems):
             o.append("\tv->%s = i;\n" % ca["count"])
         else:
             for f in rec["fields"]:
+                why = uncarried(rec["name"], f["name"])
+                if why:
+                    # Left as it was found, which for a fresh record is
+                    # zeroed. Saying so here is the point: the reason is in
+                    # the generated source, not only in the overlay.
+                    o.append("\t/* %s does not cross: %s */\n"
+                             % (f["name"], why))
+                    continue
                 node = "aj_member(d, n, %s)" % qq(f["name"])
                 cli_get_value(o, "v->" + f["name"], f["kind"], f["c_type"],
                               node, 1, rec["name"], f["name"])
@@ -1141,12 +1236,16 @@ def emit_client_helpers(need, elems):
                      % (sub["name"], ca["items"]))
             o.append("\tfree(v->%s);\n" % ca["items"])
         else:
-            for f in rec["fields"]:
+            for f in carried_fields(rec):
                 if f["kind"] == "string":
                     o.append("\tfree(v->%s);\n" % f["name"])
                 elif f["kind"] == "struct_ptr":
                     sub = elem_of(f["c_type"])
                     o.append("\tfree_%s(v->%s);\n" % (sub["name"], f["name"]))
+                elif f["kind"] == "record_value":
+                    sub = elem_of(f["c_type"])
+                    o.append("\tclear_%s(&v->%s);\n"
+                             % (sub["name"], f["name"]))
                 elif f["kind"] == "list":
                     sub = field_list_elem(rec["name"], f["name"])
                     o.append("\tarpc_free_list(v->%s, %s);\n"
@@ -1223,6 +1322,24 @@ def emit_client(gen, need, rin, src_header):
             o.append("%s %s(%s)\n{\n" % (rct, n, sig))
             o.append("\tfree_%s(%s);\n"
                      % (cl["name"], fn["params"][0]["name"]))
+            if rk != "void":
+                o.append("\treturn (%s)0;\n" % rct)
+            o.append("}\n\n")
+            continue
+
+        # The struct itself is the caller's -- it was filled in place -- so
+        # only what this client put in it is released. libalpm's own version
+        # would be freeing the server's copy.
+        clc = client_local_clear_record(n)
+        if clc:
+            pn = fn["params"][0]["name"]
+            o.append("%s %s(%s)\n{\n" % (rct, n, sig))
+            o.append("\tif (%s) {\n" % pn)
+            o.append("\t\tclear_%s(%s);\n" % (clc["name"], pn))
+            o.append("\t\t/* Zeroed as well as emptied, so cleaning up\n"
+                     "\t\t * twice is harmless rather than a double free. */\n")
+            o.append("\t\tmemset(%s, 0, sizeof(*%s));\n" % (pn, pn))
+            o.append("\t}\n")
             if rk != "void":
                 o.append("\treturn (%s)0;\n" % rct)
             o.append("}\n\n")
@@ -1308,6 +1425,10 @@ def emit_client(gen, need, rin, src_header):
                 o.append("\tarpc_put_i64(&c, (long long)%s);\n" % pn)
             elif k == "handle":
                 o.append("\tarpc_put_handle(&c, ARPC_ID(%s));\n" % pn)
+            elif k == "struct_ptr" and pn in out_params_of(n):
+                # Filled on the way back, so nothing goes out in it -- but
+                # its slot does, because arguments are read by index.
+                o.append("\tarpc_put_null(&c);\n")
             elif k == "struct_ptr":
                 e = elem_of(p["c_type"])
                 o.append("\tput_%s(&c, %s);\n" % (e["name"], pn))
@@ -1369,6 +1490,18 @@ def emit_client(gen, need, rin, src_header):
                     o.append("\tif (%s)\n\t\t*%s = build_list_%s("
                              "arpc_doc(&c),\n\t\t\t\tarpc_out_node(&c, "
                              % (op, op, e["name"]) + qq(op) + "));\n")
+                elif p["kind"] == "struct_ptr":
+                    e = elem_of(p["c_type"])
+                    o.append("\t/* Filled in place, into the caller's own\n"
+                             "\t * struct. Zeroed first so a field that does\n"
+                             "\t * not cross is reliably NULL rather than\n"
+                             "\t * whatever the caller's stack held. */\n")
+                    o.append("\tif (%s) {\n" % op)
+                    o.append("\t\tmemset(%s, 0, sizeof(*%s));\n" % (op, op))
+                    o.append("\t\tfill_%s(%s, arpc_doc(&c),\n"
+                             "\t\t\t\tarpc_out_node(&c, " % (e["name"], op)
+                             + qq(op) + "));\n")
+                    o.append("\t}\n")
                 elif p["kind"] == "ptr_handle":
                     inner = p["c_type"][:-1].strip()
                     o.append("\tif (%s)\n\t\t*%s = (%s)(uintptr_t)"
@@ -1522,6 +1655,11 @@ def main():
         "generated": len(gen),
         "total": len(model["functions"]),
         "records_materialised": sorted(e["record"]["name"] for e in need),
+        # Record names start with an underscore, so a leading one cannot be
+        # the test for a comment key here; a real entry is <record>.<field>.
+        "record_fields_uncarried": {
+            k: v for k, v in
+            OVERLAY.get("record_fields_uncarried", {}).items() if "." in k},
         "skipped": {"count": len(skipped), "by_reason": reasons,
                     "detail": dict(skipped)},
     }

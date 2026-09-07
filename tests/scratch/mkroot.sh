@@ -168,6 +168,46 @@ rm -f "$ROOT/repo/$REPO.db"
 cp "$ROOT/repo/$REPO.db.tar.gz" "$ROOT/repo/$REPO.db"
 echo "repo:  $ROOT/repo/$REPO.db"
 
+# --- signatures ----------------------------------------------------------
+#
+# A throwaway key, generated here rather than committed: it signs nothing that
+# matters and lives only as long as this directory. Everything gets a detached
+# signature, and the public half goes into the root's gpgdir with ultimate
+# ownertrust, which is the shape pacman-key would leave behind.
+#
+# The existing tests are unaffected: they load packages and register the repo
+# with siglevel 0, so nothing is checked unless a test asks for it.
+export GNUPGHOME="$ROOT/gpgtmp"
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+# gpg narrates the trustdb on stderr whatever --quiet says. Failures still
+# stop the script, because of set -e.
+gpg --batch --quiet --passphrase '' \
+	--quick-gen-key 'alpmrpc scratch <nobody@example.invalid>' \
+	default default never 2>/dev/null
+FPR=$(gpg --with-colons --list-keys | awk -F: '/^fpr/{print $10; exit}')
+
+for f in "$ROOT"/var/cache/pacman/pkg/*.pkg.tar.zst "$ROOT"/repo/*.pkg.tar.zst \
+	 "$ROOT/repo/$REPO.db"; do
+	gpg --batch --quiet --yes --detach-sign --no-armor -o "$f.sig" "$f"
+done
+
+GPGDIR="$ROOT/etc/pacman.d/gnupg"
+mkdir -p "$GPGDIR"
+chmod 700 "$GPGDIR"
+gpg --export "$FPR" > "$GNUPGHOME/pub.gpg"
+gpg --homedir "$GPGDIR" --batch --quiet --import "$GNUPGHOME/pub.gpg"
+printf '%s:6:\n' "$FPR" | \
+	gpg --homedir "$GPGDIR" --batch --quiet --import-ownertrust 2>/dev/null
+
+# Leave no agent holding a socket open inside a directory the next run of
+# this script has to delete.
+gpgconf --kill all > /dev/null 2>&1 || true
+gpgconf --homedir "$GPGDIR" --kill all > /dev/null 2>&1 || true
+
+printf '%s\n' "$FPR" > "$ROOT/signing-key"
+echo "key:   $FPR"
+
 # The server is a Cygwin process, so every path handed to libalpm is a POSIX
 # path on its side, while the test reads the scriptlet and hook logs itself
 # and needs the Windows one. Bash knows both, so it writes the POSIX form

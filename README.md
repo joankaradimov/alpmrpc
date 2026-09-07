@@ -81,9 +81,18 @@ everything else, why it is not.
   field would silently produce a list of length one. Which field is the
   count and which is the array is an overlay entry; the array then crosses
   as an array, and the elements land in a single allocation because that is
-  what they are. `alpm_siglist_t` is the same shape and still refused, for a
-  different reason: its element embeds an `alpm_pgpkey_t` whose `data` is
-  the gpgme key itself.
+  what they are. `alpm_siglist_t` is the same shape, and forgetting to
+  declare it was caught immediately — a `siglist` of one, rendered as an
+  object rather than an array, which is precisely what the entry exists to
+  prevent.
+- **A field can be declared not to cross, with its reason.** One does:
+  `alpm_pgpkey_t.data` is the gpgme key object itself, and a pointer into
+  the server's gpgme means nothing here. It is left NULL, the reason is in
+  the overlay *and* in the generated source on both sides, and
+  `coverage.json` lists every record that has such a field so it cannot
+  become a quiet way of calling an awkward record supported. Everything a
+  caller reads *about* the key — fingerprint, uid, name, email, created,
+  expires, length, revoked, algorithm — is its own field and crosses intact.
 - **`alpm_dep_free` and friends never reach the server.** They free a struct
   this client materialised; the server has libalpm's own copy, which is not
   ours to free. The generated stub calls the matching free helper locally.
@@ -166,9 +175,12 @@ everything else, why it is not.
 `ctest` from the client build directory runs codec round-trip tests and the
 end-to-end tests (which launch a server on demand). The transaction test
 installs packages for real, so it runs against a throwaway root that
-`tests/scratch/mkroot.sh` rebuilds before every run -- two packages that
-conflict by name, each with a scriptlet, and a hook. That root carries its
-own `/bin/sh`, because scriptlets and hooks are `chroot`ed into it.
+`tests/scratch/mkroot.sh` rebuilds before every run: four packages, two of
+them conflicting by name, each with a scriptlet, a changelog and an mtree; a
+post-transaction hook; a `file://` repo so the download path runs with no
+network; and a throwaway GPG key that signs everything, with its public half
+in the root's gpgdir. That root also carries its own `/bin/sh`, because
+scriptlets and hooks are `chroot`ed into it.
 
 `bench_codec` reports round-trip cost, the codec's share of it, and
 throughput on a bulk payload -- run it before and after anything that
@@ -177,15 +189,13 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-168 of 193 functions are generated, plus 22 written by hand — the eighteen
-callback setters, getters and ctx getters, `alpm_filelist_contains`, and the
-three mtree functions.
+All 193 functions are on the wire: 171 generated, and 22 written by hand —
+the eighteen callback setters, getters and ctx getters,
+`alpm_filelist_contains`, and the three mtree functions. Nothing is refused.
+`coverage.json` names the hand-written ones and the file each lives in.
 
-That leaves three, all one reason: the PGP signature-checking functions, where
-`alpm_siglist_t`'s element embeds an `alpm_pgpkey_t` whose `data` is the gpgme
-key itself. Every other field would cross fine, which is exactly the trap — it
-would be a working function with one silently NULL member. `coverage.json`
-says so per function.
+One *field* does not cross, and that is stated rather than silent:
+`alpm_pgpkey_t.data`, the gpgme key object itself. See the design note above.
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to

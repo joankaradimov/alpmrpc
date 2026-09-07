@@ -255,6 +255,16 @@
     "alpm_depmissing_free": "alpm_depmissing_t *",
     "alpm_fileconflict_free": "alpm_fileconflict_t *"
   },
+  "client_local_clear": {
+    "_comment": [
+      "The same argument as client_local, one step short of it: the struct",
+      "itself belongs to the caller -- it was filled in place through an",
+      "out-param rather than returned -- so only its contents are released.",
+      "That is exactly what the generated clear_<record> does, and calling",
+      "libalpm's version would free the server's own copy instead."
+    ],
+    "alpm_siglist_cleanup": "alpm_siglist_t *"
+  },
   "struct_own": {
     "_comment": [
       "Ownership of a returned struct pointer. Unlike strings, const-ness does",
@@ -329,19 +339,33 @@
       "off the array field, so it does not need saying twice.",
       "These cross as a plain array; its length is the count."
     ],
-    "_alpm_filelist_t": { "count": "count", "items": "files" }
+    "_alpm_filelist_t": { "count": "count", "items": "files" },
+    "_alpm_siglist_t": { "count": "count", "items": "results" }
+  },
+  "record_fields_uncarried": {
+    "_comment": [
+      "Fields that do not cross, and why. A field named here is left zeroed",
+      "on the client instead of being filled with something wrong. That is",
+      "only acceptable because it is written down: coverage.json reports",
+      "every record that has one, so it cannot become a quiet way of calling",
+      "an awkward record supported.",
+      "",
+      "alpm_pgpkey_t.data is the gpgme key object itself, and libalpm's own",
+      "fingerprint/uid/name/email point into it. A pointer into the server's",
+      "gpgme is meaningless here, and rebuilding an equivalent key would need",
+      "a gpg engine present in every caller's environment -- which would make",
+      "the field non-NULL only sometimes, and that is harder to reason about",
+      "than never. Everything a caller reads about the key is its own field",
+      "and crosses intact."
+    ],
+    "_alpm_pgpkey_t.data": "the gpgme key itself, which is the server's gpgme's to own"
   },
   "records_unsupported": {
     "_comment": [
-      "Records the materialiser must refuse rather than get wrong.",
-      "alpm_siglist_t is a counted array too, and that part is now supported.",
-      "What still stops it is inside the element: alpm_sigresult_t embeds an",
-      "alpm_pgpkey_t by value, whose `data` is the gpgme key itself. Every",
-      "other field of that key would cross fine, so this would be a working",
-      "function with one silently NULL member -- which is the kind of nearly",
-      "right the rest of this generator refuses to produce."
-    ],
-    "_alpm_siglist_t": "element embeds alpm_pgpkey_t, whose data is an opaque gpgme key"
+      "Records the materialiser must refuse rather than get wrong. Empty:",
+      "nothing in alpm.h is currently refused outright. Kept because the",
+      "next awkward record should land here rather than be forced through."
+    ]
   },
   "out_list_own": {
     "_comment": [

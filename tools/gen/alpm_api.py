@@ -62,6 +62,13 @@ def classify(t):
     ):
         return "scalar", {}
 
+    # A defined struct held by value, not through a pointer -- a field like
+    # alpm_sigresult_t's `key`. It is the same record as a struct_ptr field,
+    # differing only in where it lives, so it is worth a kind of its own
+    # rather than falling through to "unsupported".
+    if _is_transparent_record(canon):
+        return "record_value", {"type": canon.spelling.replace("struct ", "")}
+
     if canon.kind == cx.TypeKind.POINTER:
         pointee = canon.get_pointee()
         pc = pointee.get_canonical()
