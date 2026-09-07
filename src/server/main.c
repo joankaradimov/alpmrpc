@@ -123,6 +123,81 @@ static int write_exact(HANDLE h, const void *buf, DWORD n)
 	return 1;
 }
 
+/* Ask a running server on this endpoint to exit, and wait for it to let go.
+ *
+ * A rebuild has to be able to replace alpmrpcd.exe, and Windows will not let
+ * it while the old one is running. Killing it would be blunt and would drop
+ * whatever a client was doing; asking is enough, because the server finishes
+ * its current connection first. Returns 0 only if a server was there and
+ * would not leave. */
+static int stop_running_server(const char *name, int timeout_ms)
+{
+	HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+			       OPEN_EXISTING, 0, NULL);
+	if (p == INVALID_HANDLE_VALUE) {
+		DWORD e = GetLastError();
+		if (e == ERROR_FILE_NOT_FOUND) {
+			logf_("no server listening on %s", name);
+			return 1;       /* genuinely nothing to stop */
+		}
+		/* The server accepts one connection at a time, so a busy pipe
+		 * means a server is up and serving somebody. That is the case
+		 * the caller most needs told apart from "not running": its
+		 * binary is locked and cannot be replaced. */
+		if (e == ERROR_PIPE_BUSY) {
+			/* Give the current client a moment to finish. */
+			if (WaitNamedPipeA(name, (DWORD)timeout_ms)) {
+				p = CreateFileA(name,
+						GENERIC_READ | GENERIC_WRITE, 0,
+						NULL, OPEN_EXISTING, 0, NULL);
+			}
+			if (p == INVALID_HANDLE_VALUE) {
+				logf_("server is busy with another client");
+				return 0;
+			}
+		} else {
+			logf_("cannot reach the endpoint (%u)", (unsigned)e);
+			return 0;
+		}
+	}
+
+	static const char req[] =
+		"{\"id\":1,\"method\":\"arpc.shutdown\",\"params\":[]}";
+	unsigned len = (unsigned)(sizeof(req) - 1);
+	unsigned char hdr[4] = {
+		(unsigned char)(len & 0xFF), (unsigned char)((len >> 8) & 0xFF),
+		(unsigned char)((len >> 16) & 0xFF),
+		(unsigned char)((len >> 24) & 0xFF)
+	};
+	int sent = write_exact(p, hdr, 4) && write_exact(p, (void *)req, len);
+	if (sent && read_exact(p, hdr, 4)) {
+		unsigned rlen = (unsigned)hdr[0] | ((unsigned)hdr[1] << 8) |
+				((unsigned)hdr[2] << 16) | ((unsigned)hdr[3] << 24);
+		char *drop = (rlen && rlen < ARPC_MAX_FRAME)
+				     ? (char *)malloc(rlen) : NULL;
+		if (drop) {
+			read_exact(p, drop, rlen);
+			free(drop);
+		}
+	}
+	CloseHandle(p);                 /* our disconnect is what lets it go */
+	if (!sent)
+		return 0;
+
+	for (int waited = 0; waited < timeout_ms; waited += 25) {
+		Sleep(25);
+		HANDLE probe = CreateFileA(name, GENERIC_READ, 0, NULL,
+					   OPEN_EXISTING, 0, NULL);
+		if (probe == INVALID_HANDLE_VALUE) {
+			logf_("server stopped");
+			return 1;
+		}
+		CloseHandle(probe);
+	}
+	logf_("server did not stop within %dms", timeout_ms);
+	return 0;
+}
+
 static void serve_connection(HANDLE pipe)
 {
 	for (;;) {
@@ -191,6 +266,7 @@ int main(int argc, char **argv)
 	const char *root_override = NULL;
 	int idle_ms = 30000;
 	int stdio_mode = 0;
+	int stop_mode = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--stdio"))
@@ -201,6 +277,8 @@ int main(int argc, char **argv)
 			root_override = argv[++i];
 		else if (!strcmp(argv[i], "--idle") && i + 1 < argc)
 			idle_ms = atoi(argv[++i]) * 1000;
+		else if (!strcmp(argv[i], "--stop"))
+			stop_mode = 1;
 		else if (!strcmp(argv[i], "--print-endpoint")) {
 			char root[MAX_PATH], name[256];
 			if (!derive_root(root, sizeof(root)))
@@ -234,6 +312,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	logf_("root=%s endpoint=%s idle=%dms", root, name, idle_ms);
+
+	if (stop_mode)
+		return stop_running_server(name, 5000) ? 0 : 1;
 
 	SECURITY_ATTRIBUTES sa;
 	PSECURITY_DESCRIPTOR sd = NULL;
@@ -290,6 +371,10 @@ int main(int argc, char **argv)
 		DisconnectNamedPipe(pipe);
 		CloseHandle(pipe);
 		logf_("client gone; %u handles live", arpc_handle_live());
+		if (arpc_shutdown_requested()) {
+			logf_("shutdown requested; exiting (served %d)", served);
+			break;
+		}
 	}
 
 	CloseHandle(ev);

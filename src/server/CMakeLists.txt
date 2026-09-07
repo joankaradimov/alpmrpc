@@ -26,4 +26,27 @@ target_compile_options(alpmrpcd PRIVATE -Wall -Wextra)
 target_link_libraries(alpmrpcd PRIVATE
   alpm archive curl crypto gpgme intl advapi32)
 
+# Windows will not let anything overwrite a running executable, so a rebuild
+# fails at this step while a server is up. Working around it by renaming the
+# locked file aside would be worse than the error: the old server keeps its
+# endpoint, later clients keep connecting to it, and tests quietly run
+# against stale code. So retire it instead.
+#
+# Asking is enough -- the server finishes its current connection and exits,
+# and the next client starts a fresh one on demand. If it will not go, fail
+# loudly rather than install something that will not be used.
+install(CODE "
+  set(_stopper \"$<TARGET_FILE:alpmrpcd>\")
+  execute_process(
+    COMMAND \"\${_stopper}\" --root \"${MSYS2_ROOT}\" --stop
+    RESULT_VARIABLE _stop_rc
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT _stop_rc EQUAL 0)
+    message(FATAL_ERROR
+      \"A running alpmrpcd would not stop, so its binary cannot be \"
+      \"replaced. It is probably serving a client that is still \"
+      \"connected. Close that client and build again.\")
+  endif()
+")
+
 install(TARGETS alpmrpcd RUNTIME DESTINATION usr/bin)

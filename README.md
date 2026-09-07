@@ -75,6 +75,14 @@ everything else, why it is not.
   scriptlets and hooks on the path Cygwin actually supports.
 - `ALPMRPC_TRACE=1` dumps every frame. `alpmrpcd --stdio` runs the dispatch
   layer against stdin/stdout with no IPC at all.
+- **Rebuilding while a server is up.** Windows will not overwrite a running
+  executable, so installing asks any server on this endpoint to exit first
+  (`alpmrpcd --stop`); the next client starts a fresh one on demand. Renaming
+  the locked file aside would have been the easier fix and a worse one -- the
+  old server would keep its endpoint and later clients would keep reaching
+  it, so tests would quietly run against stale code. If a client is still
+  connected the server cannot be retired, and the build says so rather than
+  installing something that will not be used.
 
 ## Tests
 

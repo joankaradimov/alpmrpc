@@ -93,6 +93,10 @@ typedef struct {
 
 extern const arpc_method arpc_methods[];
 
+/* Set once a client has asked the server to exit. The accept loop checks it
+ * after each connection closes, so an in-flight call always completes. */
+int arpc_shutdown_requested(void);
+
 /* Parses one request frame and produces one response frame.
  * Returns a malloc'd NUL-terminated JSON response; caller frees. */
 char *arpc_handle_frame(const char *req, size_t len);

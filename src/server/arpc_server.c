@@ -311,6 +311,10 @@ static char *reply_error(long long id, int code, const char *msg)
 	return finish(&w);
 }
 
+static int g_shutdown_requested;
+
+int arpc_shutdown_requested(void) { return g_shutdown_requested; }
+
 char *arpc_handle_frame(const char *req, size_t len)
 {
 	aj_doc d;
@@ -326,6 +330,24 @@ char *arpc_handle_frame(const char *req, size_t len)
 	if (!method) {
 		aj_free(&d);
 		return reply_error(id, ARPC_E_INVALID_REQ, "missing method");
+	}
+
+	/* Infrastructure, not a libalpm call, so it lives here rather than in
+	 * the generated table. Exiting after the current client disconnects is
+	 * what the idle timer would do anyway -- this only brings it forward,
+	 * which is what lets a rebuild replace the binary. */
+	if (!strcmp(method, "arpc.shutdown")) {
+		g_shutdown_requested = 1;
+		aj_free(&d);
+		aj_w w;
+		ajw_init(&w);
+		ajw_obj_begin(&w);
+		ajw_key(&w, "id");     ajw_i64(&w, id);
+		ajw_key(&w, "result"); ajw_obj_begin(&w);
+		ajw_key(&w, "ret");    ajw_i64(&w, 0);
+		ajw_obj_end(&w);
+		ajw_obj_end(&w);
+		return finish(&w);
 	}
 
 	const arpc_method *m = NULL;
