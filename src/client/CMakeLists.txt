@@ -60,6 +60,9 @@ if(ALPMRPC_BUILD_TESTS)
   target_link_libraries(e2e_lists PRIVATE alpm)
   add_test(NAME e2e_lists COMMAND e2e_lists)
 
+  add_executable(bench_pkg_fields ${_tests}/bench_pkg_fields.c)
+  target_link_libraries(bench_pkg_fields PRIVATE alpm)
+
   add_executable(bench_codec ${_tests}/bench_codec.c
                              ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
   target_include_directories(bench_codec PRIVATE

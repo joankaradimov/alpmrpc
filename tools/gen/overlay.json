@@ -30,7 +30,23 @@
         "match": ".*",
         "own": "borrowed"
       }
-    ]
+    ],
+    "batch_pkg_fields": {
+      "_comment": [
+        "Accessors cheap enough to fetch for a whole list at once. They read a",
+        "field of an already-loaded db entry, so batching them is free; the",
+        "exclusions do real work (hashing a package file, computing a download",
+        "size) or are not accessors at all, and must stay one call per use.",
+        "Whether an accessor is cheap is not something the header states."
+      ],
+      "match": "^alpm_pkg_(get|has)_",
+      "exclude": [
+        "alpm_pkg_free",
+        "alpm_pkg_checkmd5sum",
+        "alpm_pkg_download_size",
+        "alpm_pkg_get_validation"
+      ]
+    }
   },
   "list_elem": {
     "_comment": [

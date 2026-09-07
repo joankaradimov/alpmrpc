@@ -91,6 +91,20 @@ void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
 void arpc_put_str_list(arpc_call *c, const alpm_list_t *l);
 void arpc_put_handle_list(arpc_call *c, const alpm_list_t *l);
 
+/* ---- batched package fields ----
+ *
+ * Reading eight fields of 1150 packages one accessor call at a time is 9200
+ * round trips. Instead a materialised package list registers itself as a
+ * group, and the first read of any field fetches that field for the whole
+ * group in one call. Fields nobody reads are never fetched.
+ *
+ * A package that belongs to no group (one from alpm_db_get_pkg, say) gets a
+ * group of one, so the same path also gives it per-field caching.
+ */
+void arpc_pkg_group_register(const alpm_list_t *pkgs);
+const char *arpc_pkg_field_str(uint64_t id, const char *field);
+long long   arpc_pkg_field_i64(uint64_t id, const char *field);
+
 /* Diagnostics. ALPMRPC_TRACE=1 dumps every frame to stderr. */
 const char *arpc_last_error(void);
 

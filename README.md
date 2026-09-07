@@ -58,6 +58,15 @@ everything else, why it is not.
   `src/client/vendor/`). A list therefore costs one round trip, not one per
   element. Transparent element structs are materialised field by field,
   recursively: `alpm_group_t` arrives with its `packages` list attached.
+- **Package fields are fetched a column at a time.** Reading eight fields of
+  1150 packages one accessor call at a time is 9200 round trips. A
+  materialised package list registers itself as a group, and the first read
+  of any field fetches that field for the whole group in one call, so the
+  1149 reads that follow are memory reads (~50ns). Fields nobody touches are
+  never fetched. `alpm_pkg_get_name()` is unchanged from the caller's side --
+  this is not a new API, it is the same one not going to the wire.
+  Which accessors are cheap enough to batch is an overlay rule: the excluded
+  ones hash a package file or compute a download size.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. Caller-owned lists are

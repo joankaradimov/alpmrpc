@@ -161,6 +161,41 @@ int main(void)
 	      found ? alpm_pkg_get_name(found) : "no satisfier");
 	alpm_list_free(needles);
 
+	printf("\n-- batched fields agree with unbatched ones --\n");
+	/* Reading a field off a list member goes through the column cache;
+	 * reading it off a package fetched by name does not. The two paths
+	 * must agree, or the batch is quietly serving wrong data. */
+	const char *batched_name = alpm_pkg_get_name(first);
+	const char *batched_ver = alpm_pkg_get_version(first);
+	alpm_pkg_t *byname = alpm_db_get_pkg(db, batched_name);
+	check(byname != NULL, "alpm_db_get_pkg() by the batched name",
+	      batched_name);
+	if (byname) {
+		const char *v = alpm_pkg_get_version(byname);
+		check(v && batched_ver && !strcmp(v, batched_ver),
+		      "version matches on both paths", v);
+		off_t a = alpm_pkg_get_isize(first);
+		off_t b = alpm_pkg_get_isize(byname);
+		snprintf(buf, sizeof(buf), "%lld vs %lld", (long long)a,
+			 (long long)b);
+		check(a == b, "numeric field matches on both paths", buf);
+	}
+
+	/* Every member must get its own value, not the first one repeated --
+	 * an off-by-one in the column indexing would show up here. */
+	int distinct = 0;
+	const char *prev = NULL;
+	for (alpm_list_t *i = cache; i; i = i->next) {
+		const char *nm = alpm_pkg_get_name((alpm_pkg_t *)i->data);
+		if (!prev || (nm && strcmp(nm, prev)))
+			distinct++;
+		prev = nm;
+	}
+	snprintf(buf, sizeof(buf), "%d distinct across %zu members", distinct,
+		 walked);
+	check((size_t)distinct == walked, "column indexing lines up per member",
+	      buf);
+
 	printf("\n-- teardown releases cached lists --\n");
 	alpm_release(h);
 	check(1, "alpm_release() with lists outstanding", "no leak, no crash");

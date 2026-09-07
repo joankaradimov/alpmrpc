@@ -192,6 +192,8 @@ static void disconnect(void)
 	}
 }
 
+static void free_all_groups(void);
+
 /* ---------------------------------------------------- borrowed-string cache */
 
 /* One cache for everything libalpm hands back as borrowed: strings and
@@ -312,7 +314,255 @@ void arpc_purge_owner(uint64_t owner)
 			pp = &(*pp)->next;
 		}
 	}
+	/* Column caches hold package ids that die with the handle too. */
+	free_all_groups();
 	LeaveCriticalSection(&g_lock);
+}
+
+
+/* ------------------------------------------------- batched package fields */
+
+typedef struct column {
+	struct column *next;
+	const char *field;      /* generated literal; static lifetime */
+	char **str;             /* one per member, or NULL for a numeric column */
+	long long *num;
+} column;
+
+typedef struct pkg_group {
+	struct pkg_group *next;
+	uint64_t *ids;          /* sorted, for binary search */
+	size_t *slot;           /* ids[k] belongs at member slot[k] */
+	uint64_t *by_slot;      /* member order, as the caller sees the list */
+	size_t n;
+	column *cols;
+} pkg_group;
+
+static pkg_group *g_groups;
+
+static void free_group(pkg_group *g)
+{
+	while (g->cols) {
+		column *c = g->cols;
+		g->cols = c->next;
+		if (c->str) {
+			for (size_t i = 0; i < g->n; i++)
+				free(c->str[i]);
+			free(c->str);
+		}
+		free(c->num);
+		free(c);
+	}
+	free(g->ids);
+	free(g->slot);
+	free(g->by_slot);
+	free(g);
+}
+
+static void free_all_groups(void)
+{
+	while (g_groups) {
+		pkg_group *g = g_groups;
+		g_groups = g->next;
+		free_group(g);
+	}
+}
+
+/* Insertion sort: ids arrive already ascending (the server assigns them in
+ * one sweep while serialising), so this is a linear pass in practice. */
+static void sort_group(pkg_group *g)
+{
+	for (size_t i = 1; i < g->n; i++) {
+		uint64_t id = g->ids[i];
+		size_t sl = g->slot[i];
+		size_t j = i;
+		while (j > 0 && g->ids[j - 1] > id) {
+			g->ids[j] = g->ids[j - 1];
+			g->slot[j] = g->slot[j - 1];
+			j--;
+		}
+		g->ids[j] = id;
+		g->slot[j] = sl;
+	}
+}
+
+static int group_find(const pkg_group *g, uint64_t id, size_t *out)
+{
+	size_t lo = 0, hi = g->n;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (g->ids[mid] == id) {
+			*out = g->slot[mid];
+			return 1;
+		}
+		if (g->ids[mid] < id)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return 0;
+}
+
+static pkg_group *group_of(uint64_t id, size_t *slot)
+{
+	for (pkg_group *g = g_groups; g; g = g->next)
+		if (group_find(g, id, slot))
+			return g;
+	return NULL;
+}
+
+static pkg_group *group_new(const uint64_t *ids, size_t n)
+{
+	pkg_group *g = (pkg_group *)calloc(1, sizeof(*g));
+	if (!g)
+		return NULL;
+	g->ids = (uint64_t *)calloc(n ? n : 1, sizeof(*g->ids));
+	g->slot = (size_t *)calloc(n ? n : 1, sizeof(*g->slot));
+	g->by_slot = (uint64_t *)calloc(n ? n : 1, sizeof(*g->by_slot));
+	if (!g->ids || !g->slot || !g->by_slot) {
+		free(g->ids);
+		free(g->slot);
+		free(g->by_slot);
+		free(g);
+		return NULL;
+	}
+	for (size_t i = 0; i < n; i++) {
+		g->ids[i] = ids[i];
+		g->slot[i] = i;
+		g->by_slot[i] = ids[i];
+	}
+	g->n = n;
+	sort_group(g);
+	g->next = g_groups;
+	g_groups = g;
+	return g;
+}
+
+void arpc_pkg_group_register(const alpm_list_t *pkgs)
+{
+	size_t n = 0;
+	for (const alpm_list_t *i = pkgs; i; i = i->next)
+		n++;
+	if (n == 0)
+		return;
+
+	uint64_t *ids = (uint64_t *)calloc(n, sizeof(*ids));
+	if (!ids)
+		return;
+	size_t k = 0;
+	for (const alpm_list_t *i = pkgs; i; i = i->next)
+		ids[k++] = ARPC_ID(i->data);
+
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	group_new(ids, n);
+	LeaveCriticalSection(&g_lock);
+	free(ids);
+}
+
+/* One round trip: this field, for every member of the group. */
+static column *fetch_column(pkg_group *g, const char *field, int want_str)
+{
+	arpc_call c;
+	if (!arpc_begin(&c, "arpc.pkg_fields"))
+		return NULL;
+
+	ajw_arr_begin(&c.req);
+	/* Member order, so the response lines up with slots directly. g->ids is
+	 * sorted for lookup; by_slot preserves the order the caller sees. */
+	for (size_t i = 0; i < g->n; i++)
+		ajw_i64(&c.req, (long long)g->by_slot[i]);
+	ajw_arr_end(&c.req);
+	arpc_put_str(&c, field);
+
+	if (!arpc_invoke(&c)) {
+		arpc_end(&c);
+		return NULL;
+	}
+
+	column *col = (column *)calloc(1, sizeof(*col));
+	if (!col) {
+		arpc_end(&c);
+		return NULL;
+	}
+	col->field = field;
+	if (want_str)
+		col->str = (char **)calloc(g->n, sizeof(*col->str));
+	else
+		col->num = (long long *)calloc(g->n, sizeof(*col->num));
+
+	int arr = arpc_ret_node(&c);
+	const aj_doc *d = arpc_doc(&c);
+	int got = aj_count(d, arr);
+	for (size_t i = 0; i < g->n && (int)i < got; i++) {
+		int e = aj_elem(d, arr, (int)i);
+		if (want_str)
+			col->str[i] = arpc_dup(aj_str(d, e, NULL));
+		else
+			col->num[i] = aj_i64(d, e, 0);
+	}
+	arpc_end(&c);
+
+	col->next = g->cols;
+	g->cols = col;
+	return col;
+}
+
+static column *column_for(pkg_group *g, const char *field, int want_str)
+{
+	for (column *c = g->cols; c; c = c->next)
+		if (!strcmp(c->field, field))
+			return c;
+	return fetch_column(g, field, want_str);
+}
+
+/* Resolve a package to its group, creating a group of one if it belongs to
+ * no list. Called with the lock held. */
+static pkg_group *group_for_pkg(uint64_t id, size_t *slot)
+{
+	pkg_group *g = group_of(id, slot);
+	if (g)
+		return g;
+	g = group_new(&id, 1);
+	if (g)
+		*slot = 0;
+	return g;
+}
+
+const char *arpc_pkg_field_str(uint64_t id, const char *field)
+{
+	if (!id)
+		return NULL;
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	size_t slot = 0;
+	const char *r = NULL;
+	pkg_group *g = group_for_pkg(id, &slot);
+	if (g) {
+		column *c = column_for(g, field, 1);
+		if (c && c->str)
+			r = c->str[slot];
+	}
+	LeaveCriticalSection(&g_lock);
+	return r;
+}
+
+long long arpc_pkg_field_i64(uint64_t id, const char *field)
+{
+	if (!id)
+		return 0;
+	lock_init_once();
+	EnterCriticalSection(&g_lock);
+	size_t slot = 0;
+	long long r = 0;
+	pkg_group *g = group_for_pkg(id, &slot);
+	if (g) {
+		column *c = column_for(g, field, 0);
+		if (c && c->num)
+			r = c->num[slot];
+	}
+	LeaveCriticalSection(&g_lock);
+	return r;
 }
 
 /* ------------------------------------------------- connection refcounting */

@@ -103,6 +103,28 @@ def field_list_elem(recname, fname):
         "%s.%s" % (recname, fname)))
 
 
+def is_batchable(fn):
+    """A pkg accessor cheap enough to fetch for a whole list in one call.
+
+    Reading one field of 1150 packages one call at a time is 1150 round
+    trips; reading it for all of them is one. The client fetches a column on
+    first use, so a field nobody touches is never fetched at all."""
+    rule = OVERLAY["rules"].get("batch_pkg_fields")
+    if not rule:
+        return False
+    n = fn["name"]
+    if n in rule.get("exclude", []):
+        return False
+    if not re.match(rule["match"], n):
+        return False
+    if fn.get("variadic") or len(fn["params"]) != 1:
+        return False
+    p = fn["params"][0]
+    if p["kind"] != "handle" or "alpm_pkg_t" not in p["c_type"]:
+        return False
+    return fn["ret"]["kind"] in ("string", "scalar", "enum")
+
+
 def out_params_of(name):
     return OVERLAY["functions"].get(name, {}).get("out_params", [])
 
@@ -338,10 +360,67 @@ def emit_server_list_writers(elems):
     return "".join(o)
 
 
+def emit_pkg_batch(gen):
+    """One method that returns a single field for many packages at once."""
+    NL = "\n"
+    fields = [f for f in gen if is_batchable(f)]
+    if not fields:
+        return ""
+
+    o = []
+    o.append("/* ---- batched package fields ----" + NL)
+    o.append(" *" + NL)
+    o.append(" * The field is resolved to an index once per call, not once per" + NL)
+    o.append(" * package, and each case calls the accessor directly rather than" + NL)
+    o.append(" * through a function pointer -- the accessors do not share a" + NL)
+    o.append(" * signature, and casting between them would be undefined." + NL)
+    o.append(" */" + NL)
+    o.append("static int pkg_field_index(const char *f)" + NL + "{" + NL)
+    for i, f in enumerate(fields):
+        o.append("	if (!strcmp(f, " + qq(f["name"]) + "))" + NL
+                 + "		return %d;" % i + NL)
+    o.append("	return -1;" + NL + "}" + NL + NL)
+
+    o.append("static void pkg_field_put(aj_w *w, alpm_pkg_t *p, int idx)"
+             + NL + "{" + NL + "	switch (idx) {" + NL)
+    for i, f in enumerate(fields):
+        if f["ret"]["kind"] == "string":
+            o.append("	case %d: ajw_str(w, %s(p)); break;" % (i, f["name"]) + NL)
+        else:
+            o.append("	case %d: ajw_i64(w, (long long)%s(p)); break;"
+                     % (i, f["name"]) + NL)
+    o.append("	default: ajw_null(w); break;" + NL + "	}" + NL + "}" + NL + NL)
+
+    o.append("static int h_arpc_pkg_fields(arpc_req *rq, arpc_res *rs)"
+             + NL + "{" + NL)
+    o.append("	int ids = arpc_arg_node(rq, 0);" + NL)
+    o.append("	const char *field = arpc_arg_str(rq, 1);" + NL)
+    o.append("	int idx = field ? pkg_field_index(field) : -1;" + NL)
+    o.append("	if (arpc_req_bad(rq) || ids < 0 || idx < 0)" + NL)
+    o.append("		return arpc_fail(rs, ARPC_E_INVALID_PARAMS," + NL)
+    o.append("			" + qq("arpc.pkg_fields: unknown or missing field")
+             + ");" + NL)
+    o.append("	arpc_ret_begin(rs);" + NL)
+    o.append("	aj_w *w = arpc_res_writer(rs);" + NL)
+    o.append("	ajw_arr_begin(w);" + NL)
+    o.append("	int n = arpc_node_count(rq, ids);" + NL)
+    o.append("	for (int i = 0; i < n; i++) {" + NL)
+    o.append("		uint64_t id = (uint64_t)arpc_node_i64(rq," + NL
+             + "				arpc_node_elem(rq, ids, i));" + NL)
+    o.append("		alpm_pkg_t *p = (alpm_pkg_t *)arpc_handle_get(id, "
+             "ARPC_H_PKG);" + NL)
+    o.append("		if (!p)" + NL + "			ajw_null(w);" + NL)
+    o.append("		else" + NL + "			pkg_field_put(w, p, idx);" + NL)
+    o.append("	}" + NL + "	ajw_arr_end(w);" + NL + "	return 0;" + NL
+             + "}" + NL + NL)
+    return "".join(o)
+
+
 def emit_server(gen, need, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_server.h"\n')
-    o.append("#include <alpm.h>\n#include <alpm_list.h>\n#include <stdlib.h>\n\n")
+    o.append("#include <alpm.h>\n#include <alpm_list.h>\n"
+             "#include <stdlib.h>\n#include <string.h>\n\n")
     elems = collect_elems(gen, need)
     o.append(emit_server_helpers(need, elems))
     o.append(emit_server_list_writers(elems))
@@ -438,7 +517,13 @@ def emit_server(gen, need, src_header):
 
         o.append("\treturn 0;\n}\n\n")
 
+    o.append(emit_pkg_batch(gen))
+
     o.append("const arpc_method arpc_methods[] = {\n")
+    if any(is_batchable(f) for f in gen):
+        # Not a libalpm function: the one composite method, which returns a
+        # single field for many packages at once.
+        o.append("\t{ " + qq("arpc.pkg_fields") + ", h_arpc_pkg_fields },\n")
     for fn in gen:
         o.append("\t{ " + qq(fn["name"]) + ", h_%s },\n" % fn["name"])
     o.append("\t{ NULL, NULL }\n};\n")
@@ -523,7 +608,12 @@ def emit_client_helpers(need, elems):
                      "(void *)(uintptr_t)aj_i64(d, e, 0));\n")
         else:
             o.append("\t\talpm_list_append(&out, get_%s(d, e));\n" % e["name"])
-        o.append("\t}\n\treturn out;\n}\n\n")
+        o.append("\t}\n")
+        if e["kind"] == "handle" and e["tag"] == "ARPC_H_PKG":
+            o.append("\t/* Register the whole set, so the first read of any\n"
+                     "\t * field can fetch that field for all of them. */\n")
+            o.append("\tarpc_pkg_group_register(out);\n")
+        o.append("\treturn out;\n}\n\n")
     return "".join(o)
 
 
@@ -553,6 +643,22 @@ def emit_client(gen, need, src_header):
         spec = OVERLAY["functions"].get(n, {})
         sig = ", ".join("%s %s" % (p["c_type"], p["name"])
                         for p in fn["params"]) or "void"
+
+        # Batchable accessors never call out on their own. The runtime fetches
+        # the whole column for the package's list on first use, so the 1149
+        # calls that follow it are plain memory reads.
+        if is_batchable(fn):
+            pn = fn["params"][0]["name"]
+            o.append("%s %s(%s)\n{\n" % (rct, n, sig))
+            if rk == "string":
+                o.append("\treturn arpc_pkg_field_str(ARPC_ID(%s), " % pn
+                         + qq(n) + ");\n")
+            else:
+                o.append("\treturn (%s)arpc_pkg_field_i64(ARPC_ID(%s), "
+                         % (rct, pn) + qq(n) + ");\n")
+            o.append("}\n\n")
+            continue
+
         fail = {
             "void": "return;",
             "scalar": "return (%s)-1;" % rct,
