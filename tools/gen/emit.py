@@ -162,6 +162,16 @@ def is_batchable(fn):
     return fn["ret"]["kind"] in ("string", "scalar", "enum")
 
 
+def exported_record(name):
+    """Marshallers shared with the hand-written callback layer, which cannot
+    call a static in a generated file."""
+    return name in OVERLAY.get("export_helpers", {}).get("records", [])
+
+
+def exported_list(name):
+    return name in OVERLAY.get("export_helpers", {}).get("lists", [])
+
+
 def out_params_of(name):
     return OVERLAY["functions"].get(name, {}).get("out_params", [])
 
@@ -211,6 +221,13 @@ def select(model):
             if k in ("ptr_enum", "ptr_scalar"):
                 if p["name"] not in outs:
                     why = "pointer param with undeclared direction: " + p["name"]
+            elif k == "ptr_list":
+                # libalpm fills these and hands ownership to the caller, so
+                # they need an element type like any other list.
+                if p["name"] not in outs:
+                    why = "list out-param not declared: " + p["name"]
+                elif param_elem(n, p["name"]) is None:
+                    why = "list out-param with no element type: " + p["name"]
             elif k == "struct_ptr":
                 r = record_unsupported_reason(p["c_type"])
                 if r:
@@ -312,7 +329,7 @@ def records_needed(gen):
         if cl:
             queue.append(cl)        # its free helper has to exist
         for p in fn["params"]:
-            if p["kind"] == "list":
+            if p["kind"] in ("list", "ptr_list"):
                 pe = param_elem(fn["name"], p["name"])
                 if pe and pe["kind"] == "record":
                     queue.append(pe)
@@ -413,7 +430,9 @@ def collect_elems(gen, need):
     for fn in gen:
         add(ret_elem(fn["name"]))
         for p in fn["params"]:
-            if p["kind"] == "list":
+            # ptr_list is an out-param, but it needs the same writer and
+            # builder as any other list of that element type.
+            if p["kind"] in ("list", "ptr_list"):
                 add(param_elem(fn["name"], p["name"]))
     for e in need:
         for f in e["record"]["fields"]:
@@ -684,9 +703,16 @@ def emit_server(gen, need, rin, src_header):
                 args.append(pn)
                 temps.append((pn, e["name"]))
 
+        out_lists = []
         for op in out_params_of(n):
             for p in fn["params"]:
-                if p["name"] == op:
+                if p["name"] != op:
+                    continue
+                if p["kind"] == "ptr_list":
+                    o.append("\talpm_list_t *%s_v = NULL;\n" % op)
+                    args.append("&%s_v" % op)
+                    out_lists.append((op, param_elem(n, op)))
+                else:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\t%s %s_v = 0;\n" % (inner, op))
                     args.append("&%s_v" % op)
@@ -752,9 +778,20 @@ def emit_server(gen, need, rin, src_header):
                     o.append("\talpm_list_free_inner(r, free);\n")
                 o.append("\talpm_list_free(r);\n")
 
+        out_list_names = [x[0] for x in out_lists]
         for op in out_params_of(n):
+            if op in out_list_names:
+                continue
             o.append("\tarpc_out_i64(rs, " + qq(op) + ", (long long)%s_v);\n"
                      % op)
+        for op, e in out_lists:
+            o.append("\tput_list_%s(arpc_out_writer(rs, " % e["name"]
+                     + qq(op) + "), %s_v, %s);\n" % (op, owner))
+            o.append("\t/* libalpm filled this for us to own, so it goes once\n"
+                     "\t * it is on the wire. */\n")
+            if e["kind"] == "string":
+                o.append("\talpm_list_free_inner(%s_v, free);\n" % op)
+            o.append("\talpm_list_free(%s_v);\n" % op)
 
         for tn, te in temps:
             o.append("\tdrop_list_%s(%s);\n" % (te, tn))
@@ -981,7 +1018,14 @@ def emit_client(gen, need, rin, src_header):
 
         for op in out_params_of(n):
             for p in fn["params"]:
-                if p["name"] == op:
+                if p["name"] != op:
+                    continue
+                if p["kind"] == "ptr_list":
+                    e = param_elem(n, op)
+                    o.append("\tif (%s)\n\t\t*%s = build_list_%s("
+                             "arpc_doc(&c),\n\t\t\t\tarpc_out_node(&c, "
+                             % (op, op, e["name"]) + qq(op) + "));\n")
+                else:
                     inner = p["c_type"].rstrip(" *")
                     o.append("\tif (%s)\n\t\t*%s = (%s)arpc_out_i64(&c, "
                              % (op, op, inner) + qq(op) + ");\n")

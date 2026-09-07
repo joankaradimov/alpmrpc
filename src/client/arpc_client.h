@@ -74,6 +74,7 @@ void arpc_purge_owner(uint64_t owner);
 /* Raw response access, for generated materialisers. */
 const aj_doc *arpc_doc(const arpc_call *c);
 int           arpc_ret_node(const arpc_call *c);
+int           arpc_out_node(const arpc_call *c, const char *name);
 
 /* strdup that tolerates NULL, matching libalpm's use of NULL for absent. */
 char *arpc_dup(const char *s);

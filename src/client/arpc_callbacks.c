@@ -18,6 +18,7 @@
 #include "arpc_client.h"
 
 #include <alpm.h>
+#include <alpm_list.h>
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -130,7 +131,7 @@ GETTER(alpm_option_get_progresscb, progress, alpm_cb_progress)
 UNIMPLEMENTED_SETTER(alpm_option_set_eventcb, event, alpm_cb_event)
 GETTER(alpm_option_get_eventcb, event, alpm_cb_event)
 
-UNIMPLEMENTED_SETTER(alpm_option_set_questioncb, question, alpm_cb_question)
+SETTER(alpm_option_set_questioncb, question, alpm_cb_question, "question")
 GETTER(alpm_option_get_questioncb, question, alpm_cb_question)
 
 UNIMPLEMENTED_SETTER(alpm_option_set_dlcb, dl, alpm_cb_download)
@@ -140,6 +141,36 @@ UNIMPLEMENTED_SETTER(alpm_option_set_fetchcb, fetch, alpm_cb_fetch)
 GETTER(alpm_option_get_fetchcb, fetch, alpm_cb_fetch)
 
 /* ---- dispatch ---- */
+
+/* A pointer inside a question is an id, same as everywhere else, so the
+ * caller can hand it straight to alpm_pkg_get_*. */
+#define ID_TO_PKG(d, obj, key) 	((alpm_pkg_t *)(uintptr_t)aj_i64((d), aj_member((d), (obj), (key)), 0))
+
+static void fill_depend(alpm_depend_t *dep, const aj_doc *d, int n)
+{
+	if (n < 0 || aj_is_null(d, n))
+		return;
+	/* Cast away const: alpm_depend_t holds char*, and these point into the
+	 * parsed frame, which outlives the callback. */
+	dep->name = (char *)aj_str(d, aj_member(d, n, "name"), NULL);
+	dep->version = (char *)aj_str(d, aj_member(d, n, "version"), NULL);
+	dep->desc = (char *)aj_str(d, aj_member(d, n, "desc"), NULL);
+	dep->name_hash = (unsigned long)
+		aj_i64(d, aj_member(d, n, "name_hash"), 0);
+	dep->mod = (alpm_depmod_t)aj_i64(d, aj_member(d, n, "mod"), 0);
+}
+
+static alpm_list_t *id_list(const aj_doc *d, int arr)
+{
+	if (arr < 0 || aj_is_null(d, arr))
+		return NULL;
+	alpm_list_t *out = NULL;
+	int n = aj_count(d, arr);
+	for (int i = 0; i < n; i++)
+		alpm_list_append(&out, (void *)(uintptr_t)
+				 aj_i64(d, aj_elem(d, arr, i), 0));
+	return out;
+}
 
 /* alpm_cb_log wants a va_list, and there is no portable way to build one
  * except by being variadic. The server already did the formatting, so this
@@ -178,6 +209,79 @@ static void call_progress(reg *r, const aj_doc *d, int args)
 		    (size_t)aj_i64(d, aj_member(d, args, "current"), 0));
 }
 
+/* Rebuild the question, hand it to the caller, and read back what they set.
+ *
+ * Every variant begins {type; int <answer>; ...}, so the answer is readable
+ * through q.any.answer whichever one this is -- the same aliasing libalpm
+ * relies on. Pointers inside the question are ids cast to pointers, exactly
+ * as everywhere else, so the caller can pass them straight to alpm_pkg_get_*. */
+static long long call_question(reg *r, const aj_doc *d, int args)
+{
+	if (!r || !r->question)
+		return 0;
+
+	alpm_question_t q;
+	memset(&q, 0, sizeof(q));
+	q.type = (alpm_question_type_t)aj_i64(d, aj_member(d, args, "type"), 0);
+
+	alpm_depend_t dep;
+	alpm_conflict_t cfl;
+	alpm_list_t *pkgs = NULL;
+	memset(&dep, 0, sizeof(dep));
+	memset(&cfl, 0, sizeof(cfl));
+
+	switch (q.type) {
+	case ALPM_QUESTION_INSTALL_IGNOREPKG:
+		q.install_ignorepkg.pkg = ID_TO_PKG(d, args, "pkg");
+		break;
+	case ALPM_QUESTION_REPLACE_PKG:
+		q.replace.oldpkg = ID_TO_PKG(d, args, "oldpkg");
+		q.replace.newpkg = ID_TO_PKG(d, args, "newpkg");
+		q.replace.newdb = (alpm_db_t *)(uintptr_t)
+			aj_i64(d, aj_member(d, args, "newdb"), 0);
+		break;
+	case ALPM_QUESTION_CONFLICT_PKG: {
+		int cn = aj_member(d, args, "conflict");
+		cfl.package1 = ID_TO_PKG(d, cn, "package1");
+		cfl.package2 = ID_TO_PKG(d, cn, "package2");
+		fill_depend(&dep, d, aj_member(d, cn, "reason"));
+		cfl.reason = &dep;
+		q.conflict.conflict = &cfl;
+		break;
+	}
+	case ALPM_QUESTION_CORRUPTED_PKG:
+		q.corrupted.filepath =
+			aj_str(d, aj_member(d, args, "filepath"), "");
+		q.corrupted.reason = (alpm_errno_t)
+			aj_i64(d, aj_member(d, args, "reason"), 0);
+		break;
+	case ALPM_QUESTION_REMOVE_PKGS:
+		pkgs = id_list(d, aj_member(d, args, "packages"));
+		q.remove_pkgs.packages = pkgs;
+		break;
+	case ALPM_QUESTION_SELECT_PROVIDER:
+		pkgs = id_list(d, aj_member(d, args, "providers"));
+		q.select_provider.providers = pkgs;
+		fill_depend(&dep, d, aj_member(d, args, "depend"));
+		q.select_provider.depend = &dep;
+		break;
+	case ALPM_QUESTION_IMPORT_KEY:
+		q.import_key.uid = aj_str(d, aj_member(d, args, "uid"), "");
+		q.import_key.fingerprint =
+			aj_str(d, aj_member(d, args, "fingerprint"), "");
+		break;
+	default:
+		break;
+	}
+
+	r->question(r->question_ctx, &q);
+
+	/* The strings above point into the parsed frame and the structs are on
+	 * this stack, so only the lists were allocated. */
+	alpm_list_free(pkgs);
+	return q.any.answer;
+}
+
 void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 {
 	const char *which = aj_str(d, aj_member(d, 0, "cb"), "");
@@ -186,11 +290,14 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 	int args = aj_member(d, 0, "args");
 
 	reg *r = reg_for(handle, 0);
+	long long ret = 0;
 
 	if (!strcmp(which, "log"))
 		call_log(r, d, args);
 	else if (!strcmp(which, "progress"))
 		call_progress(r, d, args);
+	else if (!strcmp(which, "question"))
+		ret = call_question(r, d, args);
 	/* An unknown callback is answered rather than ignored: the server is
 	 * blocked waiting, and a silent drop would deadlock the transaction. */
 
@@ -198,6 +305,6 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 	ajw_key(reply, "cbseq");
 	ajw_i64(reply, seq);
 	ajw_key(reply, "ret");
-	ajw_i64(reply, 0);
+	ajw_i64(reply, ret);
 	ajw_obj_end(reply);
 }

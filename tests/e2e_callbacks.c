@@ -96,8 +96,16 @@ int main(void)
 	 * failing here, so these report failure rather than pretending. */
 	check(alpm_option_set_eventcb(h, NULL, NULL) == -1,
 	      "alpm_option_set_eventcb() reports failure", "not yet marshalled");
-	check(alpm_option_set_questioncb(h, NULL, NULL) == -1,
-	      "alpm_option_set_questioncb() reports failure", NULL);
+	check(alpm_option_set_dlcb(h, NULL, NULL) == -1,
+	      "alpm_option_set_dlcb() reports failure", NULL);
+
+	printf("\n-- questions install a real trampoline --\n");
+	/* This returned -1 before questioncb was carried. It succeeding is what
+	 * says the server registered a trampoline with libalpm. Whether a
+	 * question then *fires* needs libalpm to have something to ask, which a
+	 * read-only test cannot arrange -- see the note in the README. */
+	rc = alpm_option_set_questioncb(h, (alpm_cb_question)0, NULL);
+	check(rc == 0, "alpm_option_set_questioncb()", "trampoline installed");
 
 	printf("\n-- ordinary calls still work around callbacks --\n");
 	const char *root = alpm_option_get_root(h);

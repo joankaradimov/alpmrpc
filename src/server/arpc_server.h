@@ -66,6 +66,10 @@ void arpc_out_i64(arpc_res *rs, const char *name, long long v);
  * building it somewhere else and copying it in. */
 void  arpc_ret_begin(arpc_res *rs);
 aj_w *arpc_res_writer(arpc_res *rs);
+
+/* Open a named out-field and hand back the writer, for an out-param that is
+ * a list rather than a scalar. */
+aj_w *arpc_out_writer(arpc_res *rs, const char *name);
 int  arpc_fail(arpc_res *rs, int code, const char *msg);
 
 /* ---- handle table ----

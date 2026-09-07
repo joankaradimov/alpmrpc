@@ -850,6 +850,11 @@ int arpc_ret_node(const arpc_call *c)
 	return aj_member(&c->rsp, c->result, "ret");
 }
 
+int arpc_out_node(const arpc_call *c, const char *name)
+{
+	return aj_member(&c->rsp, c->result, name);
+}
+
 long long arpc_ret_i64(arpc_call *c)
 {
 	return aj_i64(&c->rsp, aj_member(&c->rsp, c->result, "ret"), 0);

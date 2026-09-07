@@ -273,6 +273,15 @@ aj_w *arpc_res_writer(arpc_res *rs)
 	return &rs->out;
 }
 
+aj_w *arpc_out_writer(arpc_res *rs, const char *name)
+{
+	ensure_obj(rs);
+	if (!rs->has_ret)
+		arpc_ret_null(rs);      /* keep "ret" first for readable traces */
+	ajw_key(&rs->out, name);
+	return &rs->out;
+}
+
 void arpc_out_i64(arpc_res *rs, const char *name, long long v)
 {
 	ensure_obj(rs);

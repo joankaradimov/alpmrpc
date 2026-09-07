@@ -116,7 +116,12 @@
     "alpm_option_set_ignoregroups.ignoregrps": "char *",
     "alpm_pkg_find.haystack": "alpm_pkg_t *",
     "alpm_sync_get_new_version.dbs_sync": "alpm_db_t *",
-    "alpm_fetch_pkgurl.urls": "char *"
+    "alpm_fetch_pkgurl.urls": "char *",
+    "alpm_trans_prepare.data": "alpm_depmissing_t *",
+    "alpm_trans_commit.data": "alpm_fileconflict_t *",
+    "alpm_db_search.ret": "alpm_pkg_t *",
+    "alpm_fetch_pkgurl.fetched": "char *",
+    "alpm_extract_keyid.keys": "char *"
   },
   "record_list_elem": {
     "_comment": "Element type of alpm_list_t* fields inside transparent structs.",
@@ -238,5 +243,17 @@
     ],
     "_alpm_filelist_t": "counted array (count + files), not a single struct",
     "_alpm_siglist_t": "counted array (count + results), not a single struct"
+  },
+  "out_list_own": {
+    "_comment": [
+      "An alpm_list_t** out-param is filled by libalpm and owned by the caller.",
+      "The server is that caller, so it frees its copy once serialised; the",
+      "client hands the caller a fresh list to free the documented way."
+    ],
+    "alpm_trans_prepare.data": "caller",
+    "alpm_trans_commit.data": "caller",
+    "alpm_db_search.ret": "caller",
+    "alpm_fetch_pkgurl.fetched": "caller",
+    "alpm_extract_keyid.keys": "caller"
   }
 }
