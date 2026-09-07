@@ -74,6 +74,28 @@ int main(void)
 	      "cached against the owning handle");
 	check(!strcmp(name, "local"), "earlier pointer still readable", name);
 
+	printf("\n-- bytes cross as bytes, not as text --\n");
+	/* "AP9BAAo=" decodes to 00 ff 41 00 0a: two NULs and a byte that is
+	 * not valid in any text encoding. A wire that treated this as a
+	 * string would come back one byte long, and a length that was
+	 * believed rather than derived would not notice. */
+	unsigned char *raw = NULL;
+	size_t raw_len = 0;
+	int drc = alpm_decode_signature("AP9BAAo=", &raw, &raw_len);
+	check(drc == 0, "alpm_decode_signature()", NULL);
+	{
+		static const unsigned char want[] = { 0x00, 0xff, 0x41, 0x00,
+						      0x0a };
+		char detail[64];
+		snprintf(detail, sizeof(detail), "%zu bytes", raw_len);
+		check(raw_len == sizeof(want), "the whole buffer came back",
+		      detail);
+		check(raw && raw_len == sizeof(want)
+		      && memcmp(raw, want, sizeof(want)) == 0,
+		      "every byte of it, NULs included", NULL);
+	}
+	free(raw);
+
 	printf("\n-- type safety across the wire --\n");
 	/* An alpm_handle_t id where a db id belongs. On the server this fails
 	 * a tag check instead of reaching libalpm as the wrong pointer. */

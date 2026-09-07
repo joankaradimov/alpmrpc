@@ -1,4 +1,5 @@
 #include "arpc_server.h"
+#include "arpc_b64.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -290,6 +291,33 @@ aj_w *arpc_out_writer(arpc_res *rs, const char *name)
 		arpc_ret_null(rs);      /* keep "ret" first for readable traces */
 	ajw_key(&rs->out, name);
 	return &rs->out;
+}
+
+/* A byte buffer arrives base64, because a JSON string stops at the first NUL
+ * and a signature is full of them. Malformed text marks the request bad
+ * rather than handing libalpm a buffer of the wrong length. */
+unsigned char *arpc_arg_bytes(arpc_req *rq, int i, size_t *n)
+{
+	*n = 0;
+	const char *s = arpc_arg_str(rq, i);
+	if (!s)
+		return NULL;
+	unsigned char *b = arpc_b64_decode(s, n);
+	if (!b)
+		rq->bad = 1;
+	return b;
+}
+
+void arpc_out_bytes(arpc_res *rs, const char *name, const unsigned char *b,
+		    size_t n)
+{
+	char *enc = b ? arpc_b64_encode(b, n) : NULL;
+	ensure_obj(rs);
+	if (!rs->has_ret)
+		arpc_ret_null(rs);
+	ajw_key(&rs->out, name);
+	ajw_str(&rs->out, enc);         /* NULL stays null, not "" */
+	free(enc);
 }
 
 void arpc_out_i64(arpc_res *rs, const char *name, long long v)

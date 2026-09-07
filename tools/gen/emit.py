@@ -182,6 +182,27 @@ def counted_array(rec):
     return ca
 
 
+def byte_buffer(fn, pname):
+    """n bytes and a length, rather than text.
+
+    `const unsigned char *` parses as a string and `unsigned char **` as a
+    string out-param, so nothing in the header separates a signature from a
+    name. What does is that the length travels in another parameter, and the
+    overlay names it. Returns that parameter's name, or None."""
+    ln = OVERLAY.get("byte_buffers", {}).get(fn["name"] + "." + pname)
+    if ln and not any(p["name"] == ln for p in fn["params"]):
+        raise SystemExit("overlay: %s has no length param %r for "
+                         "byte_buffers.%s" % (fn["name"], ln, pname))
+    return ln
+
+
+def byte_lengths(fn):
+    """The length parameters of this function's byte buffers, which carry no
+    wire field of their own: the decoded buffer is what says how long it is."""
+    return {byte_buffer(fn, p["name"]) for p in fn["params"]
+            if byte_buffer(fn, p["name"])}
+
+
 def variadic_fmt(fn):
     """A variadic function whose `...` the client can format away.
 
@@ -270,7 +291,14 @@ def select(model):
             if why:
                 break
             k = p["kind"]
-            if k in ("ptr_enum", "ptr_scalar", "ptr_handle"):
+            if k == "ptr_string":
+                # unsigned char ** is a byte buffer or it is nothing this
+                # generator can name: as text it would stop at the first NUL.
+                if not byte_buffer(fn, p["name"]):
+                    why = "not yet generated: ptr_string"
+                elif p["name"] not in outs:
+                    why = "pointer param with undeclared direction: " + p["name"]
+            elif k in ("ptr_enum", "ptr_scalar", "ptr_handle"):
                 if p["name"] not in outs:
                     why = "pointer param with undeclared direction: " + p["name"]
             elif k == "ptr_list":
@@ -739,15 +767,34 @@ def emit_server(gen, need, rin, src_header):
         spec = OVERLAY["functions"].get(n, {})
         o.append("static int h_%s(arpc_req *rq, arpc_res *rs)\n{\n" % n)
 
-        args, temps, struct_temps = [], [], []
+        args, temps, struct_temps, byte_temps = [], [], [], []
+        # length parameter -> the buffer it measures, so the call is handed
+        # the length that was actually decoded
+        blen_owner = {byte_buffer(fn, p["name"]): p["name"]
+                      for p in fn["params"] if byte_buffer(fn, p["name"])}
+        byte_checks = []
         for i, p in enumerate(fn["params"]):
             k, pn, ct = p["kind"], p["name"], p["c_type"]
+            bb = byte_buffer(fn, pn)
+            if bb and k == "string":
+                # An input buffer: base64 in, malloc'd bytes out, freed after
+                # the call. The decoded length is what libalpm is told, and
+                # the length that travelled alongside is checked against it
+                # rather than believed.
+                o.append("\tsize_t %s_n = 0;\n" % pn)
+                o.append("\tunsigned char *%s = arpc_arg_bytes(rq, %d, "
+                         "&%s_n);\n" % (pn, i, pn))
+                args.append("(%s)%s" % (ct, pn))
+                byte_temps.append(pn)
+                byte_checks.append((pn, bb))
+                continue
             if k == "string":
                 o.append("\tconst char *%s = arpc_arg_str(rq, %d);\n" % (pn, i))
                 args.append(pn)
             elif k in ("scalar", "enum"):
                 o.append("\tlong long %s = arpc_arg_i64(rq, %d);\n" % (pn, i))
-                args.append("(%s)%s" % (ct, pn))
+                args.append("%s_n" % blen_owner[pn] if pn in blen_owner
+                            else "(%s)%s" % (ct, pn))
             elif k == "handle":
                 o.append("\t%s %s = (%s)arpc_arg_handle(rq, %d, %s);\n"
                          % (ct, pn, ct, i, handle_tag(ct)))
@@ -767,11 +814,19 @@ def emit_server(gen, need, rin, src_header):
 
         out_lists = []
         out_handles = []
+        out_bytes = []
         for op in out_params_of(n):
             for p in fn["params"]:
                 if p["name"] != op:
                     continue
-                if p["kind"] == "ptr_list":
+                if p["kind"] == "ptr_string":
+                    # A byte buffer libalpm allocates for its caller, and the
+                    # server is that caller: it goes out base64 and is freed
+                    # here, because nothing on the client can free it.
+                    o.append("\tunsigned char *%s_v = NULL;\n" % op)
+                    args.append("&%s_v" % op)
+                    out_bytes.append((op, byte_buffer(fn, op)))
+                elif p["kind"] == "ptr_list":
                     o.append("\talpm_list_t *%s_v = NULL;\n" % op)
                     args.append("&%s_v" % op)
                     out_lists.append((op, param_elem(n, op)))
@@ -787,11 +842,19 @@ def emit_server(gen, need, rin, src_header):
                     o.append("\t%s %s_v = 0;\n" % (inner, op))
                     args.append("&%s_v" % op)
 
-        o.append("\tif (arpc_req_bad(rq)) {\n")
+        o.append("\tif (arpc_req_bad(rq)")
+        for bn, ln in byte_checks:
+            # The length that travelled and the length that decoded have to
+            # agree. They do by construction, so a disagreement means the
+            # frame is not what it claims and libalpm is not told about it.
+            o.append("\n\t    || (size_t)%s != %s_n" % (ln, bn))
+        o.append(") {\n")
         for tn, te in temps:
             o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
         for tn, te in struct_temps:
             o.append("\t\tdrop_%s(%s);\n" % (te, tn))
+        for tn in byte_temps:
+            o.append("\t\tfree(%s);\n" % tn)
         o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
                  + qq(n + ": bad arguments") + ");\n\t}\n")
 
@@ -857,8 +920,19 @@ def emit_server(gen, need, rin, src_header):
 
         out_list_names = [x[0] for x in out_lists]
         out_handle_tags = dict(out_handles)
+        out_byte_len = dict(out_bytes)
         for op in out_params_of(n):
             if op in out_list_names:
+                continue
+            if op in out_byte_len.values():
+                # The buffer's own length says how long it is; sending it
+                # twice would only create something to disagree with.
+                continue
+            if op in out_byte_len:
+                o.append("\tarpc_out_bytes(rs, " + qq(op)
+                         + ", %s_v, %s_v);\n" % (op, out_byte_len[op]))
+                o.append("\tfree(%s_v);\t/* libalpm says the caller frees "
+                         "it, and that is us */\n" % op)
                 continue
             if op in out_handle_tags:
                 # A handle handed back through a pointer is filed exactly
@@ -883,6 +957,8 @@ def emit_server(gen, need, rin, src_header):
             o.append("\tdrop_list_%s(%s);\n" % (te, tn))
         for tn, te in struct_temps:
             o.append("\tdrop_%s(%s);\n" % (te, tn))
+        for tn in byte_temps:
+            o.append("\tfree(%s);\n" % tn)
 
         if spec.get("destroys"):
             o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
@@ -1144,7 +1220,13 @@ def emit_client(gen, need, rin, src_header):
 
         for p in fn["params"]:
             k, pn = p["kind"], p["name"]
-            if k == "string":
+            blen = byte_buffer(fn, pn)
+            if blen and k == "string":
+                # Bytes, not text: base64, encoded and freed inside the
+                # runtime so there is nothing to clean up on a failure path.
+                o.append("\tarpc_put_bytes(&c, %s, (size_t)%s);\n"
+                         % (pn, blen))
+            elif k == "string":
                 o.append("\tarpc_put_str(&c, %s);\n"
                          % ("arpc_fmtbuf" if pn == vfmt else pn))
             elif k in ("scalar", "enum"):
@@ -1164,11 +1246,27 @@ def emit_client(gen, need, rin, src_header):
         o.append("\tif (!arpc_invoke(&c)) {\n\t\tarpc_end(&c);\n\t\t%s\n\t}\n"
                  % fail)
 
+        cli_byte_lens = {byte_buffer(fn, op) for op in out_params_of(n)
+                         if byte_buffer(fn, op)}
         for op in out_params_of(n):
+            if op in cli_byte_lens:
+                continue        # filled from the buffer it measures
             for p in fn["params"]:
                 if p["name"] != op:
                     continue
-                if p["kind"] == "ptr_list":
+                if p["kind"] == "ptr_string":
+                    blen = byte_buffer(fn, op)
+                    o.append("\tsize_t %s_n = 0;\n" % op)
+                    o.append("\tunsigned char *%s_v = arpc_out_bytes(&c, "
+                             % op + qq(op) + ", &%s_n);\n" % op)
+                    o.append("\t/* Caller-owned, as the header says: it is\n"
+                             "\t * theirs to free, or ours to drop if they\n"
+                             "\t * did not ask for it. */\n")
+                    o.append("\tif (%s)\n\t\t*%s = %s_v;\n\telse\n"
+                             "\t\tfree(%s_v);\n" % (op, op, op, op))
+                    o.append("\tif (%s)\n\t\t*%s = %s_n;\n"
+                             % (blen, blen, op))
+                elif p["kind"] == "ptr_list":
                     e = param_elem(n, op)
                     o.append("\tif (%s)\n\t\t*%s = build_list_%s("
                              "arpc_doc(&c),\n\t\t\t\tarpc_out_node(&c, "

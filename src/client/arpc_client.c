@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "arpc_client.h"
+#include "arpc_b64.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -770,6 +771,28 @@ void arpc_key(arpc_call *c, const char *key)      { ajw_key(&c->req, key); }
 void arpc_put_str(arpc_call *c, const char *s)    { ajw_str(&c->req, s); }
 void arpc_put_i64(arpc_call *c, long long v)      { ajw_i64(&c->req, v); }
 void arpc_put_handle(arpc_call *c, uint64_t id)   { ajw_i64(&c->req, (long long)id); }
+
+/* Bytes, not text: a signature has NULs in it and a JSON string does not
+ * survive them, so it travels base64. The encoding is done and freed here so
+ * a generated stub has no temporary to clean up on its failure paths. */
+void arpc_put_bytes(arpc_call *c, const unsigned char *b, size_t n)
+{
+	if (!b) {
+		ajw_null(&c->req);
+		return;
+	}
+	char *enc = arpc_b64_encode(b, n);
+	ajw_str(&c->req, enc);
+	free(enc);
+}
+
+unsigned char *arpc_out_bytes(arpc_call *c, const char *name, size_t *n)
+{
+	*n = 0;
+	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, name),
+			       NULL);
+	return s ? arpc_b64_decode(s, n) : NULL;
+}
 
 void arpc_put_str_list(arpc_call *c, const alpm_list_t *l)
 {

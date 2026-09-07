@@ -16,6 +16,7 @@ add_library(alpm SHARED
   arpc_local.c
   vendor/alpm_list.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c
   ${ALPMRPC_GEN_DIR}/arpc_stubs.c)
 
@@ -48,7 +49,8 @@ if(ALPMRPC_BUILD_TESTS)
 
   # Codec round-trip tests: no server, no pipe, just the encoder and reader.
   add_executable(test_json ${_tests}/test_json.c
-                           ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c)
   target_include_directories(test_json PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../common)
   add_test(NAME test_json COMMAND test_json)

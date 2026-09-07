@@ -100,6 +100,14 @@ void *arpc_cached_ptr(uint64_t owner, const char *key);
 void  arpc_cache_ptr(uint64_t owner, const char *key, void *ptr,
                      void (*release)(void *));
 
+/* Bytes rather than text -- a signature, a changelog chunk. A JSON string
+ * stops at the first NUL, so these travel base64; see arpc_b64.h. The encode
+ * and its free happen inside arpc_put_bytes so a generated stub has no
+ * temporary to clean up on its failure paths. arpc_out_bytes hands back a
+ * malloc'd buffer, or NULL if the field was null or malformed. */
+void arpc_put_bytes(arpc_call *c, const unsigned char *b, size_t n);
+unsigned char *arpc_out_bytes(arpc_call *c, const char *name, size_t *n);
+
 /* List parameters, serialised from the caller's own list. */
 void arpc_put_str_list(arpc_call *c, const alpm_list_t *l);
 void arpc_put_handle_list(arpc_call *c, const alpm_list_t *l);

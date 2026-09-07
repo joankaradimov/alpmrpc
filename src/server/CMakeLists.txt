@@ -11,6 +11,7 @@ add_executable(alpmrpcd
   arpc_server.c
   arpc_callbacks.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c
   ${ALPMRPC_GEN_DIR}/arpc_dispatch.c)
 

@@ -103,6 +103,13 @@ everything else, why it is not.
   It serves those and keeps waiting, which is the same loop the client runs
   in the other direction. The nesting is strict, so each side's reply is
   simply the next frame that is not a fresh request.
+- **Bytes are not text.** A signature has NULs in it, so a JSON string would
+  carry the first byte and stop. The three functions that deal in raw bytes
+  send them base64 (`src/common/arpc_b64.c`), and the length that comes back
+  is the decoded length rather than a number that travelled alongside — where
+  both exist, as on the input side, they are checked against each other and a
+  disagreement fails the call. Nothing else uses it: package names and paths
+  are text and go as text.
 - **`...` is formatted on whichever side has the arguments.** The wire cannot
   carry a `va_list` in either direction, so neither side tries. `logcb` fires
   on the server, so the server formats it and sends the text;
@@ -150,11 +157,11 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-162 of 193 functions are generated, plus 19 written by hand — the eighteen
+165 of 193 functions are generated, plus 19 written by hand — the eighteen
 callback setters, getters and ctx getters, and `alpm_filelist_contains`.
-`coverage.json` lists everything else with a reason for each; what is left is
-small and specific — the signature buffers, `alpm_siglist_t`'s embedded gpgme
-key, and the opaque cursors (changelog, mtree).
+`coverage.json` lists the remaining nine with a reason for each, and they are
+now three specific things rather than a list: `alpm_siglist_t`'s embedded
+gpgme key, the changelog cursor, and mtree.
 
 All six callbacks are carried — `logcb`, `progresscb`, `eventcb`,
 `questioncb`, `dlcb`, `fetchcb` — and every one of them has been seen to

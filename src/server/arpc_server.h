@@ -63,6 +63,14 @@ void arpc_ret_str(arpc_res *rs, const char *s);
 void arpc_ret_handle(arpc_res *rs, uint64_t id);
 void arpc_out_i64(arpc_res *rs, const char *name, long long v);
 
+/* Bytes, not text. A signature and a changelog chunk contain NULs, so they
+ * travel base64; see arpc_b64.h. arpc_arg_bytes hands back a malloc'd buffer
+ * the handler frees, and marks the request bad if the text was not
+ * well-formed. */
+unsigned char *arpc_arg_bytes(arpc_req *rq, int i, size_t *n);
+void arpc_out_bytes(arpc_res *rs, const char *name, const unsigned char *b,
+                    size_t n);
+
 /* Open the "ret" slot and hand back the writer, so generated code can emit a
  * composite value (an array, an object) straight into the response instead of
  * building it somewhere else and copying it in. */

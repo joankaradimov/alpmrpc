@@ -4,6 +4,7 @@
  * went in. Escaping is where a fast encoder goes wrong quietly, so most of
  * these are strings chosen to land on a boundary in the run-copying loop.
  */
+#include "arpc_b64.h"
 #include "arpc_json.h"
 
 #include <limits.h>
@@ -214,6 +215,56 @@ int main(void)
 	expect_reject("missing colon", "{\"a\" 1}");
 	expect_reject("trailing comma", "{\"a\":1,}");
 	expect_reject("empty input", "");
+
+	/* Signatures and changelog chunks are bytes, not text: they contain
+	 * NULs and sequences that are not valid in any encoding, so they
+	 * travel base64. The cases below are the lengths that exercise every
+	 * padding branch, plus the input a wrong decoder would accept. */
+	printf("\nbase64 round-trips bytes\n");
+	{
+		static const unsigned char bytes[] = {
+			0x00, 0xff, 0x80, 0x7f, 0x00, 0x00, 0x41, 0xfe, 0x01
+		};
+		for (size_t n = 0; n <= sizeof(bytes); n++) {
+			char *enc = arpc_b64_encode(bytes, n);
+			size_t back = 12345;
+			unsigned char *dec = enc ?
+				arpc_b64_decode(enc, &back) : NULL;
+			if (!enc || !dec || back != n
+			    || (n && memcmp(dec, bytes, n) != 0)) {
+				printf("FAIL  base64 round trip at %zu byte%s"
+				       " (got %zu)\n", n, n == 1 ? "" : "s",
+				       back);
+				fails++;
+			}
+			free(enc);
+			free(dec);
+		}
+		printf("ok    0..%zu bytes, every padding case\n",
+		       sizeof(bytes));
+	}
+
+	printf("base64 rejects what it should\n");
+	{
+		static const char *bad[] = {
+			"A",            /* not a multiple of four */
+			"AAAAA",
+			"A!AA",         /* not a base64 digit */
+			"AB=C",         /* padding that does not run to the end */
+			"A===",         /* one digit cannot make a byte */
+			"====",
+		};
+		for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+			size_t n = 999;
+			unsigned char *dec = arpc_b64_decode(bad[i], &n);
+			if (dec || n != 0) {
+				printf("FAIL  base64 accepted %s\n", bad[i]);
+				fails++;
+				free(dec);
+			}
+		}
+		printf("ok    six malformed inputs refused\n");
+	}
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "PASSED", fails,
 	       fails == 1 ? "" : "s");

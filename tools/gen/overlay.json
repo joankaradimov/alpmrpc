@@ -157,6 +157,17 @@
         "siglist"
       ]
     },
+    "alpm_pkg_get_sig": {
+      "out_params": [
+        "sig",
+        "sig_len"
+      ]
+    },
+    "alpm_extract_keyid": {
+      "out_params": [
+        "keys"
+      ]
+    },
     "alpm_db_check_pgp_signature": {
       "out_params": [
         "siglist"
@@ -247,6 +258,21 @@
     "alpm_dep_from_string": "caller",
     "alpm_db_get_group": "borrowed",
     "alpm_pkg_get_files": "borrowed"
+  },
+  "byte_buffers": {
+    "_comment": [
+      "Parameters that are n bytes and a length, not text. The header cannot",
+      "say so: `const unsigned char *` parses as a string, and sending one as",
+      "a string would stop at the first NUL, which a signature is full of.",
+      "`unsigned char **` parses as a string out-param and has the same",
+      "problem in reverse. What makes them tractable is that the length is",
+      "another parameter, and that is what is named here.",
+      "They travel base64, and the decoded length is the authority -- the",
+      "length that came alongside is checked against it, not trusted."
+    ],
+    "alpm_decode_signature.data": "data_len",
+    "alpm_pkg_get_sig.sig": "sig_len",
+    "alpm_extract_keyid.sig": "len"
   },
   "variadic_format": {
     "_comment": [
