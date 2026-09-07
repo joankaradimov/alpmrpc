@@ -66,6 +66,15 @@ typedef struct {
 void ajw_init(aj_w *w);
 void ajw_free(aj_w *w);
 
+/* Pre-size the buffer when the caller already knows roughly how much is
+ * coming, so a large document does not walk up through every power of two.
+ * Returns 0 on allocation failure (w->err is then set). */
+int  ajw_reserve(aj_w *w, size_t bytes);
+
+/* Append already-formatted JSON verbatim: no escaping, no separator logic.
+ * For splicing one writer's output into another. */
+void ajw_raw(aj_w *w, const char *s, size_t n);
+
 void ajw_obj_begin(aj_w *w);
 void ajw_obj_end(aj_w *w);
 void ajw_arr_begin(aj_w *w);

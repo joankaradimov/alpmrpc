@@ -310,21 +310,13 @@ char *arpc_handle_frame(const char *req, size_t len)
 		ajw_init(&w);
 		ajw_obj_begin(&w);
 		ajw_key(&w, "id");     ajw_i64(&w, id);
+		/* Splice the handler's object in verbatim. It is already valid
+		 * JSON, so it needs no re-encoding -- and for a large result
+		 * this is the difference between one memcpy and a bounds check
+		 * per byte. */
+		ajw_reserve(&w, rs.out.len + 2);
 		ajw_key(&w, "result");
-		/* splice the handler's object in verbatim */
-		w.need_comma = 0;
-		for (size_t i = 0; i < rs.out.len; i++) {
-			char c = rs.out.buf[i];
-			aj_w *tw = &w;
-			if (tw->len + 2 > tw->cap) {
-				size_t cap = tw->cap ? tw->cap * 2 : 256;
-				char *b = (char *)realloc(tw->buf, cap);
-				if (!b) { tw->err = 1; break; }
-				tw->buf = b; tw->cap = cap;
-			}
-			w.buf[w.len++] = c;
-			w.buf[w.len] = '\0';
-		}
+		ajw_raw(&w, rs.out.buf, rs.out.len);
 		w.need_comma = 1;
 		ajw_obj_end(&w);
 		out = finish(&w);

@@ -40,8 +40,24 @@ install(FILES ${ALPMRPC_GEN_DIR}/include/alpm.h
         DESTINATION include)
 
 if(ALPMRPC_BUILD_TESTS)
-  add_executable(e2e_spike ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/e2e_spike.c)
-  target_link_libraries(e2e_spike PRIVATE alpm)
   enable_testing()
+  set(_tests ${CMAKE_CURRENT_SOURCE_DIR}/../../tests)
+
+  # Codec round-trip tests: no server, no pipe, just the encoder and reader.
+  add_executable(test_json ${_tests}/test_json.c
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
+  target_include_directories(test_json PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+  add_test(NAME test_json COMMAND test_json)
+
+  # Needs a reachable server; it launches one on demand.
+  add_executable(e2e_spike ${_tests}/e2e_spike.c)
+  target_link_libraries(e2e_spike PRIVATE alpm)
   add_test(NAME e2e_spike COMMAND e2e_spike)
+
+  add_executable(bench_codec ${_tests}/bench_codec.c
+                             ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
+  target_include_directories(bench_codec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+  target_link_libraries(bench_codec PRIVATE alpm)
 endif()

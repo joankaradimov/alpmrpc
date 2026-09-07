@@ -56,6 +56,13 @@ everything else, why it is not.
 - `ALPMRPC_TRACE=1` dumps every frame. `alpmrpcd --stdio` runs the dispatch
   layer against stdin/stdout with no IPC at all.
 
+## Tests
+
+`ctest` from the client build directory runs codec round-trip tests and the
+end-to-end test (which launches a server on demand). `bench_codec` reports
+round-trip cost, the codec's share of it, and throughput on a bulk payload --
+run it before and after anything that touches the wire.
+
 ## Status
 
 A spike. 13 of 193 functions are on the wire — enough to exercise every

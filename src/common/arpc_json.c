@@ -1,5 +1,6 @@
 #include "arpc_json.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -267,16 +268,37 @@ static int parse_value(aj_p *p)
 		if (c == '-') { neg = 1; p->p++; }
 		if (p->p >= p->end || *p->p < '0' || *p->p > '9')
 			return -1;
-		long long v = 0;
+		/* Accumulated unsigned: the magnitude of LLONG_MIN does not fit
+		 * in a long long, so signed accumulation overflows on exactly
+		 * the value we are trying to read back. */
+		unsigned long long u = 0;
 		while (p->p < p->end && *p->p >= '0' && *p->p <= '9') {
-			v = v * 10 + (*p->p - '0');
+			unsigned d = (unsigned)(*p->p - '0');
+			if (u > (18446744073709551615ULL - d) / 10)
+				return -1;              /* out of range */
+			u = u * 10 + d;
 			p->p++;
 		}
 		/* The protocol carries no reals; reject rather than truncate. */
 		if (p->p < p->end && (*p->p == '.' || *p->p == 'e' || *p->p == 'E'))
 			return -1;
+
+		long long v;
+		if (neg) {
+			if (u > (unsigned long long)LLONG_MAX + 1ULL)
+				return -1;
+			v = (u == (unsigned long long)LLONG_MAX + 1ULL)
+				    ? LLONG_MIN
+				    : -(long long)u;
+		} else {
+			/* Handle ids are uint64; anything above LLONG_MAX would
+			 * not survive the round trip, so refuse it here. */
+			if (u > (unsigned long long)LLONG_MAX)
+				return -1;
+			v = (long long)u;
+		}
 		int n = node_new(p->d, AJ_NUM);
-		if (n >= 0) p->d->nodes[n].num = neg ? -v : v;
+		if (n >= 0) p->d->nodes[n].num = v;
 		return n;
 	}
 	return -1;
@@ -373,74 +395,160 @@ int aj_is_null(const aj_doc *d, int node)
 
 /* ---------------------------------------------------------------- writer */
 
-static void wput(aj_w *w, const char *s, size_t n)
+/* Ensure room for `need` more bytes plus the terminating NUL. */
+static int wgrow(aj_w *w, size_t need)
 {
 	if (w->err)
-		return;
-	if (w->len + n + 1 > w->cap) {
-		size_t cap = w->cap ? w->cap : 256;
-		while (cap < w->len + n + 1)
-			cap *= 2;
-		char *b = (char *)realloc(w->buf, cap);
-		if (!b) {
+		return 0;
+	if (w->len + need + 1 <= w->cap)
+		return 1;
+	size_t cap = w->cap ? w->cap : 256;
+	while (cap < w->len + need + 1) {
+		size_t next = cap * 2;
+		if (next < cap) {               /* overflow */
 			w->err = 1;
-			return;
+			return 0;
 		}
-		w->buf = b;
-		w->cap = cap;
+		cap = next;
 	}
+	char *b = (char *)realloc(w->buf, cap);
+	if (!b) {
+		w->err = 1;
+		return 0;
+	}
+	w->buf = b;
+	w->cap = cap;
+	return 1;
+}
+
+int ajw_reserve(aj_w *w, size_t bytes)
+{
+	return wgrow(w, bytes);
+}
+
+/* These write without checking; every caller reserves first. Keeping the
+ * bounds check out of the inner loop is the whole point of the split. */
+static inline void wraw_(aj_w *w, const char *s, size_t n)
+{
 	memcpy(w->buf + w->len, s, n);
 	w->len += n;
 	w->buf[w->len] = '\0';
 }
 
+static inline void wputc_(aj_w *w, char c)
+{
+	w->buf[w->len++] = c;
+	w->buf[w->len] = '\0';
+}
+
+static void wput(aj_w *w, const char *s, size_t n)
+{
+	if (wgrow(w, n))
+		wraw_(w, s, n);
+}
+
+void ajw_raw(aj_w *w, const char *s, size_t n)
+{
+	if (wgrow(w, n))
+		wraw_(w, s, n);
+}
+
 static void wsep(aj_w *w)
 {
-	if (w->need_comma)
-		wput(w, ",", 1);
+	if (w->need_comma) {
+		if (!wgrow(w, 1))
+			return;
+		wputc_(w, ',');
+	}
 	w->need_comma = 1;
 }
 
 void ajw_init(aj_w *w) { memset(w, 0, sizeof(*w)); }
 void ajw_free(aj_w *w) { free(w->buf); memset(w, 0, sizeof(*w)); }
 
-void ajw_obj_begin(aj_w *w) { wsep(w); wput(w, "{", 1); w->need_comma = 0; }
-void ajw_obj_end(aj_w *w)   { wput(w, "}", 1); w->need_comma = 1; }
-void ajw_arr_begin(aj_w *w) { wsep(w); wput(w, "[", 1); w->need_comma = 0; }
-void ajw_arr_end(aj_w *w)   { wput(w, "]", 1); w->need_comma = 1; }
+static void wopen(aj_w *w, char c)
+{
+	wsep(w);
+	if (!wgrow(w, 1))
+		return;
+	wputc_(w, c);
+	w->need_comma = 0;
+}
 
+static void wclose(aj_w *w, char c)
+{
+	if (!wgrow(w, 1))
+		return;
+	wputc_(w, c);
+	w->need_comma = 1;
+}
+
+void ajw_obj_begin(aj_w *w) { wopen(w, '{'); }
+void ajw_obj_end(aj_w *w)   { wclose(w, '}'); }
+void ajw_arr_begin(aj_w *w) { wopen(w, '['); }
+void ajw_arr_end(aj_w *w)   { wclose(w, ']'); }
+
+static const char HEXDIG[] = "0123456789abcdef";
+
+/* Copies runs that need no escaping with memcpy instead of one byte at a
+ * time. Almost everything this protocol carries -- package names, versions,
+ * paths, descriptions -- contains no escapable byte at all, so the common
+ * case collapses to a single memcpy. Bytes >= 0x80 are passed through: JSON
+ * strings are UTF-8, and escaping them would be both slower and wrong. */
 static void wstr_escaped(aj_w *w, const char *s)
 {
-	wput(w, "\"", 1);
-	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-		switch (*p) {
-		case '"':  wput(w, "\\\"", 2); break;
-		case '\\': wput(w, "\\\\", 2); break;
-		case '\b': wput(w, "\\b", 2);  break;
-		case '\f': wput(w, "\\f", 2);  break;
-		case '\n': wput(w, "\\n", 2);  break;
-		case '\r': wput(w, "\\r", 2);  break;
-		case '\t': wput(w, "\\t", 2);  break;
-		default:
-			if (*p < 0x20) {
-				char buf[7];
-				static const char hex[] = "0123456789abcdef";
-				buf[0] = '\\'; buf[1] = 'u'; buf[2] = '0'; buf[3] = '0';
-				buf[4] = hex[*p >> 4]; buf[5] = hex[*p & 0xF]; buf[6] = 0;
-				wput(w, buf, 6);
-			} else {
-				wput(w, (const char *)p, 1);
-			}
+	size_t n = strlen(s);
+	if (!wgrow(w, n + 2))                   /* exact size when nothing escapes */
+		return;
+	wputc_(w, '"');
+
+	const unsigned char *p = (const unsigned char *)s;
+	const unsigned char *run = p;
+	for (;;) {
+		unsigned char c = *p;
+		if (c >= 0x20 && c != '"' && c != '\\') {
+			p++;
+			continue;
 		}
+		size_t rl = (size_t)(p - run);
+		if (rl) {
+			if (!wgrow(w, rl))
+				return;
+			wraw_(w, (const char *)run, rl);
+		}
+		if (c == '\0')
+			break;
+		if (!wgrow(w, 6))
+			return;
+		switch (c) {
+		case '"':  wraw_(w, "\\\"", 2); break;
+		case '\\': wraw_(w, "\\\\", 2); break;
+		case '\b': wraw_(w, "\\b", 2);  break;
+		case '\f': wraw_(w, "\\f", 2);  break;
+		case '\n': wraw_(w, "\\n", 2);  break;
+		case '\r': wraw_(w, "\\r", 2);  break;
+		case '\t': wraw_(w, "\\t", 2);  break;
+		default: {
+			const char esc[6] = { '\\', 'u', '0', '0',
+					      HEXDIG[c >> 4], HEXDIG[c & 0xF] };
+			wraw_(w, esc, 6);
+			break;
+		}
+		}
+		p++;
+		run = p;
 	}
-	wput(w, "\"", 1);
+	if (wgrow(w, 1))
+		wputc_(w, '"');
 }
 
 void ajw_key(aj_w *w, const char *key)
 {
 	wsep(w);
 	wstr_escaped(w, key);
-	wput(w, ":", 1);
+	if (!wgrow(w, 1))
+		return;
+	wputc_(w, ':');
 	w->need_comma = 0;
 }
 
@@ -456,19 +564,27 @@ void ajw_str(aj_w *w, const char *s)
 
 void ajw_i64(aj_w *w, long long v)
 {
-	char buf[24];
-	int n = 0, neg = v < 0;
-	unsigned long long u = neg ? (unsigned long long)(-(v + 1)) + 1
-				   : (unsigned long long)v;
-	char tmp[24];
-	do { tmp[n++] = (char)('0' + (u % 10)); u /= 10; } while (u);
-	int k = 0;
-	if (neg)
-		buf[k++] = '-';
-	while (n)
-		buf[k++] = tmp[--n];
 	wsep(w);
-	wput(w, buf, (size_t)k);
+	if (!wgrow(w, 24))
+		return;
+	/* Digits go straight into the output buffer. The previous version
+	 * staged them through two intermediate copies. */
+	char tmp[24];
+	int n = 0;
+	unsigned long long u = v < 0 ? (unsigned long long)(-(v + 1)) + 1
+				     : (unsigned long long)v;
+	do {
+		tmp[n++] = (char)('0' + (u % 10));
+		u /= 10;
+	} while (u);
+
+	char *out = w->buf + w->len;
+	if (v < 0)
+		*out++ = '-';
+	while (n)
+		*out++ = tmp[--n];
+	w->len = (size_t)(out - w->buf);
+	w->buf[w->len] = '\0';
 }
 
 void ajw_null(aj_w *w)
