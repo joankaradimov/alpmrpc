@@ -116,8 +116,10 @@ void arpc_handle_drop(uint64_t id)
 
 void arpc_handle_drop_owner(uint64_t owner)
 {
-	if (owner)
+	if (owner) {
 		rebuild_without(drop_owned, &owner);
+		arpc_cb_purge(owner);
+	}
 }
 
 void arpc_handle_reset(void)
@@ -355,8 +357,22 @@ char *arpc_handle_frame(const char *req, size_t len)
 		return finish(&w);
 	}
 
+	/* Infrastructure methods are not libalpm calls, so they are not in the
+	 * generated table. They still go through the same req/res path. */
+	static const arpc_method builtins[] = {
+		{ "arpc.set_callback", arpc_cb_set },
+		{ NULL, NULL }
+	};
+
 	const arpc_method *m = NULL;
-	for (const arpc_method *k = arpc_methods; k->name; k++) {
+	for (const arpc_method *k = builtins; k->name; k++) {
+		if (!strcmp(k->name, method)) {
+			m = k;
+			break;
+		}
+	}
+	for (const arpc_method *k = m ? (const arpc_method *)NULL
+				      : arpc_methods; k && k->name; k++) {
 		if (!strcmp(k->name, method)) {
 			m = k;
 			break;

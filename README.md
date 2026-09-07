@@ -77,6 +77,15 @@ everything else, why it is not.
 - **`alpm_dep_free` and friends never reach the server.** They free a struct
   this client materialised; the server has libalpm's own copy, which is not
   ours to free. The generated stub calls the matching free helper locally.
+- **Callbacks run nested inside the call that triggered them.** libalpm
+  calls back from the middle of an operation, and a question has to be
+  answered before the transaction that asked it can continue. So the server
+  installs its own trampoline with libalpm, sends the arguments up the same
+  pipe, and blocks; the client's frame loop delivers it to the caller's
+  function pointer and replies before its own call returns. That ordering is
+  not an optimisation -- it is the only shape a synchronous callback can
+  take -- and it keeps the server single-threaded, which is what keeps
+  libalpm's `fork()` on the path Cygwin supports.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. Caller-owned lists are

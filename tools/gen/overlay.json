@@ -184,19 +184,19 @@
     }
   },
   "skip": {
-    "_comment": "Not generatable. Callbacks need hand-written bidirectional plumbing.",
-    "alpm_option_set_logcb": "callback",
-    "alpm_option_set_dlcb": "callback",
-    "alpm_option_set_fetchcb": "callback",
-    "alpm_option_set_eventcb": "callback",
-    "alpm_option_set_questioncb": "callback",
-    "alpm_option_set_progresscb": "callback",
-    "alpm_option_get_logcb": "callback",
-    "alpm_option_get_dlcb": "callback",
-    "alpm_option_get_fetchcb": "callback",
-    "alpm_option_get_eventcb": "callback",
-    "alpm_option_get_questioncb": "callback",
-    "alpm_option_get_progresscb": "callback"
+    "_comment": "Implemented by hand in arpc_callbacks.c on both sides. Each callback has its own payload shape, so this is six specific things rather than a family the emitter could generate.",
+    "alpm_option_set_logcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_set_dlcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_set_fetchcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_set_eventcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_set_questioncb": "hand-written in arpc_callbacks.c",
+    "alpm_option_set_progresscb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_logcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_dlcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_fetchcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_eventcb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_questioncb": "hand-written in arpc_callbacks.c",
+    "alpm_option_get_progresscb": "hand-written in arpc_callbacks.c"
   },
   "spike": {
     "_comment": [

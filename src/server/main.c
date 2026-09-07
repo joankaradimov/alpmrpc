@@ -198,25 +198,83 @@ static int stop_running_server(const char *name, int timeout_ms)
 	return 0;
 }
 
+/* The live connection, as the callback layer sees it. */
+struct arpc_conn {
+	HANDLE pipe;
+};
+
+static int send_framed(HANDLE pipe, const char *buf, size_t len)
+{
+	unsigned char hdr[4];
+	hdr[0] = (unsigned char)(len & 0xFF);
+	hdr[1] = (unsigned char)((len >> 8) & 0xFF);
+	hdr[2] = (unsigned char)((len >> 16) & 0xFF);
+	hdr[3] = (unsigned char)((len >> 24) & 0xFF);
+	return write_exact(pipe, hdr, 4) &&
+	       write_exact(pipe, (void *)buf, (DWORD)len);
+}
+
+static char *recv_framed(HANDLE pipe)
+{
+	unsigned char hdr[4];
+	if (!read_exact(pipe, hdr, 4))
+		return NULL;
+	unsigned len = (unsigned)hdr[0] | ((unsigned)hdr[1] << 8) |
+		       ((unsigned)hdr[2] << 16) | ((unsigned)hdr[3] << 24);
+	if (len == 0 || len > ARPC_MAX_FRAME)
+		return NULL;
+	char *buf = (char *)malloc(len + 1);
+	if (!buf)
+		return NULL;
+	if (!read_exact(pipe, buf, len)) {
+		free(buf);
+		return NULL;
+	}
+	buf[len] = '\0';
+	return buf;
+}
+
+/* Called from inside a libalpm callback, part-way through serving a request.
+ * The client is in its own frame loop and answers this before its original
+ * call can return, so a plain send-then-read is the correct shape. */
+int arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
+		       char **reply_out)
+{
+	*reply_out = NULL;
+	if (!c || c->pipe == INVALID_HANDLE_VALUE)
+		return 0;
+	logf_("cb-> %s", frame);
+	if (!send_framed(c->pipe, frame, len))
+		return 0;
+	char *reply = recv_framed(c->pipe);
+	if (!reply)
+		return 0;
+	logf_("cb<- %s", reply);
+	*reply_out = reply;
+	return 1;
+}
+
 static void serve_connection(HANDLE pipe)
 {
+	arpc_conn conn = { pipe };
+	arpc_cb_set_conn(&conn);
 	for (;;) {
 		unsigned char lenbuf[4];
 		if (!read_exact(pipe, lenbuf, 4))
-			return;
+			break;
 		unsigned len = (unsigned)lenbuf[0] | ((unsigned)lenbuf[1] << 8) |
 			       ((unsigned)lenbuf[2] << 16) | ((unsigned)lenbuf[3] << 24);
 		if (len == 0 || len > ARPC_MAX_FRAME) {
 			logf_("refusing frame of %u bytes", len);
-			return;
+			break;
 		}
 
 		char *req = (char *)malloc(len + 1);
 		if (!req)
-			return;
+			break;
 		if (!read_exact(pipe, req, len)) {
 			free(req);
-			return;
+			break;
 		}
 		req[len] = '\0';
 		logf_("--> %s", req);
@@ -224,7 +282,7 @@ static void serve_connection(HANDLE pipe)
 		char *rsp = arpc_handle_frame(req, len);
 		free(req);
 		if (!rsp)
-			return;
+			break;
 		logf_("<-- %s", rsp);
 
 		size_t rlen = strlen(rsp);
@@ -237,8 +295,9 @@ static void serve_connection(HANDLE pipe)
 			 write_exact(pipe, rsp, (DWORD)rlen);
 		free(rsp);
 		if (!ok)
-			return;
+			break;
 	}
+	arpc_cb_set_conn(NULL);
 }
 
 /* Reads framed requests from stdin and writes framed responses to stdout,

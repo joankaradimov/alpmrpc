@@ -12,6 +12,7 @@ set(ALPM_SOVERSION 14)
 
 add_library(alpm SHARED
   arpc_client.c
+  arpc_callbacks.c
   vendor/alpm_list.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c
@@ -59,6 +60,10 @@ if(ALPMRPC_BUILD_TESTS)
   add_executable(e2e_lists ${_tests}/e2e_lists.c)
   target_link_libraries(e2e_lists PRIVATE alpm)
   add_test(NAME e2e_lists COMMAND e2e_lists)
+
+  add_executable(e2e_callbacks ${_tests}/e2e_callbacks.c)
+  target_link_libraries(e2e_callbacks PRIVATE alpm)
+  add_test(NAME e2e_callbacks COMMAND e2e_callbacks)
 
   add_executable(bench_pkg_fields ${_tests}/bench_pkg_fields.c)
   target_link_libraries(bench_pkg_fields PRIVATE alpm)

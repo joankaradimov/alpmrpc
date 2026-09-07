@@ -95,6 +95,21 @@ typedef struct {
 
 extern const arpc_method arpc_methods[];
 
+/* ---- callbacks ----
+ *
+ * A trampoline runs inside a libalpm call and has to reach the client that
+ * is waiting on it, so it needs the live connection. main.c owns the pipe
+ * and provides the exchange; the callback layer only needs these. */
+typedef struct arpc_conn arpc_conn;
+
+/* Send one frame and read the reply to it. Returns 0 if the connection is
+ * gone -- a dead pipe must not wedge libalpm mid-transaction. */
+int  arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
+                        char **reply_out);
+void arpc_cb_set_conn(arpc_conn *c);
+void arpc_cb_purge(uint64_t handle);
+int  arpc_cb_set(arpc_req *rq, arpc_res *rs);
+
 /* Set once a client has asked the server to exit. The accept loop checks it
  * after each connection closes, so an in-flight call always completes. */
 int arpc_shutdown_requested(void);

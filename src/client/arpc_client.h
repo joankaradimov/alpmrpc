@@ -117,6 +117,14 @@ void arpc_pkg_group_register(const alpm_list_t *pkgs);
 const char *arpc_pkg_field_str(uint64_t id, const char *field);
 long long   arpc_pkg_field_i64(uint64_t id, const char *field);
 
+/* ---- callbacks ----
+ *
+ * A callback fires on the server, inside a call this client is waiting on,
+ * and is answered before that call can continue. arpc_invoke's frame loop
+ * hands each one here. */
+void arpc_dispatch_callback(const aj_doc *d, aj_w *reply);
+void arpc_callbacks_purge(uint64_t handle);
+
 /* Diagnostics. ALPMRPC_TRACE=1 dumps every frame to stderr. */
 const char *arpc_last_error(void);
 

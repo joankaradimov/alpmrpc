@@ -354,6 +354,7 @@ void arpc_purge_owner(uint64_t owner)
 	}
 	/* Column caches hold package ids that die with the handle too. */
 	free_all_groups();
+	arpc_callbacks_purge(owner);
 	LeaveCriticalSection(&g_lock);
 }
 
@@ -639,20 +640,25 @@ static int io_exact(HANDLE h, void *buf, DWORD n, int writing)
 	return 1;
 }
 
-static char *transact(const char *req, size_t len)
+static int send_frame(const char *buf, size_t len)
 {
 	unsigned char hdr[4];
 	hdr[0] = (unsigned char)(len & 0xFF);
 	hdr[1] = (unsigned char)((len >> 8) & 0xFF);
 	hdr[2] = (unsigned char)((len >> 16) & 0xFF);
 	hdr[3] = (unsigned char)((len >> 24) & 0xFF);
-
 	if (!io_exact(g_pipe, hdr, 4, 1) ||
-	    !io_exact(g_pipe, (void *)req, (DWORD)len, 1)) {
+	    !io_exact(g_pipe, (void *)buf, (DWORD)len, 1)) {
 		set_err("write failed (%u)", (unsigned)GetLastError());
 		disconnect();
-		return NULL;
+		return 0;
 	}
+	return 1;
+}
+
+static char *recv_frame(void)
+{
+	unsigned char hdr[4];
 	if (!io_exact(g_pipe, hdr, 4, 0)) {
 		set_err("read failed (%u)", (unsigned)GetLastError());
 		disconnect();
@@ -676,6 +682,54 @@ static char *transact(const char *req, size_t len)
 	}
 	buf[rlen] = '\0';
 	return buf;
+}
+
+/* Send a request and read frames until the reply to it arrives.
+ *
+ * What arrives in between are callbacks. libalpm calls back from inside the
+ * call we are waiting on -- a question during a commit, progress during an
+ * install -- so the server sends those up the same pipe and blocks until we
+ * answer. This loop is what makes that work: it is not an optimisation, it
+ * is the only shape in which a synchronous callback can be served. */
+static char *transact(const char *req, size_t len)
+{
+	if (!send_frame(req, len))
+		return NULL;
+
+	for (;;) {
+		char *f = recv_frame();
+		if (!f)
+			return NULL;
+
+		aj_doc d;
+		if (!aj_parse(&d, f, strlen(f))) {
+			aj_free(&d);
+			free(f);
+			set_err("malformed frame from server");
+			disconnect();
+			return NULL;
+		}
+		int is_cb = aj_member(&d, 0, "cb") >= 0;
+		if (!is_cb) {
+			aj_free(&d);
+			return f;               /* the reply we were waiting for */
+		}
+
+		if (tracing())
+			fprintf(stderr, "alpmrpc <cb %s\n", f);
+
+		aj_w reply;
+		ajw_init(&reply);
+		arpc_dispatch_callback(&d, &reply);
+		aj_free(&d);
+		free(f);
+
+		if (reply.err || !send_frame(reply.buf, reply.len)) {
+			ajw_free(&reply);
+			return NULL;
+		}
+		ajw_free(&reply);
+	}
 }
 
 /* ------------------------------------------------------------- call cycle */
