@@ -1,0 +1,83 @@
+{
+  "_comment": [
+    "Hand-maintained annotations that a C header cannot express.",
+    "Everything inferable from alpm.h itself (string ownership via const-ness,",
+    "handle-ness via incomplete struct types) is NOT recorded here -- emit.py",
+    "derives it. This file is only for what clang genuinely cannot see.",
+    "Keep it small; if an entry could be a rule, make it a rule."
+  ],
+
+  "rules": {
+    "_comment": "Applied in order; first match wins. Overridden by 'functions'.",
+    "list_ownership": [
+      { "match": "^alpm_pkg_compute_", "own": "caller" },
+      { "match": "^alpm_checkdeps$",   "own": "caller" },
+      { "match": "^alpm_checkconflicts$", "own": "caller" },
+      { "match": "^alpm_find_group_pkgs$", "own": "caller" },
+      { "match": ".*", "own": "borrowed" }
+    ]
+  },
+
+  "functions": {
+    "alpm_initialize": {
+      "out_params": ["err"],
+      "creates": "handle",
+      "doc": "err is an out-param, not an input."
+    },
+    "alpm_release": {
+      "destroys": "handle",
+      "doc": "Invalidates every handle owned by this alpm_handle_t."
+    },
+    "alpm_db_search":            { "out_params": ["ret"], "list_own": { "ret": "caller" } },
+    "alpm_db_get_usage":         { "out_params": ["usage"] },
+    "alpm_pkg_check_pgp_signature": { "out_params": ["siglist"] },
+    "alpm_db_check_pgp_signature":  { "out_params": ["siglist"] },
+    "alpm_decode_signature":     { "out_params": ["data", "data_len"] },
+    "alpm_pkg_load":             { "out_params": ["pkg"], "creates": "pkg" },
+    "alpm_trans_prepare":        { "out_params": ["data"] },
+    "alpm_trans_commit":         { "out_params": ["data"] },
+    "alpm_pkg_free":             { "destroys": "pkg" },
+    "alpm_dep_free":             { "destroys": "dep" }
+  },
+
+  "skip": {
+    "_comment": "Not generatable. Callbacks need hand-written bidirectional plumbing.",
+    "alpm_option_set_logcb":       "callback",
+    "alpm_option_set_dlcb":        "callback",
+    "alpm_option_set_fetchcb":     "callback",
+    "alpm_option_set_eventcb":     "callback",
+    "alpm_option_set_questioncb":  "callback",
+    "alpm_option_set_progresscb":  "callback",
+    "alpm_option_get_logcb":       "callback",
+    "alpm_option_get_dlcb":        "callback",
+    "alpm_option_get_fetchcb":     "callback",
+    "alpm_option_get_eventcb":     "callback",
+    "alpm_option_get_questioncb":  "callback",
+    "alpm_option_get_progresscb":  "callback"
+  },
+
+  "spike": {
+    "_comment": [
+      "Spike allowlist. While non-empty, emit.py generates ONLY these.",
+      "Chosen to exercise every mechanism in the pipeline exactly once:",
+      "  no-arg / scalar / string-in / borrowed-string-out / owned-string-out /",
+      "  handle-create / handle-lookup / handle-destroy / enum out-param.",
+      "Empty this list to generate the full surface."
+    ],
+    "include": [
+      "alpm_version",
+      "alpm_capabilities",
+      "alpm_pkg_vercmp",
+      "alpm_compute_md5sum",
+      "alpm_compute_sha256sum",
+      "alpm_initialize",
+      "alpm_release",
+      "alpm_get_localdb",
+      "alpm_db_get_name",
+      "alpm_option_get_root",
+      "alpm_option_get_dbpath",
+      "alpm_errno",
+      "alpm_strerror"
+    ]
+  }
+}

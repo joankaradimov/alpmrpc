@@ -1,0 +1,5 @@
+build/
+build-cmake/
+
+# Prior attempts, kept for reference; contains a nested git repo.
+example/
