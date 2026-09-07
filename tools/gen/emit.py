@@ -576,9 +576,8 @@ def emit_server_list_writers(elems, pelems):
         o.append("\tint arr = arpc_arg_node(rq, i);\n")
         o.append("\tif (arr < 0 || arpc_node_is_null(rq, arr))\n\t\treturn NULL;\n")
         o.append("\talpm_list_t *out = NULL;\n")
-        o.append("\tint n = arpc_node_count(rq, arr);\n")
-        o.append("\tfor (int k = 0; k < n; k++) {\n")
-        o.append("\t\tint e = arpc_node_elem(rq, arr, k);\n")
+        o.append("\tfor (int e = arpc_node_first(rq, arr); e >= 0;\n"
+                 "\t     e = arpc_node_next(rq, e)) {\n")
         if e["kind"] == "string":
             o.append("\t\tchar *s = arpc_node_strdup(rq, e);\n")
             o.append("\t\talpm_list_append(&out, s);\n")
@@ -887,9 +886,10 @@ def emit_client_helpers(need, elems):
                  "{\n" % e["name"])
         o.append("\tif (arr < 0 || aj_is_null(d, arr))\n\t\treturn NULL;\n")
         o.append("\talpm_list_t *out = NULL;\n")
-        o.append("\tint n = aj_count(d, arr);\n")
-        o.append("\tfor (int i = 0; i < n; i++) {\n")
-        o.append("\t\tint e = aj_elem(d, arr, i);\n")
+        # aj_elem() restarts the sibling walk on every call, so indexing a
+        # whole array is quadratic. Walk it once.
+        o.append("\tfor (int e = aj_first(d, arr); e >= 0; "
+                 "e = aj_next(d, e)) {\n")
         if e["kind"] == "string":
             o.append("\t\talpm_list_append(&out, arpc_dup(aj_str(d, e, NULL)));\n")
         elif e["kind"] == "handle":

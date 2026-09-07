@@ -68,6 +68,11 @@ if(ALPMRPC_BUILD_TESTS)
   add_executable(bench_pkg_fields ${_tests}/bench_pkg_fields.c)
   target_link_libraries(bench_pkg_fields PRIVATE alpm)
 
+  add_executable(bench_json_access ${_tests}/bench_json_access.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
+  target_include_directories(bench_json_access PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+
   add_executable(bench_codec ${_tests}/bench_codec.c
                              ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c)
   target_include_directories(bench_codec PRIVATE

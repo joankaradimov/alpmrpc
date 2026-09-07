@@ -40,6 +40,8 @@ int         arpc_arg_node(arpc_req *rq, int i);
 int         arpc_node_is_null(const arpc_req *rq, int n);
 int         arpc_node_count(const arpc_req *rq, int n);
 int         arpc_node_elem(const arpc_req *rq, int arr, int k);
+int         arpc_node_first(const arpc_req *rq, int arr);
+int         arpc_node_next(const arpc_req *rq, int node);
 int         arpc_node_member(const arpc_req *rq, int obj,
                              const char *key);
 long long   arpc_node_i64(const arpc_req *rq, int n);

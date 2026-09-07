@@ -165,10 +165,8 @@ static alpm_list_t *id_list(const aj_doc *d, int arr)
 	if (arr < 0 || aj_is_null(d, arr))
 		return NULL;
 	alpm_list_t *out = NULL;
-	int n = aj_count(d, arr);
-	for (int i = 0; i < n; i++)
-		alpm_list_append(&out, (void *)(uintptr_t)
-				 aj_i64(d, aj_elem(d, arr, i), 0));
+	for (int e = aj_first(d, arr); e >= 0; e = aj_next(d, e))
+		alpm_list_append(&out, (void *)(uintptr_t)aj_i64(d, e, 0));
 	return out;
 }
 

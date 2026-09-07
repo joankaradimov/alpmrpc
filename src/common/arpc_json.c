@@ -364,6 +364,20 @@ int aj_elem(const aj_doc *d, int arr, int index)
 	return i;
 }
 
+int aj_first(const aj_doc *d, int container)
+{
+	const aj_node *a = at(d, container);
+	if (!a || (a->type != AJ_ARR && a->type != AJ_OBJ))
+		return -1;
+	return a->first_child;
+}
+
+int aj_next(const aj_doc *d, int node)
+{
+	const aj_node *n = at(d, node);
+	return n ? n->next_sibling : -1;
+}
+
 int aj_count(const aj_doc *d, int container)
 {
 	const aj_node *a = at(d, container);

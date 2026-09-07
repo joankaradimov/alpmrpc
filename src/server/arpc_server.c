@@ -213,6 +213,16 @@ int arpc_node_elem(const arpc_req *rq, int arr, int k)
 	return aj_elem(rq->doc, arr, k);
 }
 
+int arpc_node_first(const arpc_req *rq, int arr)
+{
+	return aj_first(rq->doc, arr);
+}
+
+int arpc_node_next(const arpc_req *rq, int node)
+{
+	return aj_next(rq->doc, node);
+}
+
 int arpc_node_member(const arpc_req *rq, int obj, const char *key)
 {
 	return aj_member(rq->doc, obj, key);

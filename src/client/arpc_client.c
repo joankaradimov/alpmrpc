@@ -532,9 +532,11 @@ static column *fetch_column(pkg_group *g, const char *field, int want_str)
 
 	int arr = arpc_ret_node(&c);
 	const aj_doc *d = arpc_doc(&c);
-	int got = aj_count(d, arr);
-	for (size_t i = 0; i < g->n && (int)i < got; i++) {
-		int e = aj_elem(d, arr, (int)i);
+	/* One walk, not one restart per element: indexing this by aj_elem() is
+	 * quadratic, and a column is as long as the package list. */
+	size_t i = 0;
+	for (int e = aj_first(d, arr); e >= 0 && i < g->n;
+	     e = aj_next(d, e), i++) {
 		if (want_str)
 			col->str[i] = arpc_dup(aj_str(d, e, NULL));
 		else

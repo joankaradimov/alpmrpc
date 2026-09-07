@@ -48,6 +48,14 @@ int  aj_member(const aj_doc *d, int obj, const char *key);
 int  aj_elem(const aj_doc *d, int arr, int index);
 int  aj_count(const aj_doc *d, int container);
 
+/* Iterate a container. aj_elem() is O(n) -- it walks from the start -- so a
+ * loop over it is O(n^2); at 1214 elements that measured 918us against 1.6us
+ * for these. Prefer them for anything that visits every element:
+ *     for (int e = aj_first(d, arr); e >= 0; e = aj_next(d, e))
+ */
+int  aj_first(const aj_doc *d, int container);
+int  aj_next(const aj_doc *d, int node);
+
 /* Typed accessors; each takes a default used when the node is missing or
  * of the wrong type, so callers need no separate presence check. */
 long long   aj_i64(const aj_doc *d, int node, long long dflt);
