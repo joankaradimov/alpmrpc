@@ -57,6 +57,23 @@ declares, plus the list API beside it, and nothing of the bridge's own. A
 function the generator did not produce and nobody wrote by hand then fails
 the link, by name, rather than going quietly missing from the DLL.
 
+The parse defines `__MSYS__`, and has to. It is a mingw clang reading a
+header meant for the MSYS2 one, and the compiler that builds the server
+defines that macro — so without it the model came out describing a library
+that is not the one being linked. `alpm.h` guards
+`alpm_sync_sysupgrade_core()` and `alpm_pkg_is_core_package()` with it, and
+both were quietly absent from the wire and from the export table. The Cygwin
+triple is not enough on its own: `__CYGWIN__` is not `__MSYS__`.
+
+It is defined for the parse alone, never for the client's own compilation.
+ucrt64's `zconf-ng.h` picks `z_off64_t` off the same macro, so defining it
+there would change a type in a library the client really does link.
+
+One consequence is worth knowing: the `alpm.h` that travels with the client
+is MSYS2's, verbatim, so it hides those two behind the same `#ifdef` MSYS2
+hides them behind. The DLL exports them; a caller that wants them declares
+them, exactly as it would building against MSYS2's own libalpm.
+
 `cmake --build build --target coverage` prints what is generated and, for
 everything else, why it is not.
 
@@ -319,10 +336,10 @@ rebuilds the fixture itself, so it is not part of `ctest`.
 
 ## Status
 
-All 193 functions are on the wire: 189 generated, and four written by hand —
+All 195 functions are on the wire: 191 generated, and four written by hand —
 `alpm_filelist_contains` and the three mtree functions. Nothing is refused.
 `coverage.json` names the four and the file each lives in, and the generated
-export table says the same thing at link time: it lists all 193, so the DLL
+export table says the same thing at link time: it lists all 195, so the DLL
 cannot quietly lack one.
 
 One *field* does not cross, and that is stated rather than silent:

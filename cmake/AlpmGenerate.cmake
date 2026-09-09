@@ -35,8 +35,16 @@ endif()
 # alpm.h is a Cygwin-targeted header; parsing it with a Windows-targeted
 # clang trips over __int64 in libarchive and curl. The triple is what makes
 # the parse clean, not a workaround for it.
+#
+# __MSYS__ is defined for the same reason. The compiler that builds the
+# server defines it, so the alpm.h the server compiles against declares
+# alpm_sync_sysupgrade_core() and alpm_pkg_is_core_package(); the clang doing
+# the parse is a mingw one and does not, so the model came out two functions
+# short of the library it is meant to describe, and both were silently absent
+# from the wire. The triple alone is not enough: __CYGWIN__ is not __MSYS__.
 set(ALPMRPC_CLANG_ARGS
   "--clang-arg=--target=x86_64-pc-cygwin"
+  "--clang-arg=-D__MSYS__"
   "--clang-arg=-I${MSYS2_ROOT}/usr/include")
 if(ALPMRPC_CLANG_BUILTIN_INCLUDE)
   list(APPEND ALPMRPC_CLANG_ARGS

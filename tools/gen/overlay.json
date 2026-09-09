@@ -37,9 +37,11 @@
         "field of an already-loaded db entry, so batching them is free; the",
         "exclusions do real work (hashing a package file, computing a download",
         "size) or are not accessors at all, and must stay one call per use.",
-        "Whether an accessor is cheap is not something the header states."
+        "Whether an accessor is cheap is not something the header states.",
+        "The naming is the library's, not a rule of its own: get, has and is",
+        "are all one field of one already-loaded entry."
       ],
-      "match": "^alpm_pkg_(get|has)_",
+      "match": "^alpm_pkg_(get|has|is)_",
       "exclude": [
         "alpm_pkg_free",
         "alpm_pkg_checkmd5sum",

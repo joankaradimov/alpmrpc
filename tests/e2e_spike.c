@@ -12,6 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Guarded by __MSYS__ in alpm.h, which the parse defines and this
+ * translation unit does not -- ucrt64 headers read that macro for their
+ * own purposes. Declaring them here is also the point of the checks below:
+ * if the generator ever stops producing them, this fails at the link, by
+ * name, rather than leaving them quietly off the wire again. */
+int alpm_pkg_is_core_package(const alpm_pkg_t *pkg);
+int alpm_sync_sysupgrade_core(alpm_handle_t *handle, int enable_downgrade);
+
 static int failures;
 
 static void check(int cond, const char *what, const char *detail)
@@ -98,6 +106,19 @@ int main(void)
 	}
 	free(raw);
 
+	/* The two functions MSYS2 adds to libalpm. bash and filesystem are
+	 * core there; nothing outside base is. */
+	printf("\n-- the __MSYS__ additions --\n");
+	{
+		alpm_pkg_t *bash = alpm_db_get_pkg(db, "bash");
+		alpm_pkg_t *notcore = alpm_db_get_pkg(db, "alpmrpcd");
+		check(bash && alpm_pkg_is_core_package(bash),
+			      "alpm_pkg_is_core_package(bash)",
+			      bash ? "core" : "no bash");
+		if (notcore)
+			check(!alpm_pkg_is_core_package(notcore),
+			      "and not for a package outside base", "alpmrpcd");
+	}
 	printf("\n-- type safety across the wire --\n");
 	/* An alpm_handle_t id where a db id belongs. On the server this fails
 	 * a tag check instead of reaching libalpm as the wrong pointer. */
