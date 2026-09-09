@@ -6,6 +6,7 @@
  */
 #include <alpm.h>
 #include <alpm_list.h>
+#include "path_form.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +58,8 @@ int main(void)
 	}
 
 	const char *root = alpm_option_get_root(h);
-	check(root && root[0] == '/', "alpm_option_get_root()", root);
+	check(path_in_built_form(root),
+	      "alpm_option_get_root() is a " PATH_FORM " path", root);
 	const char *dbpath = alpm_option_get_dbpath(h);
 	check(dbpath && strstr(dbpath, "pacman") != NULL,
 	      "alpm_option_get_dbpath()", dbpath);

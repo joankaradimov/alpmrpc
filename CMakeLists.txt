@@ -37,6 +37,12 @@ endif()
 message(STATUS "MSYS2 root: ${MSYS2_ROOT}")
 
 option(ALPMRPC_BUILD_TESTS "Build the end-to-end test" ON)
+# The form the client's paths take is decided here, once. libalpm's are the
+# server's, POSIX; every client known so far wants Win32, and the server
+# converts for a client that asks, so the default client asks.
+option(ALPMRPC_WIN32_PATHS
+  "Build a client that takes and returns Win32 paths, converted on the server"
+  ON)
 
 # --- generation (shared by both sides) --------------------------------------
 
@@ -72,6 +78,7 @@ ExternalProject_Add(client
   CMAKE_ARGS
     -DALPMRPC_GEN_DIR=${ALPMRPC_GEN_DIR}
     -DALPMRPC_BUILD_TESTS=${ALPMRPC_BUILD_TESTS}
+    -DALPMRPC_WIN32_PATHS=${ALPMRPC_WIN32_PATHS}
     # Only the transaction test needs this, to build its fixture root with
     # MSYS2's own bash. The client itself links nothing from there.
     -DMSYS2_ROOT=${MSYS2_ROOT}

@@ -30,6 +30,10 @@ dependency:
 
     pacman -S --asdeps mingw-w64-x86_64-uthash
 
+The DLL takes and returns Win32 paths, converted on the server (see the
+design notes); `-DALPMRPC_WIN32_PATHS=OFF` builds one that speaks the
+server's POSIX paths instead.
+
 ## Generated, not written
 
 The wire surface is generated from the *installed* `alpm.h`, so it cannot
@@ -226,23 +230,22 @@ everything else, why it is not.
   sends the text. The receiving side then passes that text as an argument to
   a literal `"%s"` — never as the format, or a `%` that came out of the
   formatting would be read as a conversion.
-- **Paths are the server's, unless the caller asks otherwise.** libalpm runs
-  in an MSYS2 process, to which `C:\msys64` is `/`. By default paths cross
-  unchanged in both directions, which is honest but leaves a native caller
-  to translate `fetchcb`'s `localpath` before it can write there -- and the
-  translation lives in msys-2.0.dll, which this DLL must never load. So the
-  server translates instead, on request: `alpmrpc_win32_paths(1)`, from the
-  one header that is this bridge's own (`include/alpmrpc.h`), or
-  `ALPMRPC_PATHS=win32` in the environment for a program that cannot be
-  changed. Every path the caller then passes is taken as Win32 and every
-  path it gets back comes as Win32 -- the root, the cachedirs, a file
-  conflict's file, a fetch callback's destination, the files a fetch wrote.
-  Which strings are paths is an overlay section, checked against the
-  header: a package's filename is a name, a pattern relative to the root
-  stays relative, and a URL is a URL, `file://` ones included. The client
-  says which form it wants in a hello when it connects, and a connection
-  that says nothing gets the server's own form, as every connection did
-  before there was anything to say.
+- **Paths are Win32 to the caller and POSIX to libalpm.** libalpm runs in an
+  MSYS2 process, to which `C:\msys64` is `/`, and a native caller cannot
+  translate between the two: `cygwin_conv_path` lives in msys-2.0.dll,
+  which this DLL must never load. So the server translates, for a
+  connection that asks. Whether this DLL asks is decided when it is built --
+  `ALPMRPC_WIN32_PATHS`, on by default, since every client known so far
+  wants Win32 -- and a Win32-path DLL tells the server so on every connect,
+  before anything else, with `arpc.set_path_style`. From then on every path
+  the caller passes is taken as Win32 and every path it gets back comes as
+  Win32: the root, the cachedirs, a file conflict's file, a fetch callback's
+  destination, the files a fetch wrote. Which strings are paths is an
+  overlay section, checked against the header: a package's filename is a
+  name, a pattern relative to the root stays relative, and a URL is a URL,
+  `file://` ones included. A connection that says nothing gets the server's
+  own form, which is what a DLL built with the option off gets, and what
+  every connection got before there was anything to say.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. An empty one is cached
@@ -303,7 +306,11 @@ failed transaction, and the differently typed list each hands back, is
 driven for real; a post-transaction hook; a `file://` repo so the download
 path runs with no network; and a throwaway GPG key that signs everything,
 with its public half in the root's gpgdir. That root also carries its own
-`/bin/sh`, because scriptlets and hooks are `chroot`ed into it.
+`/bin/sh`, because scriptlets and hooks are `chroot`ed into it. The path
+test builds a second such root and hands libalpm nothing but Win32 paths,
+checking each one that comes back -- a returned string, a list, a conflict's
+file, a fetch callback's destination, the files a fetch wrote -- by opening
+it natively; it exists only in the Win32-path build, which is the default.
 
 `bench_codec` reports round-trip cost, the codec's share of it, and
 throughput on a bulk payload -- run it before and after anything that

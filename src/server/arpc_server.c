@@ -527,18 +527,17 @@ static int g_shutdown_requested;
 
 int arpc_shutdown_requested(void) { return g_shutdown_requested; }
 
-/* What a connection wants that the protocol does not assume. So far one
- * thing: the form its paths take. A connection that never says gets the
- * server's own form, which is what every client got before there was
- * anything to say. */
-static int arpc_hello(arpc_req *rq, arpc_res *rs)
+/* The form this connection's paths take, "win32" or "posix". A connection
+ * that never says gets the server's own, POSIX, which is what every client
+ * got before there was anything to say. */
+static int arpc_set_path_style(arpc_req *rq, arpc_res *rs)
 {
-	const char *paths = arpc_arg_str(rq, 0);
-	if (arpc_req_bad(rq) || !paths ||
-	    (strcmp(paths, "win32") && strcmp(paths, "posix")))
+	const char *style = arpc_arg_str(rq, 0);
+	if (arpc_req_bad(rq) || !style ||
+	    (strcmp(style, "win32") && strcmp(style, "posix")))
 		return arpc_fail(rs, ARPC_E_INVALID_PARAMS,
-				 "arpc.hello: paths must be win32 or posix");
-	arpc_paths_set(!strcmp(paths, "win32"));
+				 "arpc.set_path_style: win32 or posix");
+	arpc_paths_set(!strcmp(style, "win32"));
 	arpc_ret_i64(rs, 0);
 	return 0;
 }
@@ -590,7 +589,7 @@ char *arpc_handle_parsed(aj_doc *d)
 	/* Infrastructure methods are not libalpm calls, so they are not in the
 	 * generated table. They still go through the same req/res path. */
 	static const arpc_method builtins[] = {
-		{ "arpc.hello", arpc_hello },
+		{ "arpc.set_path_style", arpc_set_path_style },
 		{ "arpc.set_callback", arpc_cb_set },
 		{ "arpc.mtree", arpc_mtree_get },
 		{ NULL, NULL }

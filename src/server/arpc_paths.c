@@ -3,13 +3,13 @@
  * libalpm's paths are the server's: it is an MSYS2 process, and "C:\msys64"
  * is "/" to it. A native caller has no cygwin_conv_path to make that
  * translation with -- it lives in msys-2.0.dll, which the client must never
- * load -- so the server makes it, on request. A connection that asks in its
- * hello sends Win32 paths and gets Win32 paths back: every argument, return
- * and field the overlay names as a path passes through here in the direction
- * the wire is carrying it, and nothing else does. Which strings are paths is
- * the overlay's to say -- a package's filename is not one, and neither is a
- * pattern relative to the root -- and the generator checks each name it
- * gives against the header.
+ * load -- so the server makes it, on request. A connection that asks, with
+ * arpc.set_path_style, sends Win32 paths and gets Win32 paths back: every
+ * argument, return and field the overlay names as a path passes through here
+ * in the direction the wire is carrying it, and nothing else does. Which
+ * strings are paths is the overlay's to say -- a package's filename is not
+ * one, and neither is a pattern relative to the root -- and the generator
+ * checks each name it gives against the header.
  */
 #include "arpc_server.h"
 
@@ -19,7 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Per connection: set by arpc.hello, cleared when the connection ends. */
+/* Per connection: set by arpc.set_path_style, POSIX again when the
+ * connection ends. */
 static int g_win32;
 
 void arpc_paths_set(int win32)

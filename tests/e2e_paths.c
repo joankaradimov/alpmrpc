@@ -2,10 +2,11 @@
  *
  * libalpm's paths are the server's, and the server is an MSYS2 process: to
  * it the fixture root is /f/work/..., and a native caller that wants to
- * open the files libalpm names has to know the Windows spelling. The bridge
- * converts on request, on the server, where cygwin_conv_path is. This test
- * asks for that and then hands libalpm nothing but Win32 paths, and checks
- * what comes back the way a native program would: by opening it.
+ * open the files libalpm names has to know the Windows spelling. A DLL built
+ * with ALPMRPC_WIN32_PATHS -- the default, and the only build this test is
+ * registered for -- has the server convert, on the server, where
+ * cygwin_conv_path is. This test hands libalpm nothing but Win32 paths and
+ * checks what comes back the way a native program would: by opening it.
  *
  * Every direction a path travels is exercised: an argument, a returned
  * string, a returned list, a list argument, a record's field arriving in a
@@ -17,7 +18,10 @@
  */
 #include <alpm.h>
 #include <alpm_list.h>
-#include <alpmrpc.h>
+
+#ifndef ALPMRPC_WIN32_PATHS
+#error "e2e_paths tests the DLL built with ALPMRPC_WIN32_PATHS, and this is not it"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,9 +129,7 @@ int main(int argc, char **argv)
 	posix_root[strcspn(posix_root, "\r\n")] = '\0';
 
 	char buf[512];
-	printf("-- asking for Win32 paths, then giving libalpm nothing else --\n");
-	check(alpmrpc_win32_paths(1) == 0, "alpmrpc_win32_paths(1)",
-	      "before the first call");
+	printf("-- giving libalpm nothing but Win32 paths --\n");
 
 	char dbpath[1024], cachedir[1024], hookdir[1024], base_pkg[1024];
 	char squatter_pkg[1024];
@@ -252,16 +254,6 @@ int main(int argc, char **argv)
 	check(can_open(got_path), "and this process can open it", NULL);
 	alpm_list_free_inner(fetched, free);
 	alpm_list_free(fetched);
-
-	printf("\n-- and off again --\n");
-	/* Switched back mid-session: the server's own form from here on, and
-	 * what was cached in Win32 form is not served for it. */
-	check(alpmrpc_win32_paths(0) == 0, "alpmrpc_win32_paths(0)", NULL);
-	const char *proot = alpm_option_get_root(h);
-	check(proot && proot[0] == '/', "alpm_option_get_root() is POSIX again",
-	      proot);
-	check(root && is_win32(root), "and the Win32 one is still readable",
-	      "detached, not freed");
 
 	alpm_release(h);
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

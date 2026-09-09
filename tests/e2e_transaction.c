@@ -28,6 +28,7 @@
  */
 #include <alpm.h>
 #include <alpm_list.h>
+#include "path_form.h"
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -791,8 +792,8 @@ int main(int argc, char **argv)
 	      fetch_url);
 	check(strstr(fetch_url, "alpmrpc.db") != NULL,
 	      "with the url it wanted fetched", fetch_url);
-	check(fetch_localpath[0] == '/',
-	      "and a server-side path to put it in", fetch_localpath);
+	check(path_in_built_form(fetch_localpath),
+	      "and a " PATH_FORM " path to put it in", fetch_localpath);
 	check(up != 0, "refusing it failed the update, rather than passing",
 	      NULL);
 	alpm_option_set_fetchcb(h, NULL, NULL);

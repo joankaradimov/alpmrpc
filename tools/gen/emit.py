@@ -699,9 +699,7 @@ def emit_def(model):
         o.append("    %s\n" % fn["name"])
     for name in model.get("list_functions", []):
         o.append("    %s\n" % name)
-    o.append("    ; Not libalpm's: the bridge's own API, include/alpmrpc.h,\n"
-             "    ; and its cache count, for its tests.\n"
-             "    alpmrpc_win32_paths\n"
+    o.append("    ; Not libalpm's: the bridge's own cache count, for its tests.\n"
              "    arpc_stats_cached\n")
     return "".join(o)
 

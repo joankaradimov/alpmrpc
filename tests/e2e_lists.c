@@ -7,6 +7,7 @@
  */
 #include <alpm.h>
 #include <alpm_list.h>
+#include "path_form.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,7 +85,8 @@ int main(void)
 	check(cachedirs != NULL, "alpm_option_get_cachedirs()", NULL);
 	if (cachedirs) {
 		const char *d = (const char *)cachedirs->data;
-		check(d && strchr(d, '/') != NULL, "element is a usable char*", d);
+		check(path_in_built_form(d),
+		      "element is a usable char*, a " PATH_FORM " path", d);
 	}
 
 	printf("\n-- nested: a list inside a materialised struct --\n");

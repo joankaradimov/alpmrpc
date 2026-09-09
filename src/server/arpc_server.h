@@ -193,9 +193,10 @@ int  arpc_mtree_get(arpc_req *rq, arpc_res *rs);
 
 /* ---- paths ----
  *
- * A connection may ask, in its hello, to speak Win32 paths; the generated
- * code then passes every string the overlay names as a path through these,
- * in the direction it is travelling. See src/server/arpc_paths.c. */
+ * A connection may ask, with arpc.set_path_style, to speak Win32 paths; the
+ * generated code then passes every string the overlay names as a path
+ * through these, in the direction it is travelling. See
+ * src/server/arpc_paths.c. */
 void  arpc_paths_set(int win32);
 /* Malloc'd, converted if the connection asked, a copy if not; NULL for NULL. */
 char *arpc_path_in(const char *s);
