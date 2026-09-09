@@ -581,6 +581,53 @@
     "alpm_db_update": "the package cache of every db it refreshed",
     "alpm_unregister_all_syncdbs": "every sync db, with its package cache"
   },
+  "paths": {
+    "_comment": [
+      "Which strings are paths. libalpm's paths are the server's -- an MSYS2",
+      "process, to which C:\\msys64 is / -- and a connection may ask to speak",
+      "Win32 paths instead; the server then converts every string named here,",
+      "and only those, in the direction it is travelling. A package's filename",
+      "is a name, not a path; a pattern relative to the root stays relative;",
+      "a URL is a URL. Each entry is checked against the model: a function and",
+      "its string or string-list parameter, a function returning one, an",
+      "out-list of them, a record's string field, a callback's string",
+      "parameter."
+    ],
+    "params": [
+      "alpm_initialize.root",
+      "alpm_initialize.dbpath",
+      "alpm_pkg_load.filename",
+      "alpm_compute_md5sum.filename",
+      "alpm_compute_sha256sum.filename",
+      "alpm_option_set_logfile.logfile",
+      "alpm_option_set_gpgdir.gpgdir",
+      "alpm_option_add_cachedir.cachedir",
+      "alpm_option_remove_cachedir.cachedir",
+      "alpm_option_set_cachedirs.cachedirs",
+      "alpm_option_add_hookdir.hookdir",
+      "alpm_option_remove_hookdir.hookdir",
+      "alpm_option_set_hookdirs.hookdirs"
+    ],
+    "returns": [
+      "alpm_option_get_root",
+      "alpm_option_get_dbpath",
+      "alpm_option_get_lockfile",
+      "alpm_option_get_logfile",
+      "alpm_option_get_gpgdir",
+      "alpm_option_get_cachedirs",
+      "alpm_option_get_hookdirs",
+      "alpm_fetch_pkgurl.fetched"
+    ],
+    "fields": [
+      "_alpm_fileconflict_t.file",
+      "_alpm_event_pacnew_created_t.file",
+      "_alpm_event_pacsave_created_t.file",
+      "_alpm_question_corrupted_t.filepath"
+    ],
+    "callback_params": [
+      "alpm_cb_fetch.localpath"
+    ]
+  },
   "out_list_own": {
     "_comment": [
       "An alpm_list_t** out-param is filled by libalpm and owned by the caller.",

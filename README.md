@@ -41,8 +41,9 @@ drift from the library the server links against.
               tools/gen/overlay.json ─────┴──> arpc_handle_tags.h
 
 `tools/gen/overlay.json` is the only hand-maintained input: it records what a
-C header cannot express — pointer direction, list ownership, and which union
-member a callback's tag selects. String ownership is *not* in it, because
+C header cannot express — pointer direction, list ownership, which union
+member a callback's tag selects, which strings are paths. String ownership is
+*not* in it, because
 libalpm's const-ness already determines it (`char *` is caller-owned,
 `const char *` is borrowed); `emit.py` asserts that invariant against each
 header it parses, and checks the tag mappings against the enums the same way.
@@ -225,13 +226,23 @@ everything else, why it is not.
   sends the text. The receiving side then passes that text as an argument to
   a literal `"%s"` — never as the format, or a `%` that came out of the
   formatting would be read as a conversion.
-- **Paths are the server's.** They cross unchanged in both directions, so a
-  caller passes Cygwin paths to `alpm_initialize` and gets them back from
-  `alpm_option_get_root`. `fetchcb` is where this becomes visible rather than
-  academic: the `localpath` libalpm wants a file written to is a path in the
-  server's filesystem, and a native caller has to be able to reach it. No
-  translation happens here, because guessing at one would be worse than the
-  caller doing it knowingly.
+- **Paths are the server's, unless the caller asks otherwise.** libalpm runs
+  in an MSYS2 process, to which `C:\msys64` is `/`. By default paths cross
+  unchanged in both directions, which is honest but leaves a native caller
+  to translate `fetchcb`'s `localpath` before it can write there -- and the
+  translation lives in msys-2.0.dll, which this DLL must never load. So the
+  server translates instead, on request: `alpmrpc_win32_paths(1)`, from the
+  one header that is this bridge's own (`include/alpmrpc.h`), or
+  `ALPMRPC_PATHS=win32` in the environment for a program that cannot be
+  changed. Every path the caller then passes is taken as Win32 and every
+  path it gets back comes as Win32 -- the root, the cachedirs, a file
+  conflict's file, a fetch callback's destination, the files a fetch wrote.
+  Which strings are paths is an overlay section, checked against the
+  header: a package's filename is a name, a pattern relative to the root
+  stays relative, and a URL is a URL, `file://` ones included. The client
+  says which form it wants in a hello when it connects, and a connection
+  that says nothing gets the server's own form, as every connection did
+  before there was anything to say.
 - **Borrowed lists are cached against their owner** and looked up *before*
   the call, because libalpm hands back the same pointer for repeated calls
   and a caller may still be holding an earlier one. An empty one is cached

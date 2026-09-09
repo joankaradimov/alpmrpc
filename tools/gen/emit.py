@@ -491,6 +491,96 @@ def server_hooks(fn):
     return fn["name"] in OVERLAY.get("server_hooks", {})
 
 
+# --- paths -----------------------------------------------------------------
+#
+# libalpm's paths are the server's, and a connection may ask to speak Win32
+# paths instead; the server then converts every string the overlay names as
+# a path, in the direction it is travelling, and nothing else. Which strings
+# those are is the overlay's to say -- a package's filename is a name, a
+# pattern relative to the root is relative, a URL is a URL -- and every name
+# it gives is checked against the model.
+
+
+def _paths(section):
+    return OVERLAY.get("paths", {}).get(section, [])
+
+
+def path_param(fn, pname):
+    return fn["name"] + "." + pname in _paths("params")
+
+
+def path_return(fn):
+    return fn["name"] in _paths("returns")
+
+
+def path_out_list(fn, pname):
+    return fn["name"] + "." + pname in _paths("returns")
+
+
+def path_field(recname, fname):
+    return recname is not None and recname + "." + fname in _paths("fields")
+
+
+def path_cb_param(cb, pname):
+    return cb["name"] + "." + pname in _paths("callback_params")
+
+
+def paths_validate(model):
+    """Every name in the overlay's paths section has to be a string in the
+    model, so that a typo is a build failure rather than a path that
+    quietly stays in the wrong form."""
+    by_name = {f["name"]: f for f in model["functions"]}
+
+    def param_of(fname, pname):
+        fn = by_name.get(fname)
+        return next((p for p in fn["params"] if p["name"] == pname),
+                    None) if fn else None
+
+    def is_str_list(e):
+        return e is not None and e["kind"] == "string"
+
+    for key in _paths("params"):
+        fname, _, pname = key.partition(".")
+        p = param_of(fname, pname)
+        ok = p and (p["kind"] == "string" or
+                    (p["kind"] == "list" and is_str_list(param_elem(fname, pname))))
+        if not ok:
+            raise SystemExit("overlay: paths.params: %s is not a string or "
+                             "string-list parameter" % key)
+    for key in _paths("returns"):
+        fname, _, pname = key.partition(".")
+        fn = by_name.get(fname)
+        if fn and pname:
+            p = param_of(fname, pname)
+            ok = p and p["kind"] == "ptr_list" and all(
+                is_str_list(e) for e in out_list_elems(fname, pname))
+        elif fn:
+            rk = fn["ret"]["kind"]
+            ok = rk == "string" or (rk == "list" and is_str_list(ret_elem(fname)))
+        else:
+            ok = False
+        if not ok:
+            raise SystemExit("overlay: paths.returns: %s does not return a "
+                             "string, a string list or a string out-list" % key)
+    for key in _paths("fields"):
+        rname, _, fname = key.partition(".")
+        rec = RECORDS.get(rname)
+        f = next((f for f in rec["fields"] if f["name"] == fname),
+                 None) if rec else None
+        if not f or f["kind"] != "string":
+            raise SystemExit("overlay: paths.fields: %s is not a string field"
+                             % key)
+    cbs = {c["name"]: c for c in model.get("callbacks", [])}
+    for key in _paths("callback_params"):
+        cname, _, pname = key.partition(".")
+        cb = cbs.get(cname)
+        p = next((p for p in cb["params"] if p["name"] == pname),
+                 None) if cb else None
+        if not p or p["kind"] != "string":
+            raise SystemExit("overlay: paths.callback_params: %s is not a "
+                             "string parameter of a callback" % key)
+
+
 GENERATED = {}          # name -> function, for every function emitted
 
 
@@ -609,7 +699,9 @@ def emit_def(model):
         o.append("    %s\n" % fn["name"])
     for name in model.get("list_functions", []):
         o.append("    %s\n" % name)
-    o.append("    ; Not libalpm's: the bridge's own cache count, for its tests.\n"
+    o.append("    ; Not libalpm's: the bridge's own API, include/alpmrpc.h,\n"
+             "    ; and its cache count, for its tests.\n"
+             "    alpmrpc_win32_paths\n"
              "    arpc_stats_cached\n")
     return "".join(o)
 
@@ -964,7 +1056,9 @@ def srv_put_value(o, expr, kind, c_type, owner, indent, recname=None,
                   fname=None):
     """Emit one value of the given kind into the writer."""
     t = "\t" * indent
-    if kind == "string":
+    if kind == "string" and path_field(recname, fname):
+        o.append("%sarpc_ajw_path(w, %s);\n" % (t, expr))
+    elif kind == "string":
         o.append("%sajw_str(w, %s);\n" % (t, expr))
     elif kind in ("scalar", "enum"):
         o.append("%sajw_i64(w, (long long)%s);\n" % (t, expr))
@@ -1407,7 +1501,10 @@ def emit_cb_server(model):
                 continue
             expr = "arpc_msg" if pn in fmt else pn
             o.append("\tajw_key(w, %s);\n" % qq(pn))
-            srv_put_value(o, expr, p["kind"], p["c_type"], "owner", 1)
+            if p["kind"] == "string" and path_cb_param(cb, pn):
+                o.append("\tarpc_ajw_path(w, %s);\n" % expr)
+            else:
+                srv_put_value(o, expr, p["kind"], p["c_type"], "owner", 1)
 
         o.append("\tajw_obj_end(w);\n\n")
         o.append("\tlong long r = arpc_cb_send(ARPC_CB_%s, owner, w, %s);\n"
@@ -1506,8 +1603,9 @@ def srv_args(fn, o):
     out-params. Returns the pieces the rest of the handler needs."""
     n = fn["name"]
     h = {"args": [], "temps": [], "struct_temps": [], "byte_temps": [],
-         "byte_checks": [], "out_buf": None, "out_lists": [],
-         "out_handles": [], "out_bytes": [], "out_structs": []}
+         "path_temps": [], "byte_checks": [], "out_buf": None,
+         "out_lists": [], "out_handles": [], "out_bytes": [],
+         "out_structs": []}
     args = h["args"]
     # length parameter -> the buffer it measures, so the call is handed
     # the length that was actually decoded
@@ -1534,7 +1632,14 @@ def srv_args(fn, o):
             h["byte_temps"].append(pn)
             h["byte_checks"].append((pn, bb))
             continue
-        if k == "string":
+        if k == "string" and path_param(fn, pn):
+            # A path in the caller's form: converted, so a copy, and one
+            # to free after the call.
+            o.append("\tchar *%s = arpc_path_in(arpc_arg_str(rq, %d));\n"
+                     % (pn, i))
+            args.append(pn)
+            h["path_temps"].append(pn)
+        elif k == "string":
             o.append("\tconst char *%s = arpc_arg_str(rq, %d);\n" % (pn, i))
             args.append(pn)
         elif k in ("scalar", "enum"):
@@ -1555,6 +1660,8 @@ def srv_args(fn, o):
             e = param_elem(n, pn)
             o.append("\talpm_list_t *%s = take_list_%s(rq, %d);\n"
                      % (pn, e["name"], i))
+            if path_param(fn, pn):
+                o.append("\tarpc_paths_in_list(%s);\n" % pn)
             args.append(pn)
             h["temps"].append((pn, e["name"]))
         elif k == "opaque_void" and opaque_handle(fn, pn):
@@ -1632,7 +1739,7 @@ def srv_check(fn, o, h):
         o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
     for tn, te in h["struct_temps"]:
         o.append("\t\tdrop_%s(%s);\n" % (te, tn))
-    for tn in h["byte_temps"]:
+    for tn in h["byte_temps"] + h["path_temps"]:
         o.append("\t\tfree(%s);\n" % tn)
     if h["out_buf"]:
         o.append("\t\tfree(%s);\n" % h["out_buf"][0])
@@ -1689,12 +1796,13 @@ def srv_call(fn, o, h):
         else:
             o.append("\tarpc_ret_i64(rs, (long long)%s);\n" % call)
     elif rk == "string":
+        ret = "arpc_ret_path" if path_return(fn) else "arpc_ret_str"
         if ret_string_owned(fn):
             o.append("\tchar *r = %s;\n" % call)
-            o.append("\tarpc_ret_str(rs, r);\n")
+            o.append("\t%s(rs, r);\n" % ret)
             o.append("\tfree(r);\t/* header says char*: caller-owned */\n")
         else:
-            o.append("\tarpc_ret_str(rs, %s);\n" % call)
+            o.append("\t%s(rs, %s);\n" % (ret, call))
     elif rk == "handle":
         owner = owner_expr(fn, handle_tag(rct))
         o.append("\t%s r = %s;\n" % (rct, call))
@@ -1716,8 +1824,11 @@ def srv_call(fn, o, h):
         own = list_ownership(n)
         o.append("\talpm_list_t *r = %s;\n" % call)
         o.append("\tarpc_ret_begin(rs);\n")
-        o.append("\tput_list_%s(arpc_res_writer(rs), r, %s);\n"
-                 % (e["name"], owner_expr(fn, elem_tag(e))))
+        if path_return(fn):
+            o.append("\tarpc_put_path_list(arpc_res_writer(rs), r);\n")
+        else:
+            o.append("\tput_list_%s(arpc_res_writer(rs), r, %s);\n"
+                     % (e["name"], owner_expr(fn, elem_tag(e))))
         if own == "caller":
             o.append("\t/* overlay says caller-owned: the server is that "
                      "caller */\n")
@@ -1794,8 +1905,12 @@ def srv_outs(fn, o, h):
                  % op)
     for op, e in h["out_lists"]:
         own = owner_expr(fn, elem_tag(e))
-        o.append("\tput_list_%s(arpc_out_writer(rs, " % e["name"]
-                 + qq(op) + "), %s_v, %s);\n" % (op, own))
+        if path_out_list(fn, op):
+            o.append("\tarpc_put_path_list(arpc_out_writer(rs, " + qq(op)
+                     + "), %s_v);\n" % op)
+        else:
+            o.append("\tput_list_%s(arpc_out_writer(rs, " % e["name"]
+                     + qq(op) + "), %s_v, %s);\n" % (op, own))
         o.append("\t/* libalpm filled this for us to own, so it goes once\n"
                  "\t * it is on the wire. */\n")
         o.append(free_elems_code(e, op + "_v", 1, own))
@@ -1812,7 +1927,7 @@ def srv_finish(fn, o, h):
         o.append("\tdrop_list_%s(%s);\n" % (te, tn))
     for tn, te in h["struct_temps"]:
         o.append("\tdrop_%s(%s);\n" % (te, tn))
-    for tn in h["byte_temps"]:
+    for tn in h["byte_temps"] + h["path_temps"]:
         o.append("\tfree(%s);\n" % tn)
 
     if spec.get("destroys"):
@@ -2709,6 +2824,7 @@ def main():
         if not name.startswith("_") and name not in GENERATED:
             raise SystemExit("overlay: server_hooks names %s, which is not "
                              "generated" % name)
+    paths_validate(model)
     need = records_needed(gen, cb_seed_records(model))
     rin = records_input(gen)
     os.makedirs(a.outdir, exist_ok=True)
@@ -2747,6 +2863,10 @@ def main():
                         if invalidation_of(f)},
         "server_hooks": sorted(k for k in OVERLAY.get("server_hooks", {})
                                if not k.startswith("_")),
+        # The strings the server converts for a connection that asked for
+        # Win32 paths, and nothing else does.
+        "paths": {k: v for k, v in OVERLAY.get("paths", {}).items()
+                  if not k.startswith("_")},
     }
     with open(os.path.join(a.outdir, "coverage.json"), "w",
               encoding="utf-8") as fh:

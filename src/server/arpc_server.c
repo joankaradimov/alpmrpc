@@ -411,6 +411,11 @@ static void set_ret(arpc_res *rs)
 void arpc_ret_null(arpc_res *rs)              { set_ret(rs); ajw_null(&rs->out); }
 void arpc_ret_i64(arpc_res *rs, long long v)  { set_ret(rs); ajw_i64(&rs->out, v); }
 void arpc_ret_str(arpc_res *rs, const char *s){ set_ret(rs); ajw_str(&rs->out, s); }
+void arpc_ret_path(arpc_res *rs, const char *s)
+{
+	set_ret(rs);
+	arpc_ajw_path(&rs->out, s);
+}
 
 void arpc_ret_handle(arpc_res *rs, uint64_t id)
 {
@@ -522,6 +527,22 @@ static int g_shutdown_requested;
 
 int arpc_shutdown_requested(void) { return g_shutdown_requested; }
 
+/* What a connection wants that the protocol does not assume. So far one
+ * thing: the form its paths take. A connection that never says gets the
+ * server's own form, which is what every client got before there was
+ * anything to say. */
+static int arpc_hello(arpc_req *rq, arpc_res *rs)
+{
+	const char *paths = arpc_arg_str(rq, 0);
+	if (arpc_req_bad(rq) || !paths ||
+	    (strcmp(paths, "win32") && strcmp(paths, "posix")))
+		return arpc_fail(rs, ARPC_E_INVALID_PARAMS,
+				 "arpc.hello: paths must be win32 or posix");
+	arpc_paths_set(!strcmp(paths, "win32"));
+	arpc_ret_i64(rs, 0);
+	return 0;
+}
+
 char *arpc_handle_frame(const char *req, size_t len)
 {
 	aj_doc d;
@@ -569,6 +590,7 @@ char *arpc_handle_parsed(aj_doc *d)
 	/* Infrastructure methods are not libalpm calls, so they are not in the
 	 * generated table. They still go through the same req/res path. */
 	static const arpc_method builtins[] = {
+		{ "arpc.hello", arpc_hello },
 		{ "arpc.set_callback", arpc_cb_set },
 		{ "arpc.mtree", arpc_mtree_get },
 		{ NULL, NULL }

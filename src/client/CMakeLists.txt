@@ -52,7 +52,11 @@ if(NOT ALPMRPC_UTHASH_INCLUDE)
     "  pacman -S --asdeps mingw-w64-x86_64-uthash")
 endif()
 
-target_include_directories(alpm PUBLIC ${ALPMRPC_GEN_DIR}/include)
+# alpm.h and alpm_list.h as libalpm ships them, and beside them alpmrpc.h,
+# the one header that is this bridge's own.
+target_include_directories(alpm PUBLIC
+  ${ALPMRPC_GEN_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(alpm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../common
@@ -77,6 +81,7 @@ set_target_properties(alpm PROPERTIES ARCHIVE_OUTPUT_NAME "alpm")
 install(TARGETS alpm RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 install(FILES ${ALPMRPC_GEN_DIR}/include/alpm.h
               ${ALPMRPC_GEN_DIR}/include/alpm_list.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/alpmrpc.h
         DESTINATION include)
 
 if(ALPMRPC_BUILD_TESTS)
@@ -122,6 +127,20 @@ if(ALPMRPC_BUILD_TESTS)
     target_link_libraries(e2e_transaction PRIVATE alpm archive)
     add_test(NAME e2e_transaction COMMAND e2e_transaction "${_scratch}")
     set_tests_properties(e2e_transaction PROPERTIES FIXTURES_REQUIRED scratch)
+
+    # Win32 paths in every direction, against a root of its own: the
+    # transaction test leaves its root changed, and this one changes its
+    # own, so neither can share.
+    set(_scratch_paths ${CMAKE_CURRENT_BINARY_DIR}/scratch-paths)
+    add_test(NAME scratch_root_paths
+             COMMAND "${MSYS2_ROOT}/usr/bin/bash.exe"
+                     "${_tests}/scratch/mkroot.sh" "${_scratch_paths}")
+    set_tests_properties(scratch_root_paths PROPERTIES FIXTURES_SETUP scratch_paths)
+
+    add_executable(e2e_paths ${_tests}/e2e_paths.c)
+    target_link_libraries(e2e_paths PRIVATE alpm)
+    add_test(NAME e2e_paths COMMAND e2e_paths "${_scratch_paths}")
+    set_tests_properties(e2e_paths PROPERTIES FIXTURES_REQUIRED scratch_paths)
 
     # Rebuilds the fixture itself between runs, so it is not part of ctest.
     add_executable(bench_transaction ${_tests}/bench_transaction.c)

@@ -253,6 +253,7 @@ static void serve_connection(HANDLE pipe)
 {
 	arpc_conn conn = { pipe };
 	arpc_cb_set_conn(&conn);
+	arpc_paths_set(0);              /* until this connection says otherwise */
 	for (;;) {
 		char *req = recv_framed(pipe);
 		if (!req)

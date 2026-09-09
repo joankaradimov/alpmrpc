@@ -3,6 +3,7 @@
 
 #include "arpc_client.h"
 #include "arpc_b64.h"
+#include "alpmrpc.h"
 
 /* The caches below are hash tables, and uthash is the whole of one. An add
  * that runs out of memory is not fatal here -- this is a DLL in somebody
@@ -21,6 +22,7 @@ static int g_self_known;
 static long long g_next_id = 1;
 static long g_conn_refs;                /* libalpm handles alive; under the lock */
 static int g_trace;                     /* read once, in DllMain */
+static int g_win32_paths;               /* what the caller asked for; see alpmrpc.h */
 static char g_err[256];
 
 /* ------------------------------------------------------------------ lock */
@@ -46,6 +48,9 @@ static void set_err(const char *fmt, ...)
 }
 
 const char *arpc_last_error(void) { return g_err; }
+
+static void disconnect(void);
+static int hello(void);
 
 /* ------------------------------------------------------ locating MSYS2 */
 
@@ -172,7 +177,7 @@ static int ensure_connected(void)
 	}
 	int r = try_open(name);
 	if (r)
-		return r > 0;
+		return r > 0 && hello();
 
 	/* Nothing listening: start a server and wait for it to. Two clients
 	 * starting at once both do this and get a server each -- which is
@@ -187,7 +192,29 @@ static int ensure_connected(void)
 	}
 	if (r == 0 && !g_err[0])
 		set_err("server did not start listening within 10s");
-	return r > 0;
+	return r > 0 && hello();
+}
+
+/* ---------------------------------------------------- the bridge's own API */
+
+/* Tell the server what this connection wants that the protocol does not
+ * assume. Only sent when there is something to say: a connection that says
+ * nothing gets the server's own paths, as every connection always did. Runs
+ * inside ensure_connected once the pipe is up, so its own begin finds the
+ * connection in place rather than making one. */
+static int hello(void)
+{
+	if (!g_win32_paths)
+		return 1;
+	arpc_call c;
+	if (!arpc_begin(&c, "arpc.hello"))
+		return 0;
+	arpc_put_str(&c, "win32");
+	int ok = arpc_invoke(&c);
+	arpc_end(&c);
+	if (!ok)
+		disconnect();
+	return ok;
 }
 
 static void disconnect(void)
@@ -476,6 +503,38 @@ size_t arpc_stats_cached(void)
 		n++;
 	arpc_leave();
 	return n;
+}
+
+/* The bridge's own API, and so a whole call: it takes the lock. */
+int alpmrpc_win32_paths(int enable)
+{
+	arpc_enter();
+	int rc = 0;
+	if (!!enable != g_win32_paths) {
+		g_win32_paths = !!enable;
+		if (g_pipe != INVALID_HANDLE_VALUE) {
+			/* Connected already, so say so now -- posix is a word
+			 * the server knows too -- and let go of everything
+			 * cached in the old form. Detached, not freed: a
+			 * caller may hold it, as it may hold anything borrowed. */
+			arpc_call c;
+			if (arpc_begin(&c, "arpc.hello")) {
+				arpc_put_str(&c, g_win32_paths ? "win32" : "posix");
+				rc = arpc_invoke(&c) ? 0 : -1;
+				arpc_end(&c);
+			} else {
+				rc = -1;
+			}
+			owned *o, *tmp;
+			HASH_ITER(hh, g_owned, o, tmp) {
+				HASH_DEL(g_owned, o);
+				o->next = g_detached;
+				g_detached = o;
+			}
+		}
+	}
+	arpc_leave();
+	return rc;
 }
 
 /* Strings that belong to nobody -- alpm_strerror's, alpm_version's -- are
@@ -1083,6 +1142,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		DWORD n = GetEnvironmentVariableA("ALPMRPC_TRACE", buf,
 						  sizeof(buf));
 		g_trace = n > 0 && buf[0] && buf[0] != '0';
+		n = GetEnvironmentVariableA("ALPMRPC_PATHS", buf, sizeof(buf));
+		g_win32_paths = n > 0 && n < sizeof(buf) && !strcmp(buf, "win32");
 	} else if (reason == DLL_PROCESS_DETACH) {
 		disconnect();
 		DeleteCriticalSection(&g_lock);

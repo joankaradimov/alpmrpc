@@ -11,6 +11,8 @@
 #include "arpc_wire.h"
 #include "arpc_handle_tags.h"
 
+#include <alpm_list.h>
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -61,6 +63,7 @@ typedef struct {
 void arpc_ret_null(arpc_res *rs);
 void arpc_ret_i64(arpc_res *rs, long long v);
 void arpc_ret_str(arpc_res *rs, const char *s);
+void arpc_ret_path(arpc_res *rs, const char *s);
 void arpc_ret_handle(arpc_res *rs, uint64_t id);
 void arpc_out_i64(arpc_res *rs, const char *name, long long v);
 
@@ -187,6 +190,20 @@ extern const arpc_cb_kind arpc_cb_kinds[];
  * object the caller reads with libarchive, so it is materialised on the
  * client rather than proxied; see src/server/arpc_mtree.c. */
 int  arpc_mtree_get(arpc_req *rq, arpc_res *rs);
+
+/* ---- paths ----
+ *
+ * A connection may ask, in its hello, to speak Win32 paths; the generated
+ * code then passes every string the overlay names as a path through these,
+ * in the direction it is travelling. See src/server/arpc_paths.c. */
+void  arpc_paths_set(int win32);
+/* Malloc'd, converted if the connection asked, a copy if not; NULL for NULL. */
+char *arpc_path_in(const char *s);
+char *arpc_path_out(const char *s);
+void  arpc_ajw_path(aj_w *w, const char *posix);
+void  arpc_put_path_list(aj_w *w, const alpm_list_t *l);
+/* Converts a list of strings the server owns, in place. */
+void  arpc_paths_in_list(alpm_list_t *l);
 
 /* Set once a client has asked the server to exit. The accept loop checks it
  * after each connection closes, so an in-flight call always completes. */
