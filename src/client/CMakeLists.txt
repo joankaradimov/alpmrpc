@@ -10,6 +10,21 @@ endif()
 # Matches libalpm's own soname so consumers linking -lalpm resolve normally.
 set(ALPM_SOVERSION 14)
 
+# The vendored alpm_list.c is only right for the alpm_list.h it came with.
+# If pacman ships a different header, fail here and say so, rather than
+# building a list that libalpm walks differently. See vendor/README.md.
+if(MSYS2_ROOT)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/vendor/alpm_list.h.sha256" _vendored_sha)
+  string(STRIP "${_vendored_sha}" _vendored_sha)
+  file(SHA256 "${MSYS2_ROOT}/usr/include/alpm_list.h" _installed_sha)
+  if(NOT _installed_sha STREQUAL _vendored_sha)
+    message(FATAL_ERROR
+      "The installed alpm_list.h is not the one vendor/alpm_list.c was taken "
+      "with. Re-vendor lib/libalpm/alpm_list.c from the pacman this libalpm "
+      "came from, and update vendor/alpm_list.h.sha256 to match.")
+  endif()
+endif()
+
 add_library(alpm SHARED
   arpc_client.c
   arpc_callbacks.c
@@ -19,13 +34,30 @@ add_library(alpm SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c
-  ${ALPMRPC_GEN_DIR}/arpc_stubs.c)
+  ${ALPMRPC_GEN_DIR}/arpc_stubs.c
+  # The export table, generated from the same model as the stubs: exactly
+  # libalpm's, and a function missing from the build fails the link by name.
+  ${ALPMRPC_GEN_DIR}/alpm.def)
+
+# The client's caches are uthash tables, and uthash is one header. It comes
+# from the toolchain's own package, the same way libarchive does, so it is
+# looked for next to the compiler rather than anywhere on the machine.
+get_filename_component(_toolchain_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+find_path(ALPMRPC_UTHASH_INCLUDE uthash.h
+  HINTS "${_toolchain_bin}/../include"
+  DOC "uthash.h, from the toolchain's uthash package")
+if(NOT ALPMRPC_UTHASH_INCLUDE)
+  message(FATAL_ERROR
+    "uthash.h not found. Install the toolchain's uthash package, e.g.\n"
+    "  pacman -S --asdeps mingw-w64-x86_64-uthash")
+endif()
 
 target_include_directories(alpm PUBLIC ${ALPMRPC_GEN_DIR}/include)
 target_include_directories(alpm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../common
-  ${ALPMRPC_GEN_DIR})
+  ${ALPMRPC_GEN_DIR}
+  ${ALPMRPC_UTHASH_INCLUDE})
 
 target_compile_options(alpm PRIVATE -Wall -Wextra)
 # libarchive is the mingw/ucrt64 one, not MSYS2's: an mtree is a

@@ -39,17 +39,8 @@ static int derive_root(char *out, size_t outsz)
 {
 	char exe[MAX_PATH];
 	DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
-	if (n == 0 || n >= sizeof(exe))
+	if (n == 0 || n >= sizeof(exe) || !arpc_strip_dirs(exe, 3))
 		return 0;
-	for (int up = 0; up < 3; up++) {
-		char *slash = strrchr(exe, '\\');
-		char *fwd = strrchr(exe, '/');
-		if (fwd > slash)
-			slash = fwd;
-		if (!slash)
-			return 0;
-		*slash = '\0';
-	}
 	size_t len = strlen(exe);
 	if (len + 1 > outsz)
 		return 0;
@@ -57,144 +48,144 @@ static int derive_root(char *out, size_t outsz)
 	return 1;
 }
 
-/* Owner-only DACL. The derived pipe name already includes the user SID, but
- * a name is not a permission -- this is what actually keeps another user on
- * the machine from driving package installs through this pipe. */
-static int owner_only_sa(SECURITY_ATTRIBUTES *sa, PSECURITY_DESCRIPTOR *sd_out)
+/* Owner-only DACL, and a mandatory label at this process's own integrity.
+ * The derived pipe name already includes both, but a name is not a
+ * permission: the DACL is what keeps another user on the machine from
+ * driving package installs through this pipe, and the label is what keeps
+ * an unelevated process of this same user from driving an elevated one.
+ * Nobody else is on the list -- not even SYSTEM, which needs nothing from
+ * here. */
+static int owner_only_sa(const arpc_identity *me, SECURITY_ATTRIBUTES *sa,
+			 PSECURITY_DESCRIPTOR *sd_out)
 {
-	HANDLE tok = NULL;
 	char sddl[512];
-	LPSTR sidstr = NULL;
-	int ok = 0;
+	snprintf(sddl, sizeof(sddl), "D:(A;;GA;;;%s)S:(ML;;NW;;;S-1-16-%u)",
+		 me->sid, (unsigned)me->integrity);
 
-	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+	PSECURITY_DESCRIPTOR sd = NULL;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+		    sddl, SDDL_REVISION_1, &sd, NULL))
 		return 0;
-
-	DWORD need = 0;
-	GetTokenInformation(tok, TokenUser, NULL, 0, &need);
-	TOKEN_USER *tu = need ? (TOKEN_USER *)LocalAlloc(LPTR, need) : NULL;
-	if (tu && GetTokenInformation(tok, TokenUser, tu, need, &need) &&
-	    ConvertSidToStringSidA(tu->User.Sid, &sidstr) && sidstr) {
-		snprintf(sddl, sizeof(sddl),
-			 "D:(A;;GA;;;%s)(A;;GA;;;SY)", sidstr);
-		PSECURITY_DESCRIPTOR sd = NULL;
-		if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-			    sddl, SDDL_REVISION_1, &sd, NULL)) {
-			sa->nLength = sizeof(*sa);
-			sa->lpSecurityDescriptor = sd;
-			sa->bInheritHandle = FALSE;
-			*sd_out = sd;
-			ok = 1;
-		}
-	}
-	if (sidstr)
-		LocalFree(sidstr);
-	if (tu)
-		LocalFree(tu);
-	CloseHandle(tok);
-	return ok;
-}
-
-/* ---- framed I/O ---- */
-
-static int read_exact(HANDLE h, void *buf, DWORD n)
-{
-	char *p = (char *)buf;
-	while (n) {
-		DWORD got = 0;
-		if (!ReadFile(h, p, n, &got, NULL) || got == 0)
-			return 0;
-		p += got;
-		n -= got;
-	}
+	sa->nLength = sizeof(*sa);
+	sa->lpSecurityDescriptor = sd;
+	sa->bInheritHandle = FALSE;
+	*sd_out = sd;
 	return 1;
 }
 
-static int write_exact(HANDLE h, const void *buf, DWORD n)
+/* ---- framed I/O ----
+ *
+ * The framing is shared with the client (arpc_wire.c). What is this side's
+ * own is the event: the pipe is opened overlapped so that waiting for a
+ * client can time out, and a handle opened that way has to be read and
+ * written that way too -- ReadFile with no OVERLAPPED on one is documented
+ * as able to report a read complete that is not. The server is
+ * single-threaded and the pipe carries one exchange at a time, so one event
+ * serves every transfer. */
+
+static HANDLE g_io_ev;
+
+static int send_framed(HANDLE pipe, const char *buf, size_t len)
 {
-	const char *p = (const char *)buf;
-	while (n) {
-		DWORD put = 0;
-		if (!WriteFile(h, p, n, &put, NULL) || put == 0)
-			return 0;
-		p += put;
-		n -= put;
-	}
-	return 1;
+	return arpc_send_frame(pipe, g_io_ev, buf, len);
 }
 
-/* Ask a running server on this endpoint to exit, and wait for it to let go.
+static char *recv_framed(HANDLE pipe)
+{
+	size_t len = 0;
+	char *f = arpc_recv_frame(pipe, g_io_ev, &len);
+	if (!f && len)
+		logf_("refusing frame of %zu bytes", len);
+	return f;
+}
+
+/* Ask every server on this endpoint to exit, and wait for them to let go.
  *
  * A rebuild has to be able to replace alpmrpcd.exe, and Windows will not let
- * it while the old one is running. Killing it would be blunt and would drop
- * whatever a client was doing; asking is enough, because the server finishes
- * its current connection first. Returns 0 only if a server was there and
- * would not leave. */
-static int stop_running_server(const char *name, int timeout_ms)
+ * it while one is running. Killing it would be blunt and would drop whatever
+ * a client was doing; asking is enough, because a server finishes its
+ * current connection first. Two clients at once mean two servers, each with
+ * its own instance of the pipe, and stopping one leaves the other holding
+ * the binary -- so this keeps asking until nobody answers. Returns 0 only if
+ * a server was there and would not leave. */
+static int stop_running_servers(const char *name, int timeout_ms,
+				const arpc_identity *me)
 {
-	HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-			       OPEN_EXISTING, 0, NULL);
-	if (p == INVALID_HANDLE_VALUE) {
-		DWORD e = GetLastError();
-		if (e == ERROR_FILE_NOT_FOUND) {
-			logf_("no server listening on %s", name);
-			return 1;       /* genuinely nothing to stop */
+	int stopped = 0;
+	for (int waited = 0; waited < timeout_ms; waited += 25) {
+		/* A client here, so the client's rules: nothing but an
+		 * anonymous view of this process for the other end, and the
+		 * other end has to be this user's. See the client's try_open. */
+		HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0,
+				       NULL, OPEN_EXISTING,
+				       FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT
+				       | SECURITY_ANONYMOUS, NULL);
+		if (p != INVALID_HANDLE_VALUE && !arpc_peer_is(p, 0, me)) {
+			CloseHandle(p);
+			fprintf(stderr, "alpmrpcd: %s is held by a process that "
+				"is not this user's at this elevation\n", name);
+			return 0;
 		}
-		/* The server accepts one connection at a time, so a busy pipe
-		 * means a server is up and serving somebody. That is the case
-		 * the caller most needs told apart from "not running": its
-		 * binary is locked and cannot be replaced. */
-		if (e == ERROR_PIPE_BUSY) {
-			/* Give the current client a moment to finish. */
-			if (WaitNamedPipeA(name, (DWORD)timeout_ms)) {
-				p = CreateFileA(name,
-						GENERIC_READ | GENERIC_WRITE, 0,
-						NULL, OPEN_EXISTING, 0, NULL);
+		if (p == INVALID_HANDLE_VALUE) {
+			DWORD e = GetLastError();
+			if (e == ERROR_FILE_NOT_FOUND) {
+				if (stopped)
+					logf_("stopped %d server%s", stopped,
+					      stopped == 1 ? "" : "s");
+				else
+					logf_("no server listening on %s",
+					      name);
+				return 1;
 			}
-			if (p == INVALID_HANDLE_VALUE) {
-				logf_("server is busy with another client");
+			/* A server accepts one connection at a time, so a
+			 * busy pipe means one is up and serving somebody.
+			 * That is the case the caller most needs told apart
+			 * from "not running": its binary is locked. Give
+			 * that client a moment to finish. */
+			if (e != ERROR_PIPE_BUSY) {
+				logf_("cannot reach the endpoint (%u)",
+				      (unsigned)e);
+				return 0;
+			}
+			Sleep(25);
+			continue;
+		}
+
+		/* The process at the other end, so that its exit can be
+		 * waited for: the binary is free once the process is gone,
+		 * not once the pipe is, and a Cygwin process takes its time
+		 * between the two. */
+		DWORD pid = 0;
+		HANDLE proc = NULL;
+		if (GetNamedPipeServerProcessId(p, &pid))
+			proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+
+		static const char req[] =
+			"{\"id\":1,\"method\":\"arpc.shutdown\",\"params\":[]}";
+		int sent = send_framed(p, req, sizeof(req) - 1);
+		if (sent)
+			free(recv_framed(p));
+		CloseHandle(p);         /* our disconnect is what lets it go */
+		if (!sent) {
+			if (proc)
+				CloseHandle(proc);
+			return 0;
+		}
+		stopped++;
+		if (proc) {
+			DWORD w = WaitForSingleObject(
+				proc, (DWORD)(timeout_ms - waited));
+			CloseHandle(proc);
+			if (w != WAIT_OBJECT_0) {
+				logf_("server %u did not exit within %dms",
+				      (unsigned)pid, timeout_ms);
 				return 0;
 			}
 		} else {
-			logf_("cannot reach the endpoint (%u)", (unsigned)e);
-			return 0;
+			Sleep(100);
 		}
 	}
-
-	static const char req[] =
-		"{\"id\":1,\"method\":\"arpc.shutdown\",\"params\":[]}";
-	unsigned len = (unsigned)(sizeof(req) - 1);
-	unsigned char hdr[4] = {
-		(unsigned char)(len & 0xFF), (unsigned char)((len >> 8) & 0xFF),
-		(unsigned char)((len >> 16) & 0xFF),
-		(unsigned char)((len >> 24) & 0xFF)
-	};
-	int sent = write_exact(p, hdr, 4) && write_exact(p, (void *)req, len);
-	if (sent && read_exact(p, hdr, 4)) {
-		unsigned rlen = (unsigned)hdr[0] | ((unsigned)hdr[1] << 8) |
-				((unsigned)hdr[2] << 16) | ((unsigned)hdr[3] << 24);
-		char *drop = (rlen && rlen < ARPC_MAX_FRAME)
-				     ? (char *)malloc(rlen) : NULL;
-		if (drop) {
-			read_exact(p, drop, rlen);
-			free(drop);
-		}
-	}
-	CloseHandle(p);                 /* our disconnect is what lets it go */
-	if (!sent)
-		return 0;
-
-	for (int waited = 0; waited < timeout_ms; waited += 25) {
-		Sleep(25);
-		HANDLE probe = CreateFileA(name, GENERIC_READ, 0, NULL,
-					   OPEN_EXISTING, 0, NULL);
-		if (probe == INVALID_HANDLE_VALUE) {
-			logf_("server stopped");
-			return 1;
-		}
-		CloseHandle(probe);
-	}
-	logf_("server did not stop within %dms", timeout_ms);
+	logf_("a server is still busy with a client after %dms", timeout_ms);
 	return 0;
 }
 
@@ -202,48 +193,6 @@ static int stop_running_server(const char *name, int timeout_ms)
 struct arpc_conn {
 	HANDLE pipe;
 };
-
-static int send_framed(HANDLE pipe, const char *buf, size_t len)
-{
-	unsigned char hdr[4];
-	hdr[0] = (unsigned char)(len & 0xFF);
-	hdr[1] = (unsigned char)((len >> 8) & 0xFF);
-	hdr[2] = (unsigned char)((len >> 16) & 0xFF);
-	hdr[3] = (unsigned char)((len >> 24) & 0xFF);
-	return write_exact(pipe, hdr, 4) &&
-	       write_exact(pipe, (void *)buf, (DWORD)len);
-}
-
-static char *recv_framed(HANDLE pipe)
-{
-	unsigned char hdr[4];
-	if (!read_exact(pipe, hdr, 4))
-		return NULL;
-	unsigned len = (unsigned)hdr[0] | ((unsigned)hdr[1] << 8) |
-		       ((unsigned)hdr[2] << 16) | ((unsigned)hdr[3] << 24);
-	if (len == 0 || len > ARPC_MAX_FRAME)
-		return NULL;
-	char *buf = (char *)malloc(len + 1);
-	if (!buf)
-		return NULL;
-	if (!read_exact(pipe, buf, len)) {
-		free(buf);
-		return NULL;
-	}
-	buf[len] = '\0';
-	return buf;
-}
-
-/* A request frame carries a method; a callback's answer does not. */
-static int is_request(const char *frame)
-{
-	aj_doc d;
-	int req = 0;
-	if (aj_parse(&d, frame, strlen(frame)))
-		req = aj_member(&d, 0, "method") >= 0;
-	aj_free(&d);
-	return req;
-}
 
 /* Called from inside a libalpm callback, part-way through serving a request.
  *
@@ -276,15 +225,20 @@ int arpc_conn_exchange(arpc_conn *c, const char *frame, size_t len,
 		if (!f)
 			return 0;
 
-		if (!is_request(f)) {
+		/* A request carries a method; an answer does not. Parsed
+		 * once, here, and handed on parsed. */
+		aj_doc d;
+		if (!aj_parse(&d, f, strlen(f)) ||
+		    aj_member(&d, 0, "method") < 0) {
+			aj_free(&d);
 			logf_("cb<- %s", f);
 			*reply_out = f;
 			return 1;
 		}
 
 		logf_("--> nested %s", f);
-		char *rsp = arpc_handle_frame(f, strlen(f));
-		free(f);
+		free(f);                /* the document copied what it kept */
+		char *rsp = arpc_handle_parsed(&d);
 		if (!rsp)
 			return 0;
 		logf_("<-- nested %s", rsp);
@@ -300,40 +254,18 @@ static void serve_connection(HANDLE pipe)
 	arpc_conn conn = { pipe };
 	arpc_cb_set_conn(&conn);
 	for (;;) {
-		unsigned char lenbuf[4];
-		if (!read_exact(pipe, lenbuf, 4))
-			break;
-		unsigned len = (unsigned)lenbuf[0] | ((unsigned)lenbuf[1] << 8) |
-			       ((unsigned)lenbuf[2] << 16) | ((unsigned)lenbuf[3] << 24);
-		if (len == 0 || len > ARPC_MAX_FRAME) {
-			logf_("refusing frame of %u bytes", len);
-			break;
-		}
-
-		char *req = (char *)malloc(len + 1);
+		char *req = recv_framed(pipe);
 		if (!req)
 			break;
-		if (!read_exact(pipe, req, len)) {
-			free(req);
-			break;
-		}
-		req[len] = '\0';
 		logf_("--> %s", req);
 
-		char *rsp = arpc_handle_frame(req, len);
+		char *rsp = arpc_handle_frame(req, strlen(req));
 		free(req);
 		if (!rsp)
 			break;
 		logf_("<-- %s", rsp);
 
-		size_t rlen = strlen(rsp);
-		unsigned char out[4];
-		out[0] = (unsigned char)(rlen & 0xFF);
-		out[1] = (unsigned char)((rlen >> 8) & 0xFF);
-		out[2] = (unsigned char)((rlen >> 16) & 0xFF);
-		out[3] = (unsigned char)((rlen >> 24) & 0xFF);
-		int ok = write_exact(pipe, out, 4) &&
-			 write_exact(pipe, rsp, (DWORD)rlen);
+		int ok = send_framed(pipe, rsp, strlen(rsp));
 		free(rsp);
 		if (!ok)
 			break;
@@ -390,7 +322,7 @@ int main(int argc, char **argv)
 		} else {
 			fprintf(stderr,
 				"usage: alpmrpcd [--stdio] [-v] [--root DIR] "
-				"[--idle SECONDS] [--print-endpoint]\n");
+				"[--idle SECONDS] [--print-endpoint] [--stop]\n");
 			return 2;
 		}
 	}
@@ -406,21 +338,38 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	arpc_identity me;
+	if (!arpc_process_identity(NULL, &me)) {
+		fprintf(stderr, "alpmrpcd: cannot tell which user this is\n");
+		return 1;
+	}
+
 	char name[256];
 	if (!arpc_pipe_name(root, name, sizeof(name))) {
 		fprintf(stderr, "alpmrpcd: cannot derive endpoint name\n");
 		return 1;
 	}
-	logf_("root=%s endpoint=%s idle=%dms", root, name, idle_ms);
+	logf_("root=%s endpoint=%s idle=%dms user=%s integrity=0x%x", root,
+	      name, idle_ms, me.sid, (unsigned)me.integrity);
+
+	g_io_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+	if (!g_io_ev)
+		return 1;
 
 	if (stop_mode)
-		return stop_running_server(name, 5000) ? 0 : 1;
+		return stop_running_servers(name, 5000, &me) ? 0 : 1;
 
 	SECURITY_ATTRIBUTES sa;
 	PSECURITY_DESCRIPTOR sd = NULL;
-	SECURITY_ATTRIBUTES *psa = owner_only_sa(&sa, &sd) ? &sa : NULL;
-	if (!psa)
-		logf_("WARNING: falling back to the default pipe DACL");
+	if (!owner_only_sa(&me, &sa, &sd)) {
+		/* The name has the user's SID in it, but a name is not a
+		 * permission. Without the DACL the pipe would take anyone's
+		 * package installs, so it is not opened at all. */
+		fprintf(stderr, "alpmrpcd: cannot build an owner-only DACL for "
+			"the pipe (%u); not serving\n",
+			(unsigned)GetLastError());
+		return 1;
+	}
 
 	HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
 	if (!ev)
@@ -431,10 +380,16 @@ int main(int argc, char **argv)
 		HANDLE pipe = CreateNamedPipeA(
 			name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 			PIPE_TYPE_MESSAGE | PIPE_READMODE_BYTE | PIPE_WAIT,
-			PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024, 0, psa);
+			PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024, 0, &sa);
 		if (pipe == INVALID_HANDLE_VALUE) {
-			fprintf(stderr, "alpmrpcd: CreateNamedPipe failed (%u)\n",
-				(unsigned)GetLastError());
+			DWORD e = GetLastError();
+			/* Another instance of this name exists and its owner
+			 * did not grant this process the right to add one:
+			 * somebody else's pipe, under our name. */
+			fprintf(stderr, e == ERROR_ACCESS_DENIED
+				? "alpmrpcd: %s is held by another user\n"
+				: "alpmrpcd: CreateNamedPipe %s failed (%u)\n",
+				name, (unsigned)e);
 			return 1;
 		}
 
@@ -464,6 +419,18 @@ int main(int argc, char **argv)
 			continue;
 		}
 
+		/* The DACL should already have kept anyone else out. Checked
+		 * again here, against the process at the other end, because
+		 * this is the boundary that matters and a DACL is one line of
+		 * SDDL away from being wrong. */
+		if (!arpc_peer_is(pipe, 1, &me)) {
+			logf_("refusing a connection from a process that is "
+			      "not this user's at this elevation");
+			DisconnectNamedPipe(pipe);
+			CloseHandle(pipe);
+			continue;
+		}
+
 		served++;
 		logf_("client connected (#%d)", served);
 		serve_connection(pipe);
@@ -478,8 +445,8 @@ int main(int argc, char **argv)
 	}
 
 	CloseHandle(ev);
-	if (sd)
-		LocalFree(sd);
+	CloseHandle(g_io_ev);
+	LocalFree(sd);
 	arpc_handle_reset();
 	return 0;
 }

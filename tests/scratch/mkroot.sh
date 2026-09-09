@@ -74,20 +74,24 @@ EOF
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# mkpkg <name> <where: cache|repo> <conflicts-or-empty>
+# mkpkg <name> <where: cache|repo> [extra .PKGINFO line ...]
 #
 # A package in the cache is installable from a file; one only in the repo has
 # to be downloaded first, which is the difference between exercising the
-# download callbacks and not.
+# download callbacks and not. MKPKG_ARCH and MKPKG_PAYLOAD override the
+# architecture and the name of the one file the package ships, for the
+# packages that exist to be refused.
 mkpkg() {
-	local name=$1 where=$2 conflicts=${3:-}
+	local name=$1 where=$2
+	shift 2
+	local arch=${MKPKG_ARCH:-$ARCH} payload=${MKPKG_PAYLOAD:-$name.txt}
 	local stage="$WORK/$name"
 	rm -rf "$stage"
 	mkdir -p "$stage/usr/share/alpmrpc-scratch"
 
-	echo "$name $VER" > "$stage/usr/share/alpmrpc-scratch/$name.txt"
+	echo "$name $VER" > "$stage/usr/share/alpmrpc-scratch/$payload"
 	local size
-	size=$(stat -c %s "$stage/usr/share/alpmrpc-scratch/$name.txt")
+	size=$(stat -c %s "$stage/usr/share/alpmrpc-scratch/$payload")
 
 	{
 		echo "pkgname = $name"
@@ -98,9 +102,12 @@ mkpkg() {
 		echo "builddate = 1750000000"
 		echo "packager = alpmrpc scratch <nobody@example.invalid>"
 		echo "size = $size"
-		echo "arch = $ARCH"
+		echo "arch = $arch"
 		echo "license = MIT"
-		[ -n "$conflicts" ] && echo "conflict = $conflicts"
+		local line
+		for line in "$@"; do
+			echo "$line"
+		done
 	} > "$stage/.PKGINFO"
 
 	# Printed lines become ALPM_EVENT_SCRIPTLET_INFO; the appended lines are
@@ -134,7 +141,7 @@ EOF
 		--options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
 		.PKGINFO .INSTALL .CHANGELOG usr )
 
-	local file="$name-$VER-$ARCH.pkg.tar.zst"
+	local file="$name-$VER-$arch.pkg.tar.zst"
 	# .PKGINFO first, which is where libalpm expects to find it.
 	bsdtar --zstd -cf "$WORK/$file" -C "$stage" \
 		.PKGINFO .INSTALL .CHANGELOG .MTREE usr
@@ -152,11 +159,18 @@ mkdir -p "$ROOT/repo"
 
 echo "packages:"
 mkpkg alpmrpc-base  cache
-mkpkg alpmrpc-rival cache alpmrpc-base
+mkpkg alpmrpc-rival cache "conflict = alpmrpc-base"
 mkpkg alpmrpc-extra repo
 # Never installed and never cached: something for alpm_fetch_pkgurl to fetch
 # that has not already been fetched by something else.
 mkpkg alpmrpc-spare repo
+# The ones that exist to be refused. Each makes libalpm fail a transaction
+# in a different way, and each failure hands back a differently typed list:
+# a missing dependency, a foreign architecture, and a file that an installed
+# package already owns.
+mkpkg alpmrpc-needy cache "depend = alpmrpc-missing"
+MKPKG_ARCH=alien mkpkg alpmrpc-alien cache
+MKPKG_PAYLOAD=alpmrpc-base.txt mkpkg alpmrpc-squatter cache
 
 # A file:// repo, so the download path runs with no network at all. repo-add
 # leaves alpmrpc.db as a symlink to the tarball; that is replaced with a copy

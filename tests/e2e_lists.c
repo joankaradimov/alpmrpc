@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Not libalpm API: the bridge's own count of what it has cached. */
+extern size_t arpc_stats_cached(void);
+
 static int failures;
 
 static void check(int cond, const char *what, const char *detail)
@@ -161,6 +164,54 @@ int main(void)
 	      found ? alpm_pkg_get_name(found) : "no satisfier");
 	alpm_list_free(needles);
 
+	printf("\n-- the same object is the same pointer --\n");
+	/* libalpm hands out one alpm_pkg_t for a package however it is
+	 * reached, and callers compare them -- pacman does, with
+	 * alpm_list_find_ptr. An id here is minted once per object, so the
+	 * same holds. */
+	check(found == first,
+	      "alpm_find_satisfier() returns the list's own element",
+	      "same id for the same object");
+	check(alpm_db_get_pkg(db, alpm_pkg_get_name(first)) == first,
+	      "and so does alpm_db_get_pkg()", NULL);
+	check(alpm_get_localdb(h) == db, "alpm_get_localdb() twice is one db",
+	      NULL);
+	check(alpm_pkg_get_db(first) == db,
+	      "and alpm_pkg_get_db() is that same db", NULL);
+
+	printf("\n-- a setter detaches what a getter cached --\n");
+	/* A borrowed list is cached, but libalpm's own copy changes under an
+	 * add; a re-read must see it, and the list read before must stay
+	 * readable, because natively it would be the same memory. */
+	size_t ndirs = alpm_list_count(cachedirs);
+	alpm_option_add_cachedir(h, "/var/cache/pacman/alpmrpc-extra/");
+	alpm_list_t *cachedirs2 = alpm_option_get_cachedirs(h);
+	snprintf(buf, sizeof(buf), "%zu -> %zu", ndirs,
+		 alpm_list_count(cachedirs2));
+	check(alpm_list_count(cachedirs2) == ndirs + 1,
+	      "alpm_option_get_cachedirs() sees the added dir", buf);
+	check(alpm_list_count(cachedirs) == ndirs,
+	      "the list from before is still readable",
+	      "detached, not freed");
+	const char *root0 = alpm_option_get_root(h);
+	alpm_option_add_cachedir(h, "/var/cache/pacman/alpmrpc-more/");
+	check(alpm_option_get_root(h) == root0,
+	      "a string that did not change keeps its pointer", root0);
+	check(alpm_db_get_pkgcache(db) == cache,
+	      "and the pkgcache, which it cannot touch, is untouched",
+	      "only what a call can change is detached");
+
+	printf("\n-- strings that belong to nobody stay put --\n");
+	/* alpm_strerror's strings are static in libalpm. Here they belong to
+	 * no handle, and their value depends on the argument, so caching them
+	 * under one slot would free each when the next was asked for. */
+	const char *e1 = alpm_strerror(ALPM_ERR_MEMORY);
+	const char *e2 = alpm_strerror(ALPM_ERR_SYSTEM);
+	check(e1 && e2 && strcmp(e1, e2) != 0,
+	      "alpm_strerror() differs by errno", e2);
+	check(alpm_strerror(ALPM_ERR_MEMORY) == e1,
+	      "and an earlier pointer is still the answer", e1);
+
 	printf("\n-- batched fields agree with unbatched ones --\n");
 	/* Reading a field off a list member goes through the column cache;
 	 * reading it off a package fetched by name does not. The two paths
@@ -239,12 +290,28 @@ int main(void)
 			check(again2 == byname,
 			      "repeat call returns the same pointer",
 			      "cached against the owning handle");
+			/* Cached per argument, not per handle: another name
+			 * has to be another group, not the first one again. */
+			if (groups->next) {
+				alpm_group_t *g1 =
+					(alpm_group_t *)groups->next->data;
+				alpm_group_t *by1 = alpm_db_get_group(db, g1->name);
+				check(by1 && by1 != byname && by1->name
+				      && !strcmp(by1->name, g1->name),
+				      "another name is another group", g1->name);
+			}
 		}
 	}
 
 	printf("\n-- teardown releases cached lists --\n");
+	snprintf(buf, sizeof(buf), "%zu entries cached", arpc_stats_cached());
+	check(arpc_stats_cached() > 0, "lists and columns are cached before it",
+	      buf);
 	alpm_release(h);
-	check(1, "alpm_release() with lists outstanding", "no leak, no crash");
+	size_t left = arpc_stats_cached();
+	snprintf(buf, sizeof(buf), "%zu left", left);
+	check(left == 0, "alpm_release() with lists outstanding frees them",
+	      buf);
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");

@@ -46,6 +46,87 @@
         "alpm_pkg_download_size",
         "alpm_pkg_get_validation"
       ]
+    },
+    "invalidates": {
+      "_comment": [
+        "Calls after which a borrowed result the client has cached may be",
+        "stale, and which cached results those are. A setter replaces a",
+        "list, an add appends to it, a transaction rewrites the package",
+        "cache; after one of these the client detaches exactly the entries",
+        "named here, so the next read of one fetches afresh. Detached, not",
+        "freed -- after an add the old pointer is still valid memory",
+        "natively, and a caller may hold it -- and detached entries go when",
+        "the handle does, so naming only what can change is what keeps",
+        "that pile small.",
+        "",
+        "`match` says which calls change anything. Each must get its keys:",
+        "from a `derive` rule -- the getter named like the setter, plural or",
+        "not, whichever exists -- or from an entry of its own here, or the",
+        "build fails. `under` is where the entries live: the first handle",
+        "argument (the default), everything under its root, or each element",
+        "of a named list argument. A key that is a regex names every getter",
+        "it matches. `columns` are batched package fields the call changes;",
+        "only a numeric one may be named, since a caller may hold a pointer",
+        "into a string column. coverage.json lists the outcome per call."
+      ],
+      "match": "^alpm_(add_pkg|remove_pkg|db_(add|remove|set)_\\w+|db_unregister|db_update|option_(add|remove|set)_\\w+|pkg_set_reason|register_syncdb|trans_(init|prepare|commit|interrupt|release)|unregister_all_syncdbs)$",
+      "derive": [
+        {
+          "match": "^alpm_option_(?:set|add|remove)_(\\w+)$",
+          "keys": ["alpm_option_get_\\1", "alpm_option_get_\\1s"]
+        },
+        {
+          "match": "^alpm_db_(?:set|add|remove)_(\\w+)$",
+          "keys": ["alpm_db_get_\\1", "alpm_db_get_\\1s"]
+        }
+      ],
+      "alpm_option_set_disable_dl_timeout": {
+        "keys": [],
+        "doc": "Sets a scalar nothing caches, and libalpm has no getter for it, so the naming rule finds nothing; stated so that the check stays strict for the next setter."
+      },
+      "alpm_register_syncdb": {
+        "keys": ["alpm_get_syncdbs"]
+      },
+      "alpm_db_unregister": {
+        "under": "root",
+        "keys": ["alpm_get_syncdbs"],
+        "doc": "The db's own entries go with it (destroys); the handle's list of dbs is what is left to detach."
+      },
+      "alpm_unregister_all_syncdbs": {
+        "under": "root",
+        "keys": ["alpm_get_syncdbs", "^alpm_db_get_"]
+      },
+      "alpm_db_update": {
+        "under": "dbs",
+        "keys": ["alpm_db_get_pkgcache", "alpm_db_get_groupcache", "alpm_db_get_group"],
+        "doc": "libalpm throws away the package cache of each db it refreshed; which those were it does not say, so every db passed in is taken to have been."
+      },
+      "alpm_trans_init": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_trans_prepare": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_trans_interrupt": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_trans_release": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_add_pkg": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_remove_pkg": {
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove"]
+      },
+      "alpm_trans_commit": {
+        "under": "root",
+        "keys": ["alpm_trans_get_add", "alpm_trans_get_remove", "alpm_db_get_pkgcache", "alpm_db_get_groupcache", "alpm_db_get_group"],
+        "doc": "It is the local db's package cache that is rewritten, but the client does not know which db that is, so every db's goes; a sync db's is one round trip to fetch again."
+      },
+      "alpm_pkg_set_reason": {
+        "columns": ["alpm_pkg_get_reason"]
+      }
     }
   },
   "list_elem": {
@@ -117,8 +198,6 @@
     "alpm_pkg_find.haystack": "alpm_pkg_t *",
     "alpm_sync_get_new_version.dbs_sync": "alpm_db_t *",
     "alpm_fetch_pkgurl.urls": "char *",
-    "alpm_trans_prepare.data": "alpm_depmissing_t *",
-    "alpm_trans_commit.data": "alpm_fileconflict_t *",
     "alpm_db_search.ret": "alpm_pkg_t *",
     "alpm_fetch_pkgurl.fetched": "char *",
     "alpm_extract_keyid.keys": "char *"
@@ -140,6 +219,14 @@
     "alpm_release": {
       "destroys": "handle",
       "doc": "Invalidates every handle owned by this alpm_handle_t."
+    },
+    "alpm_errno": {
+      "fail": "ALPM_ERR_SYSTEM",
+      "doc": "What the stub returns when the server cannot be reached. The kind's default of zero would say ALPM_ERR_OK about a call that just failed."
+    },
+    "alpm_strerror": {
+      "fail": "arpc_last_error()",
+      "doc": "Never NULL, as libalpm's never is. With the server gone, the bridge's own reason is the most useful text there is, and it is what a frontend's error message then shows."
     },
     "alpm_db_search": {
       "out_params": [
@@ -205,6 +292,10 @@
     },
     "alpm_pkg_free": {
       "destroys": "pkg"
+    },
+    "alpm_db_unregister": {
+      "destroys": "db",
+      "doc": "libalpm frees the db and its package cache; the id and everything under it go with them."
     },
     "alpm_pkg_changelog_close": {
       "closes": "fp",
@@ -453,6 +544,42 @@
       "nothing in alpm.h is currently refused outright. Kept because the",
       "next awkward record should land here rather than be forced through."
     ]
+  },
+  "out_list_elem_by_errno": {
+    "_comment": [
+      "An out-list whose element type depends on why the call failed. The",
+      "header doc for alpm_trans_prepare names alpm_depmissing_t, but that",
+      "is only the unsatisfied-deps case: libalpm puts alpm_conflict_t there",
+      "for a conflict and package names for a bad arch, and pacman's own",
+      "sync_prepare() switches on alpm_errno() to tell which. The generated",
+      "code does the same on both sides, and the errno travels beside the",
+      "list. Every errno named here is checked against the enum; one not",
+      "named here arrives as an empty list, which is what libalpm leaves."
+    ],
+    "alpm_trans_prepare.data": {
+      "ALPM_ERR_UNSATISFIED_DEPS": "alpm_depmissing_t *",
+      "ALPM_ERR_CONFLICTING_DEPS": "alpm_conflict_t *",
+      "ALPM_ERR_PKG_INVALID_ARCH": "char *"
+    },
+    "alpm_trans_commit.data": {
+      "ALPM_ERR_FILE_CONFLICTS": "alpm_fileconflict_t *",
+      "ALPM_ERR_PKG_INVALID": "char *",
+      "ALPM_ERR_PKG_INVALID_CHECKSUM": "char *",
+      "ALPM_ERR_PKG_INVALID_SIG": "char *"
+    }
+  },
+  "server_hooks": {
+    "_comment": [
+      "Calls after which libalpm has freed objects the handle table still",
+      "points at, and nothing in the header says so. Each is bracketed by a",
+      "pre and a post hook, hand-written in src/server/arpc_invalidate.c,",
+      "that note what is about to die and drop those ids afterwards. The",
+      "value says what dies."
+    ],
+    "alpm_trans_release": "the packages loaded from files, and the copies made of the ones to remove",
+    "alpm_trans_commit": "the installed version of every package it replaced or removed",
+    "alpm_db_update": "the package cache of every db it refreshed",
+    "alpm_unregister_all_syncdbs": "every sync db, with its package cache"
   },
   "out_list_own": {
     "_comment": [

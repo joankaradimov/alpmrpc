@@ -87,27 +87,41 @@ static int set_remote(uint64_t handle, const char *which, int enabled)
 	return r;
 }
 
+/* These three are the whole of a setter's or getter's stub, so they take
+ * the lock; the dispatcher below runs inside a call that already holds it. */
 int arpc_cb_register(uint64_t handle, int kind, const char *wire,
 		     void (*fn)(void), void *ctx)
 {
+	arpc_enter();
+	int rc = -1;
 	reg *r = reg_for(handle, 1);
-	if (!r || kind < 0 || kind >= ARPC_CB_SLOTS)
-		return -1;
-	r->fn[kind] = fn;
-	r->ctx[kind] = ctx;
-	return set_remote(handle, wire, fn != NULL);
+	if (r && kind >= 0 && kind < ARPC_CB_SLOTS) {
+		r->fn[kind] = fn;
+		r->ctx[kind] = ctx;
+		rc = set_remote(handle, wire, fn != NULL);
+	}
+	arpc_leave();
+	return rc;
 }
 
 void (*arpc_cb_fn(uint64_t handle, int kind))(void)
 {
+	arpc_enter();
 	reg *r = reg_for(handle, 0);
-	return (r && kind >= 0 && kind < ARPC_CB_SLOTS) ? r->fn[kind] : NULL;
+	void (*fn)(void) = (r && kind >= 0 && kind < ARPC_CB_SLOTS)
+				   ? r->fn[kind] : NULL;
+	arpc_leave();
+	return fn;
 }
 
 void *arpc_cb_ctx(uint64_t handle, int kind)
 {
+	arpc_enter();
 	reg *r = reg_for(handle, 0);
-	return (r && kind >= 0 && kind < ARPC_CB_SLOTS) ? r->ctx[kind] : NULL;
+	void *ctx = (r && kind >= 0 && kind < ARPC_CB_SLOTS) ? r->ctx[kind]
+							      : NULL;
+	arpc_leave();
+	return ctx;
 }
 
 /* alpm_cb_log wants a va_list, and there is no portable way to build one

@@ -33,13 +33,14 @@ void       *arpc_arg_handle(arpc_req *rq, int i, arpc_handle_tag tag);
 uint64_t    arpc_arg_id(arpc_req *rq, int i);
 int         arpc_req_bad(const arpc_req *rq);
 void        arpc_req_mark_bad(arpc_req *rq);
+/* The first element of a list argument, as an id, for filing what a call
+ * with no handle argument returns. */
+uint64_t    arpc_list_owner(arpc_req *rq, int i);
 
 /* Raw node access. Generated list code walks the request tree directly
  * rather than going through a typed accessor per element. */
 int         arpc_arg_node(arpc_req *rq, int i);
 int         arpc_node_is_null(const arpc_req *rq, int n);
-int         arpc_node_count(const arpc_req *rq, int n);
-int         arpc_node_elem(const arpc_req *rq, int arr, int k);
 int         arpc_node_first(const arpc_req *rq, int arr);
 int         arpc_node_next(const arpc_req *rq, int node);
 int         arpc_node_member(const arpc_req *rq, int obj,
@@ -85,19 +86,58 @@ int  arpc_fail(arpc_res *rs, int code, const char *msg);
 
 /* ---- handle table ----
  *
- * Ids are monotonic and never reused, so a stale id can never alias a live
- * object -- it simply misses. Lookup is an open-addressed hash, not a linear
- * scan: a full pkgcache walk puts thousands of live handles in this table.
+ * Ids are never reused, so a stale id can never alias a live object -- it
+ * simply misses. The same object always gets the same id, so pointer
+ * identity survives the wire. Lookup is an open-addressed hash, not a
+ * linear scan: a full pkgcache walk puts thousands of live handles in this
+ * table.
+ *
+ * Objects form a tree -- handle, db, package, changelog cursor -- and
+ * `owner` is the parent. An id carries its root in its high bits; see
+ * ARPC_ROOT in arpc_wire.h.
  */
 uint64_t arpc_handle_put(void *ptr, arpc_handle_tag tag, uint64_t owner);
+/* An object libalpm made for its caller that the client now holds ids
+ * into -- a conflict, whose packages are copies made for it -- so it cannot
+ * be freed once serialised. It is filed under `owner` instead, with no tag
+ * of its own, and `release` is called when that owner is dropped. */
+uint64_t arpc_handle_adopt(void *ptr, uint64_t owner, void (*release)(void *));
 void    *arpc_handle_get(uint64_t id, arpc_handle_tag tag);
-uint64_t arpc_owner_of(uint64_t id);
+/* Walk up from `id` to the nearest object of `tag`, or to the top of the
+ * chain if `tag` is ARPC_H_NONE or nothing of that kind is above it. */
+uint64_t arpc_ancestor(uint64_t id, arpc_handle_tag tag);
 void     arpc_handle_drop(uint64_t id);
-/* Drops `owner` and everything it owns. Called when an alpm_handle_t is
+/* Drops `owner` and everything under it. Called when an alpm_handle_t is
  * released, since every db/pkg derived from it dies with it. */
 void     arpc_handle_drop_owner(uint64_t owner);
+/* Everything under `owner`, but not `owner` itself: a db whose package
+ * cache libalpm has thrown away is still a db. */
+void     arpc_handle_drop_under(uint64_t owner);
+/* By pointer, for an object libalpm freed without being asked through this
+ * table -- see arpc_invalidate.c. */
+void     arpc_handle_drop_ptr(void *ptr, arpc_handle_tag tag);
 void     arpc_handle_reset(void);
 unsigned arpc_handle_live(void);
+
+/* ---- invalidation hooks ----
+ *
+ * libalpm frees objects the table still points at in a few places nothing
+ * in the header announces. The overlay names those calls, and the generated
+ * handler brackets each with a pair of these: before the call, note what is
+ * about to die; after it, drop those ids. A post hook must not call libalpm
+ * -- every public function resets the handle's errno, and the client has
+ * not read it yet -- so what it needs to know, the pre hook found out. */
+void *arpc_hook_alpm_trans_release_pre(arpc_req *rq);
+void  arpc_hook_alpm_trans_release_post(arpc_req *rq, void *state,
+                                        long long rc);
+void *arpc_hook_alpm_trans_commit_pre(arpc_req *rq);
+void  arpc_hook_alpm_trans_commit_post(arpc_req *rq, void *state,
+                                       long long rc);
+void *arpc_hook_alpm_db_update_pre(arpc_req *rq);
+void  arpc_hook_alpm_db_update_post(arpc_req *rq, void *state, long long rc);
+void *arpc_hook_alpm_unregister_all_syncdbs_pre(arpc_req *rq);
+void  arpc_hook_alpm_unregister_all_syncdbs_post(arpc_req *rq, void *state,
+                                                 long long rc);
 
 /* ---- dispatch (table is generated) ---- */
 
@@ -108,7 +148,9 @@ typedef struct {
 	arpc_handler fn;
 } arpc_method;
 
+/* Sorted by name, in strcmp order, so the dispatcher can bsearch it. */
 extern const arpc_method arpc_methods[];
+extern const size_t arpc_method_count;
 
 /* ---- callbacks ----
  *
@@ -153,6 +195,9 @@ int arpc_shutdown_requested(void);
 /* Parses one request frame and produces one response frame.
  * Returns a malloc'd NUL-terminated JSON response; caller frees. */
 char *arpc_handle_frame(const char *req, size_t len);
+/* The same, for a frame the caller has already parsed to see what it is.
+ * Takes the document: it is freed here. */
+char *arpc_handle_parsed(aj_doc *d);
 
 #ifdef __cplusplus
 }

@@ -14,9 +14,15 @@ find_file(ALPMRPC_LIBCLANG
   HINTS "${MSYS2_ROOT}/clang64/bin" "${MSYS2_ROOT}/ucrt64/bin"
   DOC "libclang used to parse alpm.h")
 
+# clang's own builtin headers live under lib/clang/<major>/include, and the
+# major changes with every release, so the directory is found, not listed;
+# newest first, should more than one be installed.
+file(GLOB _clang_builtin_dirs LIST_DIRECTORIES true
+  "${MSYS2_ROOT}/clang64/lib/clang/*/include")
+list(SORT _clang_builtin_dirs COMPARE NATURAL ORDER DESCENDING)
 find_path(ALPMRPC_CLANG_BUILTIN_INCLUDE stddef.h
-  HINTS "${MSYS2_ROOT}/clang64/lib/clang"
-  PATH_SUFFIXES 22/include 21/include 20/include 19/include 18/include
+  HINTS ${_clang_builtin_dirs}
+  NO_DEFAULT_PATH
   DOC "clang's own builtin include directory")
 
 if(NOT ALPMRPC_PYTHON OR NOT ALPMRPC_LIBCLANG)
@@ -59,6 +65,7 @@ function(alpmrpc_add_generation OUTDIR)
     OUTPUT "${OUTDIR}/arpc_dispatch.c"
            "${OUTDIR}/arpc_stubs.c"
            "${OUTDIR}/arpc_handle_tags.h"
+           "${OUTDIR}/alpm.def"
            "${OUTDIR}/coverage.json"
     COMMAND "${ALPMRPC_PYTHON}" "${_gen}/emit.py"
             --model "${_model}" --overlay "${_gen}/overlay.json"

@@ -67,37 +67,41 @@ static void forget(struct archive *a)
 	}
 }
 
+/* Hand-written, so the lock the generated stubs hold is taken here by hand:
+ * for the call, and for the list of streams that outlives it. */
 struct archive *alpm_pkg_mtree_open(alpm_pkg_t *pkg)
 {
 	arpc_call c;
-	if (!arpc_begin(&c, "arpc.mtree"))
+	arpc_enter();
+	if (!arpc_begin(&c, "arpc.mtree")) {
+		arpc_leave();
 		return NULL;
+	}
 	arpc_put_handle(&c, ARPC_ID(pkg));
 	if (!arpc_invoke(&c)) {
 		arpc_end(&c);
+		arpc_leave();
 		return NULL;
 	}
 
 	size_t n = 0;
 	unsigned char *buf = arpc_ret_bytes(&c, &n);
 	arpc_end(&c);
-	if (!buf)
-		return NULL;            /* the package has no mtree */
 
-	struct archive *a = archive_read_new();
-	if (!a) {
-		free(buf);
-		return NULL;
+	struct archive *a = buf ? archive_read_new() : NULL; /* NULL: no mtree */
+	if (a) {
+		archive_read_support_filter_all(a);
+		archive_read_support_format_mtree(a);
+		if (archive_read_open_memory(a, buf, n) != ARCHIVE_OK) {
+			archive_read_free(a);
+			a = NULL;
+		}
 	}
-	archive_read_support_filter_all(a);
-	archive_read_support_format_mtree(a);
-	if (archive_read_open_memory(a, buf, n) != ARCHIVE_OK) {
-		archive_read_free(a);
+	if (a)
+		remember(a, buf);
+	else
 		free(buf);
-		return NULL;
-	}
-
-	remember(a, buf);
+	arpc_leave();
 	return a;
 }
 
@@ -125,6 +129,8 @@ int alpm_pkg_mtree_close(const alpm_pkg_t *pkg, struct archive *archive)
 	if (!archive)
 		return -1;
 	int rc = archive_read_free(archive);
+	arpc_enter();
 	forget(archive);
+	arpc_leave();
 	return rc == ARCHIVE_OK ? 0 : -1;
 }

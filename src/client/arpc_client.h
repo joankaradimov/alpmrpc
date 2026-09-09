@@ -31,10 +31,22 @@ extern "C" {
 typedef struct {
 	aj_w req;
 	aj_doc rsp;
+	long long id;           /* the request's, checked against the reply's */
 	int result;             /* node index of "result", or -1 */
 	int parsed;
-	int held_lock;
 } arpc_call;
+
+/* ---- the lock ----
+ *
+ * One lock, and one rule: a stub holds it for the whole of a call, from the
+ * cache lookup that may answer it to the cache store after it, callbacks
+ * included, since they arrive inside the call and their own calls nest in
+ * the same lock. Nothing below this line locks for itself, so there is
+ * nothing to race: two threads calling through this DLL take turns, one
+ * whole call at a time. The lock is recursive, which is what lets a
+ * callback's calls nest. */
+void arpc_enter(void);
+void arpc_leave(void);
 
 /* Opens the connection on first use, launching the server if it is not
  * already listening. Returns 0 if the server could not be reached, in which
@@ -54,6 +66,10 @@ long long arpc_out_i64(arpc_call *c, const char *name);
  * as the owning object does, so it is cached against `owner` and released
  * when that owner is. */
 const char *arpc_intern_str(arpc_call *c, uint64_t owner, const char *key);
+/* Borrowed, but owned by nobody and varying with the arguments --
+ * alpm_strerror. libalpm's are static strings, so these are kept for good,
+ * one copy per distinct value. */
+const char *arpc_intern_static(arpc_call *c);
 /* Caller-owned return: a plain malloc'd copy the caller frees, matching the
  * contract of the three libalpm functions that return char*. */
 char *arpc_take_str(arpc_call *c);
@@ -62,7 +78,30 @@ char *arpc_take_str(arpc_call *c);
  * exactly as long as the caller's libalpm handles do. */
 void arpc_conn_ref(void);
 void arpc_conn_unref(void);
+
+/* What a call did to the caches, emitted after it by kind:
+ *   - a handle released: everything cached under it or anything below it
+ *     goes, along with its package lists' column caches and its callbacks.
+ *     The root in every id (ARPC_ROOT) is what makes "below it" answerable
+ *     here without knowing the tree in between;
+ *   - a package or db freed: what was cached under that one object goes;
+ *   - anything that changes something -- a setter, an add, a transaction:
+ *     exactly the results it can have changed, named by the overlay, are
+ *     detached, so the next read of one fetches afresh -- but not freed,
+ *     because after an append the old list is still valid memory natively
+ *     and a caller may be walking it. They go when the handle does.
+ * `keys` is a NULL-terminated list of getter names; an entry keyed on a
+ * getter and its arguments counts for that getter. Under `owner` alone, or
+ * under everything with its root. A column is one batched package field a
+ * setter changed, for one package. */
+void arpc_purge_root(uint64_t handle);
 void arpc_purge_owner(uint64_t owner);
+void arpc_detach(uint64_t owner, int whole_root, const char *const *keys);
+void arpc_drop_column(uint64_t pkg, const char *field);
+
+/* For the tests: how many cache entries and package groups are live,
+ * detached ones included. Zero after the last handle is released. */
+size_t arpc_stats_cached(void);
 
 /* ---- lists ----
  *
@@ -82,24 +121,25 @@ char *arpc_dup(const char *s);
 
 void arpc_free_list(alpm_list_t *l, alpm_list_fn_free elem_free);
 
-/* Borrowed lists are cached against their owner, because libalpm returns the
- * same pointer for repeated calls and callers may still hold an earlier one.
- * The lookup happens before the call, so a repeat costs no round trip. */
-alpm_list_t *arpc_cached_list(uint64_t owner, const char *key);
-void arpc_cache_list(uint64_t owner, const char *key, alpm_list_t *list,
-                     alpm_list_fn_free elem_free);
+/* Borrowed lists and structs are cached against their owner, because libalpm
+ * returns the same pointer for repeated calls and callers may still hold an
+ * earlier one. The lookup happens before the call, so a repeat costs no
+ * round trip. A cached NULL is an answer -- an empty list -- not a miss, so
+ * the lookup says whether it found one rather than what. Caching hands back
+ * the value the cache holds: the one just made, unless a callback fetched
+ * the same thing while the call was in flight, in which case the callback's,
+ * and the newcomer is released -- a repeat has to be the same pointer even
+ * then. `release` frees a value of this kind, and is what the entry uses
+ * when its owner goes. */
+int   arpc_cached(uint64_t owner, const char *key, void **out);
+void *arpc_cache(uint64_t owner, const char *key, void *value,
+                 void (*release)(void *));
 
 /* Raw request-writer access, for generated struct serialisers. */
 void arpc_put_null(arpc_call *c);
 void arpc_obj_begin(arpc_call *c);
 void arpc_obj_end(arpc_call *c);
 void arpc_key(arpc_call *c, const char *key);
-
-/* A borrowed struct return, cached against its owner exactly like a borrowed
- * list: same lifetime rule, same pre-call lookup. */
-void *arpc_cached_ptr(uint64_t owner, const char *key);
-void  arpc_cache_ptr(uint64_t owner, const char *key, void *ptr,
-                     void (*release)(void *));
 
 /* Bytes rather than text -- a signature, a changelog chunk. A JSON string
  * stops at the first NUL, so these travel base64; see arpc_b64.h. The encode

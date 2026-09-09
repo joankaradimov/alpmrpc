@@ -36,6 +36,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Not libalpm API: the bridge's own count of what it has cached, so the
+ * test can see that a release leaves nothing behind. */
+extern size_t arpc_stats_cached(void);
+
 static int failures;
 
 static void check(int cond, const char *what, const char *detail)
@@ -51,6 +55,8 @@ static void check(int cond, const char *what, const char *detail)
 static int questions;
 static alpm_question_type_t last_question;
 static char conflict_pair[256];
+static int remove_pkgs_questions;
+static char remove_pkgs_first[128];
 
 static int events;
 static int op_install, op_remove;
@@ -168,6 +174,19 @@ static void on_question(void *ctx, alpm_question_t *q)
 			 alpm_pkg_get_name(q->conflict.conflict->package1),
 			 alpm_pkg_get_name(q->conflict.conflict->package2));
 		q->conflict.remove = 1;
+	} else if (q->type == ALPM_QUESTION_REMOVE_PKGS) {
+		/* A package whose dependencies cannot be resolved: libalpm
+		 * offers to drop it from the transaction and carry on. Saying
+		 * no is what makes prepare fail with the unsatisfied
+		 * dependency in data, which is what that test is after. The
+		 * list carries the package as a usable handle. */
+		remove_pkgs_questions++;
+		alpm_list_t *pkgs = q->remove_pkgs.packages;
+		snprintf(remove_pkgs_first, sizeof(remove_pkgs_first), "%s",
+			 pkgs && pkgs->data
+				 ? alpm_pkg_get_name((alpm_pkg_t *)pkgs->data)
+				 : "(none)");
+		q->remove_pkgs.skip = 0;
 	} else {
 		q->any.answer = 1;
 	}
@@ -179,6 +198,10 @@ static const char *trans_err(alpm_handle_t *h)
 {
 	return alpm_strerror(alpm_errno(h));
 }
+
+/* What alpm_trans_get_add() named once the target was added: it is a
+ * borrowed list, and one transaction's must not be served for the next. */
+static char last_target[128];
 
 static int add_and_commit(alpm_handle_t *h, alpm_pkg_t *p, const char **stage)
 {
@@ -193,6 +216,10 @@ static int add_and_commit(alpm_handle_t *h, alpm_pkg_t *p, const char **stage)
 		alpm_trans_release(h);
 		return -1;
 	}
+	alpm_list_t *add = alpm_trans_get_add(h);
+	snprintf(last_target, sizeof(last_target), "%s",
+		 add && add->data ? alpm_pkg_get_name((alpm_pkg_t *)add->data)
+				  : "(none)");
 
 	*stage = "alpm_trans_prepare";
 	if (alpm_trans_prepare(h, &data) != 0) {
@@ -224,6 +251,30 @@ static int install(alpm_handle_t *h, const char *pkgfile, const char **stage)
 	if (alpm_pkg_load(h, pkgfile, 1, 0, &p) != 0 || !p)
 		return -1;
 	return add_and_commit(h, p, stage);
+}
+
+/* A transaction that is expected to be refused. Loads the files, adds them,
+ * and runs it as far as `stage` says; what comes back in `data`, and which
+ * errno explains it, is the caller's to check. The transaction is left open
+ * so that the data can be read while its packages are alive. */
+static int refuse(alpm_handle_t *h, const char **files, int nfiles,
+		  int commit, alpm_list_t **data)
+{
+	*data = NULL;
+	if (alpm_trans_init(h, 0) != 0)
+		return -1;
+	for (int i = 0; i < nfiles; i++) {
+		alpm_pkg_t *p = NULL;
+		if (alpm_pkg_load(h, files[i], 1, 0, &p) != 0 || !p
+		    || alpm_add_pkg(h, p) != 0)
+			return -1;
+	}
+	int rc = alpm_trans_prepare(h, data);
+	if (rc != 0 || !commit)
+		return rc;
+	alpm_list_free(*data);
+	*data = NULL;
+	return alpm_trans_commit(h, data);
 }
 
 /* ---- the root, from this process rather than through libalpm ---- */
@@ -295,6 +346,16 @@ int main(int argc, char **argv)
 	snprintf(rival_pkg, sizeof(rival_pkg),
 		 "%s/var/cache/pacman/pkg/alpmrpc-rival-1.0-1-x86_64.pkg.tar.zst",
 		 posix_root);
+	char needy_pkg[1024], alien_pkg[1024], squatter_pkg[1024];
+	snprintf(needy_pkg, sizeof(needy_pkg),
+		 "%s/var/cache/pacman/pkg/alpmrpc-needy-1.0-1-x86_64.pkg.tar.zst",
+		 posix_root);
+	snprintf(alien_pkg, sizeof(alien_pkg),
+		 "%s/var/cache/pacman/pkg/alpmrpc-alien-1.0-1-alien.pkg.tar.zst",
+		 posix_root);
+	snprintf(squatter_pkg, sizeof(squatter_pkg),
+		 "%s/var/cache/pacman/pkg/"
+		 "alpmrpc-squatter-1.0-1-x86_64.pkg.tar.zst", posix_root);
 
 	printf("root %s\n\n", posix_root);
 
@@ -328,6 +389,8 @@ int main(int argc, char **argv)
 	if (rc != 0)
 		printf("       failed at %s\n", stage);
 	check(installed_count(h) == 1, "one package is now installed", NULL);
+	check(!strcmp(last_target, "alpmrpc-base"),
+	      "alpm_trans_get_add() named the target", last_target);
 	check(op_install == 1, "ALPM_EVENT_PACKAGE_OPERATION_START (install)",
 	      NULL);
 	/* progresscb has been carried since callbacks went in, but nothing
@@ -394,6 +457,174 @@ int main(int argc, char **argv)
 	      == NULL, "and does not find one it does not", NULL);
 	check(fl != NULL && alpm_pkg_get_files(installed) == fl,
 	      "a repeat call is the same pointer", "borrowed, so cached");
+	check(localdb && alpm_get_localdb(h) == localdb,
+	      "and so is the db itself, asked for again",
+	      "the same object is the same id");
+	alpm_list_t *held = localdb ? alpm_db_get_pkgcache(localdb) : NULL;
+	check(held && alpm_list_count(held) == 1
+	      && (alpm_pkg_t *)held->data == installed,
+	      "the pkgcache lists that same package object", NULL);
+
+	/* ---- the one batched field a setter changes ---- */
+
+	printf("\n-- a batched field that a setter changes --\n");
+	/* The install reason is the one package field a setter changes. Its
+	 * column is what alpm_pkg_set_reason drops, and nothing else is. */
+	check(installed
+	      && alpm_pkg_get_reason(installed) == ALPM_PKG_REASON_EXPLICIT,
+	      "alpm_pkg_get_reason() reads explicit", NULL);
+	int src = installed
+		? alpm_pkg_set_reason(installed, ALPM_PKG_REASON_DEPEND) : -1;
+	check(src == 0, "alpm_pkg_set_reason(depend)",
+	      src == 0 ? NULL : trans_err(h));
+	check(installed
+	      && alpm_pkg_get_reason(installed) == ALPM_PKG_REASON_DEPEND,
+	      "and the column re-reads it", "that column was dropped");
+	check(localdb && alpm_db_get_pkgcache(localdb) == held,
+	      "and nothing else was touched", "the pkgcache is the same list");
+
+	/* ---- the refusals, each with a differently typed list ----
+	 *
+	 * The header's comment on alpm_trans_prepare names alpm_depmissing_t,
+	 * but what `data` holds depends on why the call failed: pacman's own
+	 * reader switches on alpm_errno() to tell, and so must this bridge.
+	 * Reading a conflict as a depmissing is a crash, so each kind is
+	 * driven for real. The packages that provoke them are in the fixture
+	 * for no other reason. */
+
+	printf("\n-- refused: a missing dependency --\n");
+	{
+		const char *files[] = { needy_pkg };
+		alpm_list_t *data = NULL;
+		int prc = refuse(h, files, 1, 0, &data);
+		check(remove_pkgs_questions == 1,
+		      "libalpm first asked ALPM_QUESTION_REMOVE_PKGS",
+		      remove_pkgs_first);
+		check(!strcmp(remove_pkgs_first, "alpmrpc-needy"),
+		      "naming the package, as a usable handle in a list", NULL);
+		check(prc != 0 && alpm_errno(h) == ALPM_ERR_UNSATISFIED_DEPS,
+		      "refusing that, prepare fails with "
+		      "ALPM_ERR_UNSATISFIED_DEPS", trans_err(h));
+		check(alpm_list_count(data) == 1,
+		      "and data lists the one missing dependency", NULL);
+		if (data) {
+			alpm_depmissing_t *m = (alpm_depmissing_t *)data->data;
+			check(m->target && !strcmp(m->target, "alpmrpc-needy"),
+			      "as an alpm_depmissing_t naming the target",
+			      m->target);
+			check(m->depend && m->depend->name
+			      && !strcmp(m->depend->name, "alpmrpc-missing"),
+			      "and what it wanted",
+			      m->depend ? m->depend->name : NULL);
+			for (alpm_list_t *l = data; l; l = l->next)
+				alpm_depmissing_free((alpm_depmissing_t *)l->data);
+			alpm_list_free(data);
+		}
+		alpm_trans_release(h);
+	}
+
+	printf("\n-- refused: conflicting targets --\n");
+	/* Both packages that conflict by name in one transaction: neither can
+	 * be dropped in favour of the other, so this is an error rather than
+	 * a question, and data holds alpm_conflict_t. */
+	{
+		const char *files[] = { base_pkg, rival_pkg };
+		alpm_list_t *data = NULL;
+		int prc = refuse(h, files, 2, 0, &data);
+		check(prc != 0 && alpm_errno(h) == ALPM_ERR_CONFLICTING_DEPS,
+		      "prepare fails with ALPM_ERR_CONFLICTING_DEPS",
+		      trans_err(h));
+		check(alpm_list_count(data) == 1,
+		      "and data lists the one conflict", NULL);
+		if (data) {
+			alpm_conflict_t *cf = (alpm_conflict_t *)data->data;
+			const char *n1 = cf->package1
+				? alpm_pkg_get_name(cf->package1) : NULL;
+			const char *n2 = cf->package2
+				? alpm_pkg_get_name(cf->package2) : NULL;
+			snprintf(buf, sizeof(buf), "%s vs %s", n1 ? n1 : "?",
+				 n2 ? n2 : "?");
+			check(n1 && n2 && strstr(n1, "alpmrpc-")
+			      && strstr(n2, "alpmrpc-"),
+			      "as an alpm_conflict_t whose packages are usable",
+			      buf);
+			/* libalpm makes copies of the packages for a conflict
+			 * it hands to its caller, so these are not the objects
+			 * that were added; they are readable until the
+			 * conflict is freed, which for the copies on the
+			 * server side means until the handle is released. */
+			check(n1 && n2
+			      && ((!strcmp(n1, "alpmrpc-rival")
+				   && !strcmp(n2, "alpmrpc-base"))
+				  || (!strcmp(n1, "alpmrpc-base")
+				      && !strcmp(n2, "alpmrpc-rival"))),
+			      "and they are the two that were added",
+			      "as copies made for the caller");
+			check(cf->reason && cf->reason->name
+			      && !strcmp(cf->reason->name, "alpmrpc-base"),
+			      "with the depend that says so as the reason",
+			      cf->reason ? cf->reason->name : NULL);
+			for (alpm_list_t *l = data; l; l = l->next)
+				alpm_conflict_free((alpm_conflict_t *)l->data);
+			alpm_list_free(data);
+		}
+		alpm_trans_release(h);
+	}
+
+	printf("\n-- refused: a foreign architecture --\n");
+	{
+		const char *files[] = { alien_pkg };
+		alpm_list_t *data = NULL;
+		int prc = refuse(h, files, 1, 0, &data);
+		check(prc != 0 && alpm_errno(h) == ALPM_ERR_PKG_INVALID_ARCH,
+		      "prepare fails with ALPM_ERR_PKG_INVALID_ARCH",
+		      trans_err(h));
+		check(alpm_list_count(data) == 1,
+		      "and data lists the one package", NULL);
+		if (data) {
+			const char *s = (const char *)data->data;
+			check(s && !strcmp(s, "alpmrpc-alien-1.0-1-alien"),
+			      "as a plain string, name-version-arch", s);
+			alpm_list_free_inner(data, free);
+			alpm_list_free(data);
+		}
+		alpm_trans_release(h);
+	}
+
+	printf("\n-- refused: a file an installed package owns --\n");
+	/* alpmrpc-squatter ships the file alpmrpc-base already has. Nothing
+	 * conflicts by name, so prepare passes and it is the commit that
+	 * refuses, with alpm_fileconflict_t in data. */
+	{
+		const char *files[] = { squatter_pkg };
+		alpm_list_t *data = NULL;
+		int crc = refuse(h, files, 1, 1, &data);
+		check(crc != 0 && alpm_errno(h) == ALPM_ERR_FILE_CONFLICTS,
+		      "commit fails with ALPM_ERR_FILE_CONFLICTS",
+		      trans_err(h));
+		check(alpm_list_count(data) == 1,
+		      "and data lists the one file conflict", NULL);
+		if (data) {
+			alpm_fileconflict_t *fc =
+				(alpm_fileconflict_t *)data->data;
+			check(fc->target
+			      && !strcmp(fc->target, "alpmrpc-squatter"),
+			      "as an alpm_fileconflict_t naming the target",
+			      fc->target);
+			check(fc->file && strstr(fc->file, "alpmrpc-base.txt"),
+			      "and the file", fc->file);
+			check(fc->ctarget
+			      && !strcmp(fc->ctarget, "alpmrpc-base"),
+			      "and who owns it", fc->ctarget);
+			for (alpm_list_t *l = data; l; l = l->next)
+				alpm_fileconflict_free(
+					(alpm_fileconflict_t *)l->data);
+			alpm_list_free(data);
+		}
+		alpm_trans_release(h);
+		check(installed_count(h) == 1, "and nothing was installed",
+		      NULL);
+	}
 
 	/* ---- the conflict, which is a question ---- */
 
@@ -404,6 +635,9 @@ int main(int argc, char **argv)
 	      rc == 0 ? NULL : trans_err(h));
 	if (rc != 0)
 		printf("       failed at %s\n", stage);
+	check(!strcmp(last_target, "alpmrpc-rival"),
+	      "alpm_trans_get_add() named this transaction's target",
+	      last_target);
 
 	check(questions > before, "a question reached the callback",
 	      questions > before ? "first one ever to" : "none fired");
@@ -420,6 +654,28 @@ int main(int argc, char **argv)
 	check(op_remove == 1, "answering yes removed the conflicting package",
 	      NULL);
 	check(installed_count(h) == 1, "one package installed, not two", NULL);
+
+	/* The pkgcache fetched before the commit is a borrowed list. libalpm
+	 * rewrote it; a re-read has to see that, and the earlier list has to
+	 * stay readable, because natively it would be the same memory. */
+	alpm_list_t *now = localdb ? alpm_db_get_pkgcache(localdb) : NULL;
+	check(now && now != held,
+	      "alpm_db_get_pkgcache() re-read after the commit",
+	      "not the list from before it");
+	check(now && now->data
+	      && !strcmp(alpm_pkg_get_name((alpm_pkg_t *)now->data),
+			 "alpmrpc-rival"),
+	      "and it lists what is installed now",
+	      now && now->data ? alpm_pkg_get_name((alpm_pkg_t *)now->data)
+			       : NULL);
+	check(held && alpm_list_count(held) == 1,
+	      "the list from before is still readable memory",
+	      "detached, not freed");
+	/* A numeric field, because those are re-read after a commit; a string
+	 * a caller already holds is kept, as libalpm's would be. */
+	check(alpm_pkg_get_isize(installed) == 0,
+	      "the package the commit removed no longer resolves",
+	      "its id was dropped, so a fresh read misses");
 
 	slurp(win_root, "alpmrpc-scriptlet.log", log, sizeof(log));
 	check(strstr(log, "alpmrpc-base pre_remove") != NULL,
@@ -742,8 +998,14 @@ int main(int argc, char **argv)
 	const char *root = alpm_option_get_root(h);
 	check(root != NULL, "an ordinary call still works after committing",
 	      root);
+	check(fl && fl->count > 1 && fl->files[0].name,
+	      "and a list borrowed before the commits is still readable",
+	      "the handle it belongs to is still open");
 
 	alpm_release(h);
+	size_t left = arpc_stats_cached();
+	snprintf(buf, sizeof(buf), "%zu left", left);
+	check(left == 0, "the last release left nothing cached", buf);
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");
 	return failures ? 1 : 0;

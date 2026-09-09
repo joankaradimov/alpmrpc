@@ -14,16 +14,16 @@ import clang.cindex as cx
 
 # --- type classification ---------------------------------------------------
 
-SCALARS = {
-    "int", "unsigned int", "long", "unsigned long", "long long",
-    "unsigned long long", "short", "unsigned short", "char", "signed char",
-    "unsigned char", "size_t", "ssize_t", "off_t", "time_t", "mode_t",
-    "uid_t", "gid_t", "double", "float", "_Bool",
-}
-
-
-def _decl_of(t):
-    return t.get_canonical().get_declaration()
+# Every arithmetic type crosses as a 64-bit integer. A typedef -- size_t,
+# off_t, time_t -- is looked at through its canonical type, so this is a set
+# of clang's kinds rather than a list of names.
+SCALAR_KINDS = (
+    cx.TypeKind.INT, cx.TypeKind.UINT, cx.TypeKind.LONG, cx.TypeKind.ULONG,
+    cx.TypeKind.LONGLONG, cx.TypeKind.ULONGLONG, cx.TypeKind.SHORT,
+    cx.TypeKind.USHORT, cx.TypeKind.DOUBLE, cx.TypeKind.FLOAT,
+    cx.TypeKind.BOOL, cx.TypeKind.SCHAR, cx.TypeKind.UCHAR,
+    cx.TypeKind.CHAR_S, cx.TypeKind.CHAR_U,
+)
 
 
 def _is_opaque_record(t):
@@ -53,13 +53,7 @@ def classify(t):
     if canon.kind == cx.TypeKind.ENUM:
         return "enum", {"enum": canon.get_declaration().spelling or t.spelling}
 
-    if canon.spelling in SCALARS or canon.kind in (
-        cx.TypeKind.INT, cx.TypeKind.UINT, cx.TypeKind.LONG,
-        cx.TypeKind.ULONG, cx.TypeKind.LONGLONG, cx.TypeKind.ULONGLONG,
-        cx.TypeKind.SHORT, cx.TypeKind.USHORT, cx.TypeKind.DOUBLE,
-        cx.TypeKind.FLOAT, cx.TypeKind.BOOL, cx.TypeKind.SCHAR,
-        cx.TypeKind.UCHAR, cx.TypeKind.CHAR_S,
-    ):
+    if canon.kind in SCALAR_KINDS:
         return "scalar", {}
 
     # A defined struct held by value, not through a pointer -- a field like
@@ -111,10 +105,7 @@ def classify(t):
         # pointer-to-scalar / pointer-to-enum -> candidate out-param
         if pc.kind == cx.TypeKind.ENUM:
             return "ptr_enum", {"enum": pc.get_declaration().spelling}
-        if pc.spelling in SCALARS or pc.kind in (
-            cx.TypeKind.INT, cx.TypeKind.UINT, cx.TypeKind.LONG,
-            cx.TypeKind.ULONG, cx.TypeKind.ULONGLONG, cx.TypeKind.LONGLONG,
-        ):
+        if pc.kind in SCALAR_KINDS:
             return "ptr_scalar", {"base": pc.spelling}
 
         # char** , alpm_list_t** , struct**
@@ -143,10 +134,17 @@ def extract(header, args):
                          "that did not parse cleanly")
 
     hdr_real = os.path.realpath(header)
-    funcs, records, enums, callbacks = [], [], [], []
+    funcs, records, enums, callbacks, list_funcs = [], [], [], [], []
 
     for c in tu.cursor.get_children():
         if not c.location.file:
+            continue
+        # alpm_list.h is not part of the wire -- the client links the real
+        # implementation -- but its functions are part of the DLL's export
+        # table, which is generated from this model.
+        if os.path.basename(c.location.file.name) == "alpm_list.h":
+            if c.kind == cx.CursorKind.FUNCTION_DECL:
+                list_funcs.append(c.spelling)
             continue
         if os.path.realpath(c.location.file.name) != hdr_real:
             continue
@@ -223,7 +221,7 @@ def extract(header, args):
 
     return {"header": header, "functions": funcs,
             "records": records, "enums": enums,
-            "callbacks": callbacks}
+            "callbacks": callbacks, "list_functions": list_funcs}
 
 
 def main():

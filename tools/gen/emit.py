@@ -201,7 +201,9 @@ def is_batchable(fn):
     p = fn["params"][0]
     if p["kind"] != "handle" or "alpm_pkg_t" not in p["c_type"]:
         return False
-    return fn["ret"]["kind"] in ("string", "scalar", "enum")
+    # A handle too -- alpm_pkg_get_db -- now that the same object always
+    # gets the same id, so a column of them is as stable as one of names.
+    return fn["ret"]["kind"] in ("string", "scalar", "enum", "handle")
 
 
 def counted_array(rec):
@@ -254,13 +256,6 @@ def byte_buffer(fn, pname):
         raise SystemExit("overlay: %s has no length param %r for "
                          "byte_buffers.%s" % (fn["name"], ln, pname))
     return ln
-
-
-def byte_lengths(fn):
-    """The length parameters of this function's byte buffers, which carry no
-    wire field of their own: the decoded buffer is what says how long it is."""
-    return {byte_buffer(fn, p["name"]) for p in fn["params"]
-            if byte_buffer(fn, p["name"])}
 
 
 def variadic_fmt(fn):
@@ -447,6 +442,318 @@ def out_params_of(name):
     return OVERLAY["functions"].get(name, {}).get("out_params", [])
 
 
+def out_list_by_errno(fname, pname):
+    """An out-list whose element type depends on why the call failed.
+
+    alpm_trans_prepare's `data` holds depmissings for unsatisfied deps,
+    conflicts for conflicting ones and package names for a bad arch, and
+    alpm_trans_commit's holds file conflicts or file names. The header doc
+    names one of them; the reference reader, pacman's sync_prepare(),
+    switches on alpm_errno() to tell. So does the generated code: the server
+    reads the errno after the call and sends it beside the list, and the
+    client picks the materialiser by it. Returns [(errno, elem)] or None."""
+    m = OVERLAY.get("out_list_elem_by_errno", {}).get(fname + "." + pname)
+    if not m:
+        return None
+    out = []
+    for err, t in m.items():
+        e = elem_of(t)
+        if e is None:
+            raise SystemExit("overlay: out_list_elem_by_errno.%s.%s: %r is "
+                             "not a type that crosses" % (fname, pname, t))
+        out.append((err, e))
+    return out
+
+
+def out_list_elems(fname, pname):
+    """Every element type an out-list parameter can carry."""
+    by_err = out_list_by_errno(fname, pname)
+    if by_err:
+        return [e for _, e in by_err]
+    e = param_elem(fname, pname)
+    return [e] if e else []
+
+
+def errno_handle_param(fn):
+    """The handle whose errno says what an errno-typed list carries."""
+    for p in fn["params"]:
+        if p["kind"] == "handle" and handle_tag(p["c_type"]) == "ARPC_H_HANDLE":
+            return p["name"]
+    raise SystemExit("emit: %s has an errno-typed out-list but no "
+                     "alpm_handle_t to read the errno from" % fn["name"])
+
+
+def server_hooks(fn):
+    """Calls that make libalpm free objects the handle table still points
+    at. The header cannot say which, so the overlay lists them, and the
+    generated handler brackets the call with a pre and a post hook written
+    by hand in arpc_invalidate.c."""
+    return fn["name"] in OVERLAY.get("server_hooks", {})
+
+
+GENERATED = {}          # name -> function, for every function emitted
+
+
+def invalidation_of(fn):
+    """What a call detaches from the client's caches, or None.
+
+    libalpm hands back the same list for repeated calls, so the client
+    caches them; a setter replaces one, an add appends to it, a transaction
+    rewrites the package cache. The overlay's rules.invalidates says which
+    calls change anything and, for each, exactly which cached results -- by
+    the getter's name, derived from the setter's where the naming allows and
+    stated where it does not -- and under which owner. Naming only what can
+    change is what keeps the pile of detached entries small, since they live
+    until the handle goes. Detached, not freed: after an add the old pointer
+    is still valid memory natively, and a caller may be holding it."""
+    spec = OVERLAY["rules"].get("invalidates", {})
+    n = fn["name"]
+    if not re.match(spec["match"], n):
+        if n in spec:
+            raise SystemExit("overlay: rules.invalidates names %s, which does "
+                             "not match its own `match`" % n)
+        return None
+
+    entry = spec.get(n)
+    derived = False
+    if entry is None:
+        for rule in spec.get("derive", []):
+            m = re.match(rule["match"], n)
+            if m:
+                entry = {"keys": [m.expand(k) for k in rule["keys"]]}
+                derived = True
+                break
+    if entry is None:
+        raise SystemExit("overlay: %s changes something, and rules.invalidates "
+                         "does not say what it detaches" % n)
+
+    keys = []
+    for k in entry.get("keys", []):
+        if k.startswith("^"):
+            found = sorted(g for g in GENERATED if re.match(k, g))
+        else:
+            found = [k] if k in GENERATED else []
+        if not found and not derived:
+            raise SystemExit("overlay: rules.invalidates.%s: %r names no "
+                             "generated function" % (n, k))
+        keys.extend(f for f in found if f not in keys)
+    if entry.get("keys") and not keys:
+        raise SystemExit("overlay: %s: none of %s is a generated getter; the "
+                         "naming rule does not fit it, so say what it detaches"
+                         % (n, entry["keys"]))
+
+    columns = entry.get("columns", [])
+    for c in columns:
+        if c not in GENERATED or not is_batchable(GENERATED[c]):
+            raise SystemExit("overlay: rules.invalidates.%s: %r is not a "
+                             "batched package field" % (n, c))
+        if GENERATED[c]["ret"]["kind"] not in ("scalar", "enum"):
+            raise SystemExit("overlay: rules.invalidates.%s: %r is a %s "
+                             "column, which cannot be dropped: a caller may "
+                             "hold a pointer into it"
+                             % (n, c, GENERATED[c]["ret"]["kind"]))
+
+    under = entry.get("under", "self")
+    if under not in ("self", "root"):
+        p = next((p for p in fn["params"] if p["name"] == under), None)
+        pe = param_elem(n, under) if p else None
+        if not p or p["kind"] != "list" or not pe or pe["kind"] != "handle":
+            raise SystemExit("overlay: rules.invalidates.%s: `under` must be "
+                             "self, root or a handle-list parameter, not %r"
+                             % (n, under))
+    return {"under": under, "keys": keys, "columns": columns}
+
+
+def cache_key_code(fn, first_handle):
+    """The cache key for a borrowed result: the function's name, and if it
+    takes anything but its handle, those arguments too -- alpm_db_get_group
+    is one group per name, not one per db. Returns (setup code, key)."""
+    extra = [p for p in fn["params"] if p["name"] != first_handle]
+    if not extra:
+        return "", qq(fn["name"])
+    fmt, args = [], []
+    for p in extra:
+        if p["kind"] == "string":
+            fmt.append("%s")
+            args.append('%s ? %s : ""' % (p["name"], p["name"]))
+        elif p["kind"] in ("scalar", "enum"):
+            fmt.append("%lld")
+            args.append("(long long)%s" % p["name"])
+        elif p["kind"] == "handle":
+            fmt.append("%llu")
+            args.append("(unsigned long long)ARPC_ID(%s)" % p["name"])
+        else:
+            raise SystemExit("emit: %s: a borrowed result cannot be keyed on "
+                             "its %s parameter %s"
+                             % (fn["name"], p["kind"], p["name"]))
+    code = ("\t/* One result per argument, not one per handle. */\n"
+            "\tchar arpc_key[512];\n"
+            "\tsnprintf(arpc_key, sizeof(arpc_key), \"%s:%s\", %s);\n"
+            % (fn["name"], ":".join(fmt), ", ".join(args)))
+    return code, "arpc_key"
+
+
+def emit_def(model):
+    """The DLL's export table, from the model: every function alpm.h
+    declares and the alpm_list API beside it, and nothing else. A function
+    the generator did not produce and nobody wrote by hand then fails the
+    link, by name, rather than going quietly missing from the DLL."""
+    o = ["; GENERATED by tools/gen/emit.py from %s -- DO NOT EDIT.\n"
+         % model["header"],
+         ";\n"
+         "; Exactly libalpm's exports: every function alpm.h declares, and the\n"
+         "; alpm_list API. One that is missing from the build fails the link\n"
+         "; here, by name, rather than going quietly missing from the DLL.\n"
+         "EXPORTS\n"]
+    for fn in model["functions"]:
+        o.append("    %s\n" % fn["name"])
+    for name in model.get("list_functions", []):
+        o.append("    %s\n" % name)
+    o.append("    ; Not libalpm's: the bridge's own cache count, for its tests.\n"
+             "    arpc_stats_cached\n")
+    return "".join(o)
+
+
+def elem_tag(e):
+    return e["tag"] if e and e["kind"] == "handle" else None
+
+
+# Which handle a new object is filed under. Objects form a tree -- a package
+# belongs to its db, a db to its handle, a changelog cursor to its package --
+# and releasing a node releases what is under it.
+PARENT_TAG = {
+    "ARPC_H_PKG": "ARPC_H_DB",
+    "ARPC_H_DB": "ARPC_H_HANDLE",
+    "ARPC_H_CHANGELOG": "ARPC_H_PKG",
+}
+
+
+def owner_expr(fn, for_tag):
+    """The server-side expression for the owner of an object this call
+    produces, of tag `for_tag` (None for a record, which may hold packages).
+
+    Its natural parent when the call has one: a package returned by
+    alpm_db_get_pkg() goes under that db. Failing that, walk up from the
+    first handle parameter to the parent's level -- a package from
+    alpm_pkg_load() goes under the handle, a db from alpm_pkg_get_db() under
+    the package's handle. Failing that, the same from the first element of
+    the first handle-list parameter, which is all alpm_find_group_pkgs()
+    has. Failing that, nobody's, and it lives until the server exits."""
+    want = PARENT_TAG.get(for_tag or "ARPC_H_PKG")
+    handles = [(i, handle_tag(p["c_type"]))
+               for i, p in enumerate(fn["params"]) if p["kind"] == "handle"]
+    lists = []
+    for i, p in enumerate(fn["params"]):
+        if p["kind"] == "list":
+            e = param_elem(fn["name"], p["name"])
+            if e and e["kind"] == "handle":
+                lists.append((i, e["tag"]))
+    for i, tag in handles:
+        if tag == want:
+            return "arpc_arg_id(rq, %d)" % i
+    for i, tag in lists:
+        if tag == want:
+            return "arpc_list_owner(rq, %d)" % i
+    level = want or "ARPC_H_NONE"
+    if handles:
+        return "arpc_ancestor(arpc_arg_id(rq, %d), %s)" % (handles[0][0], level)
+    if lists:
+        return ("arpc_ancestor(arpc_list_owner(rq, %d), %s)"
+                % (lists[0][0], level))
+    return "0"
+
+
+def record_has_handles(rec):
+    return any(f["kind"] == "handle" for f in rec["fields"])
+
+
+def free_elems_code(e, var, indent, owner):
+    """Release the elements of a caller-owned list the server has put on
+    the wire: strings with free(), handles not at all, being libalpm's own
+    objects, and a record with the libalpm function that frees it -- which
+    client_local already pairs with the record.
+
+    Except a record that holds handles. A conflict's packages are copies
+    libalpm made for its caller, and the client now holds ids into them, so
+    freeing the conflict here would free what it was just handed. Such a
+    record is adopted instead: filed under `owner`, and freed with it."""
+    t = "\t" * indent
+    if e["kind"] == "string":
+        return "%salpm_list_free_inner(%s, free);\n" % (t, var)
+    if e["kind"] == "record":
+        ff = libalpm_free_fn(e["c_type"])
+        if not ff:
+            raise SystemExit("emit: no libalpm free function known for a "
+                             "caller-owned list of %s" % e["c_type"])
+        if record_has_handles(e["record"]):
+            return ("%s/* holds copies of packages the client now has ids\n"
+                    "%s * for: kept, under the handle, until it goes */\n"
+                    "%sfor (alpm_list_t *l = %s; l; l = l->next)\n"
+                    "%s\tarpc_handle_adopt(l->data, %s, adopt_free_%s);\n"
+                    % (t, t, t, var, t, owner, e["name"]))
+        return ("%sfor (alpm_list_t *l = %s; l; l = l->next)\n"
+                "%s\t%s((%s)l->data);\n" % (t, var, t, ff, e["c_type"]))
+    return ""
+
+
+def emit_adopt_wrappers(need):
+    """alpm_list_fn_free takes void*, and calling a record's free function
+    through that type would be undefined -- so an adopted record's release
+    is a wrapper, one per record that can be adopted."""
+    o = []
+    for e in need:
+        ff = libalpm_free_fn(e["c_type"])
+        if ff and record_has_handles(e["record"]):
+            o.append("ARPC_MAYBE_UNUSED static void adopt_free_%s(void *p)\n"
+                     "{\n\t%s((%s)p);\n}\n\n" % (e["name"], ff, e["c_type"]))
+    return "".join(o)
+
+
+def emit_cb_record_handle_drops(spec, urec, pn):
+    """Handles reached through a record in a callback's payload are
+    libalpm's temporaries -- a conflict's packages are copies made for the
+    question -- and are freed once the callback returns. Their ids go with
+    it, so a later use misses instead of reaching freed memory."""
+    by_member = {}
+    for val, member in spec.get("members", {}).items():
+        by_member.setdefault(member, []).append(val)
+    cases = []
+    for member, vals in by_member.items():
+        variant = cb_variant(next(f["c_type"] for f in urec["fields"]
+                                  if f["name"] == member))
+        drops = []
+        for f in variant["fields"]:
+            if f["kind"] != "struct_ptr":
+                continue
+            sub = elem_of(f["c_type"])
+            if not sub or sub["kind"] != "record":
+                continue
+            for hf in sub["record"]["fields"]:
+                if hf["kind"] == "handle":
+                    drops.append((f["name"], hf["name"],
+                                  handle_tag(hf["c_type"])))
+        if drops:
+            cases.append((sorted(vals), member, drops))
+    if not cases:
+        return ""
+    o = ["\t/* Handles reached through a record in the payload are\n"
+         "\t * libalpm's temporaries -- a conflict's packages are copies\n"
+         "\t * made for the question -- and are freed once this returns.\n"
+         "\t * Their ids go now, so a later use misses instead of reaching\n"
+         "\t * freed memory. */\n"]
+    o.append("\tswitch (%s->%s) {\n" % (pn, urec["fields"][0]["name"]))
+    for vals, member, drops in cases:
+        for v in vals:
+            o.append("\tcase %s:\n" % v)
+        for fname, hname, tag in drops:
+            o.append("\t\tif (%s->%s.%s)\n"
+                     "\t\t\tarpc_handle_drop_ptr(%s->%s.%s->%s, %s);\n"
+                     % (pn, member, fname, pn, member, fname, hname, tag))
+        o.append("\t\tbreak;\n")
+    o.append("\tdefault:\n\t\tbreak;\n\t}\n")
+    return "".join(o)
+
+
 # --- selection -------------------------------------------------------------
 
 
@@ -508,10 +815,11 @@ def select(model):
                     why = "pointer param with undeclared direction: " + p["name"]
             elif k == "ptr_list":
                 # libalpm fills these and hands ownership to the caller, so
-                # they need an element type like any other list.
+                # they need an element type like any other list -- or one
+                # per errno, where what is in it depends on what went wrong.
                 if p["name"] not in outs:
                     why = "list out-param not declared: " + p["name"]
-                elif param_elem(n, p["name"]) is None:
+                elif not out_list_elems(n, p["name"]):
                     why = "list out-param with no element type: " + p["name"]
             elif k == "struct_ptr":
                 r = record_unsupported_reason(p["c_type"])
@@ -612,7 +920,7 @@ def records_input(gen):
 
 def records_needed(gen, extra=()):
     """Every record the server writes and the client reads, transitively."""
-    need, queue = {}, list(extra)
+    queue = list(extra)
     for fn in gen:
         e = ret_elem(fn["name"])
         if e and e["kind"] == "record":
@@ -626,31 +934,15 @@ def records_needed(gen, extra=()):
         if cl:
             queue.append(cl)        # its free helper has to exist
         for p in fn["params"]:
-            if p["kind"] in ("list", "ptr_list"):
-                pe = param_elem(fn["name"], p["name"])
-                if pe and pe["kind"] == "record":
-                    queue.append(pe)
+            elems = []
+            if p["kind"] == "list":
+                elems = [param_elem(fn["name"], p["name"])]
+            elif p["kind"] == "ptr_list":
+                elems = out_list_elems(fn["name"], p["name"])
             elif p["kind"] == "struct_ptr":
-                e = elem_of(p["c_type"])
-                if e and e["kind"] == "record":
-                    queue.append(e)
-    while queue:
-        e = queue.pop()
-        rec = e["record"]
-        if rec["name"] in need:
-            continue
-        need[rec["name"]] = e
-        for f in carried_fields(rec):
-            if f["kind"] in ("struct_ptr", "record_value"):
-                sub = elem_of(f["c_type"])
-                if sub and sub["kind"] == "record":
-                    queue.append(sub)
-            elif f["kind"] == "list":
-                sub = field_list_elem(rec["name"], f["name"])
-                if sub and sub["kind"] == "record":
-                    queue.append(sub)
-    # deepest first, so a helper is defined before it is used
-    return list(need.values())
+                elems = [elem_of(p["c_type"])]
+            queue.extend(e for e in elems if e and e["kind"] == "record")
+    return _close_over_records(queue)
 
 
 # --- emission --------------------------------------------------------------
@@ -752,9 +1044,13 @@ def collect_elems(gen, need):
         add(ret_elem(fn["name"]))
         for p in fn["params"]:
             # ptr_list is an out-param, but it needs the same writer and
-            # builder as any other list of that element type.
-            if p["kind"] in ("list", "ptr_list"):
+            # builder as any other list of that element type -- one per
+            # errno, where what it carries depends on what went wrong.
+            if p["kind"] == "list":
                 add(param_elem(fn["name"], p["name"]))
+            elif p["kind"] == "ptr_list":
+                for e in out_list_elems(fn["name"], p["name"]):
+                    add(e)
     for e in need:
         for f in e["record"]["fields"]:
             if f["kind"] == "list":
@@ -798,6 +1094,13 @@ def emit_server_readers(rin):
                 sub = elem_of(f["c_type"])
                 o.append("\tv->%s = read_%s(rq, %s);\n"
                          % (f["name"], sub["name"], node))
+            else:
+                # Rather than leave the field zeroed and hope: a record that
+                # goes in with a list or a by-value struct in it needs a
+                # reader written for that, and the build should say so.
+                raise SystemExit("emit: %s.%s is a %s field, which cannot "
+                                 "be read back off the wire yet"
+                                 % (rec["name"], f["name"], f["kind"]))
         o.append("\treturn v;\n}\n\n")
 
         o.append("static void drop_%s(%s v)\n{\n" % (e["name"], ct))
@@ -840,7 +1143,9 @@ def emit_client_writers(rin):
                 sub = elem_of(f["c_type"])
                 o.append("\tput_%s(c, v->%s);\n" % (sub["name"], f["name"]))
             else:
-                o.append("\tarpc_put_null(c);\n")
+                raise SystemExit("emit: %s.%s is a %s field, which cannot "
+                                 "be sent yet" % (rec["name"], f["name"],
+                                                  f["kind"]))
         o.append("\tarpc_obj_end(c);\n}\n\n")
     return "".join(o)
 
@@ -942,11 +1247,20 @@ def emit_pkg_batch(gen):
                  + "		return %d;" % i + NL)
     o.append("	return -1;" + NL + "}" + NL + NL)
 
-    o.append("static void pkg_field_put(aj_w *w, alpm_pkg_t *p, int idx)"
-             + NL + "{" + NL + "	switch (idx) {" + NL)
+    o.append("static void pkg_field_put(aj_w *w, alpm_pkg_t *p, uint64_t id, "
+             "int idx)" + NL + "{" + NL + "	(void)id;" + NL
+             + "	switch (idx) {" + NL)
     for i, f in enumerate(fields):
         if f["ret"]["kind"] == "string":
             o.append("	case %d: ajw_str(w, %s(p)); break;" % (i, f["name"]) + NL)
+        elif f["ret"]["kind"] == "handle":
+            # Filed where a call returning it would file it: under the
+            # package's ancestor of the right kind.
+            tag = handle_tag(f["ret"]["c_type"])
+            o.append("	case %d: ajw_i64(w, (long long)arpc_handle_put(%s(p), %s,"
+                     % (i, f["name"], tag) + NL
+                     + "			arpc_ancestor(id, %s))); break;"
+                     % PARENT_TAG.get(tag, "ARPC_H_NONE") + NL)
         else:
             o.append("	case %d: ajw_i64(w, (long long)%s(p)); break;"
                      % (i, f["name"]) + NL)
@@ -964,14 +1278,15 @@ def emit_pkg_batch(gen):
     o.append("	arpc_ret_begin(rs);" + NL)
     o.append("	aj_w *w = arpc_res_writer(rs);" + NL)
     o.append("	ajw_arr_begin(w);" + NL)
-    o.append("	int n = arpc_node_count(rq, ids);" + NL)
-    o.append("	for (int i = 0; i < n; i++) {" + NL)
-    o.append("		uint64_t id = (uint64_t)arpc_node_i64(rq," + NL
-             + "				arpc_node_elem(rq, ids, i));" + NL)
+    o.append("	/* One walk: indexing restarts from the head each time, and" + NL)
+    o.append("	 * a column is as long as the package list. */" + NL)
+    o.append("	for (int e = arpc_node_first(rq, ids); e >= 0;" + NL
+             + "	     e = arpc_node_next(rq, e)) {" + NL)
+    o.append("		uint64_t id = (uint64_t)arpc_node_i64(rq, e);" + NL)
     o.append("		alpm_pkg_t *p = (alpm_pkg_t *)arpc_handle_get(id, "
              "ARPC_H_PKG);" + NL)
     o.append("		if (!p)" + NL + "			ajw_null(w);" + NL)
-    o.append("		else" + NL + "			pkg_field_put(w, p, idx);" + NL)
+    o.append("		else" + NL + "			pkg_field_put(w, p, id, idx);" + NL)
     o.append("	}" + NL + "	ajw_arr_end(w);" + NL + "	return 0;" + NL
              + "}" + NL + NL)
     return "".join(o)
@@ -1105,6 +1420,8 @@ def emit_cb_server(model):
             o.append("\t/* Whatever the caller set is readable here whichever\n"
                      "\t * variant arrived: the aliasing libalpm documents. */\n")
             o.append("\t%s->%s.%s = (int)r;\n" % (up["name"], anym, ans))
+        if up:
+            o.append(emit_cb_record_handle_drops(spec, urec, up["name"]))
         if rk == "void":
             o.append("\t(void)r;\n")
         else:
@@ -1174,6 +1491,343 @@ def emit_cb_void_put(spec, pn):
     return "".join(o)
 
 
+# ---- one server handler ----
+#
+# Five steps, each appending C: read the arguments and declare the
+# out-params; refuse the call if any argument failed to cross; make the call
+# and put its return on the wire; put the out-params on the wire; drop what
+# was made along the way. What a later step needs from an earlier one -- the
+# arguments in call order, the temporaries, the out-params by kind -- travels
+# in one dict.
+
+
+def srv_args(fn, o):
+    """Read the arguments off the request, in order, and declare the
+    out-params. Returns the pieces the rest of the handler needs."""
+    n = fn["name"]
+    h = {"args": [], "temps": [], "struct_temps": [], "byte_temps": [],
+         "byte_checks": [], "out_buf": None, "out_lists": [],
+         "out_handles": [], "out_bytes": [], "out_structs": []}
+    args = h["args"]
+    # length parameter -> the buffer it measures, so the call is handed
+    # the length that was actually decoded
+    blen_owner = {byte_buffer(fn, p["name"]): p["name"]
+                  for p in fn["params"] if byte_buffer(fn, p["name"])}
+    outs_here = set(out_params_of(n))
+    for i, p in enumerate(fn["params"]):
+        k, pn, ct = p["kind"], p["name"], p["c_type"]
+        if pn in outs_here:
+            # Declared and passed by the out-param block below. Only a
+            # struct_ptr can reach here, being the one kind that is a
+            # legitimate input as well.
+            continue
+        bb = byte_buffer(fn, pn)
+        if bb and k == "string":
+            # An input buffer: base64 in, malloc'd bytes out, freed after
+            # the call. The decoded length is what libalpm is told, and
+            # the length that travelled alongside is checked against it
+            # rather than believed.
+            o.append("\tsize_t %s_n = 0;\n" % pn)
+            o.append("\tunsigned char *%s = arpc_arg_bytes(rq, %d, "
+                     "&%s_n);\n" % (pn, i, pn))
+            args.append("(%s)%s" % (ct, pn))
+            h["byte_temps"].append(pn)
+            h["byte_checks"].append((pn, bb))
+            continue
+        if k == "string":
+            o.append("\tconst char *%s = arpc_arg_str(rq, %d);\n" % (pn, i))
+            args.append(pn)
+        elif k in ("scalar", "enum"):
+            o.append("\tlong long %s = arpc_arg_i64(rq, %d);\n" % (pn, i))
+            args.append("%s_n" % blen_owner[pn] if pn in blen_owner
+                        else "(%s)%s" % (ct, pn))
+        elif k == "handle":
+            o.append("\t%s %s = (%s)arpc_arg_handle(rq, %d, %s);\n"
+                     % (ct, pn, ct, i, handle_tag(ct)))
+            args.append(pn)
+        elif k == "struct_ptr":
+            e = elem_of(ct)
+            o.append("\t%s %s = read_%s(rq, arpc_arg_node(rq, %d));\n"
+                     % (e["c_type"], pn, e["name"], i))
+            args.append(pn)
+            h["struct_temps"].append((pn, e["name"]))
+        elif k == "list":
+            e = param_elem(n, pn)
+            o.append("\talpm_list_t *%s = take_list_%s(rq, %d);\n"
+                     % (pn, e["name"], i))
+            args.append(pn)
+            h["temps"].append((pn, e["name"]))
+        elif k == "opaque_void" and opaque_handle(fn, pn):
+            o.append("\tvoid *%s = arpc_arg_handle(rq, %d, %s);\n"
+                     % (pn, i, opaque_handle(fn, pn)))
+            args.append(pn)
+        elif k == "opaque_void" and out_buffer(fn, pn):
+            # Declared after the loop: it is sized by a parameter that
+            # has not been read yet at this point.
+            h["out_buf"] = (pn, out_buffer(fn, pn))
+            args.append(pn)
+
+    if h["out_buf"]:
+        bn, sn = h["out_buf"]
+        o.append("\t/* The caller's buffer is on the other side of the\n"
+                 "\t * pipe, so libalpm fills one here and the bytes go\n"
+                 "\t * back with the count. */\n")
+        o.append("\tunsigned char *%s = (%s > 0 && %s < (1 << 24))\n"
+                 "\t\t\t? (unsigned char *)malloc((size_t)%s) : NULL;\n"
+                 % (bn, sn, sn, sn))
+
+    for op in out_params_of(n):
+        for p in fn["params"]:
+            if p["name"] != op:
+                continue
+            if p["kind"] == "ptr_string":
+                # A byte buffer libalpm allocates for its caller, and the
+                # server is that caller: it goes out base64 and is freed
+                # here, because nothing on the client can free it.
+                o.append("\tunsigned char *%s_v = NULL;\n" % op)
+                args.append("&%s_v" % op)
+                h["out_bytes"].append((op, byte_buffer(fn, op)))
+            elif p["kind"] == "ptr_list":
+                o.append("\talpm_list_t *%s_v = NULL;\n" % op)
+                args.append("&%s_v" % op)
+                if not out_list_by_errno(n, op):
+                    h["out_lists"].append((op, param_elem(n, op)))
+            elif p["kind"] == "ptr_handle":
+                # alpm_pkg_t ** -> alpm_pkg_t *: one level of
+                # indirection off, not every trailing star.
+                inner = p["c_type"][:-1].strip()
+                o.append("\t%s %s_v = NULL;\n" % (inner, op))
+                args.append("&%s_v" % op)
+                h["out_handles"].append((op, handle_tag(inner)))
+            elif p["kind"] == "struct_ptr":
+                # A struct libalpm fills in place. The caller's copy is
+                # on the other side of the pipe, so one is provided here
+                # and serialised afterwards.
+                o.append("\t%s %s_v;\n"
+                         % (base_type(p["c_type"]), op))
+                o.append("\tmemset(&%s_v, 0, sizeof(%s_v));\n" % (op, op))
+                args.append("&%s_v" % op)
+                h["out_structs"].append((op, elem_of(p["c_type"]),
+                                         libalpm_clear_fn(p["c_type"])))
+            else:
+                inner = p["c_type"].rstrip(" *")
+                o.append("\t%s %s_v = 0;\n" % (inner, op))
+                args.append("&%s_v" % op)
+    return h
+
+
+def srv_check(fn, o, h):
+    """Refuse the call if any argument failed to cross, letting go of what
+    was made so far."""
+    o.append("\tif (arpc_req_bad(rq)")
+    if h["out_buf"]:
+        o.append("\n\t    || (%s > 0 && !%s)" % (h["out_buf"][1], h["out_buf"][0]))
+    for bn, ln in h["byte_checks"]:
+        # The length that travelled and the length that decoded have to
+        # agree. They do by construction, so a disagreement means the
+        # frame is not what it claims and libalpm is not told about it.
+        o.append("\n\t    || (size_t)%s != %s_n" % (ln, bn))
+    o.append(") {\n")
+    for tn, te in h["temps"]:
+        o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
+    for tn, te in h["struct_temps"]:
+        o.append("\t\tdrop_%s(%s);\n" % (te, tn))
+    for tn in h["byte_temps"]:
+        o.append("\t\tfree(%s);\n" % tn)
+    if h["out_buf"]:
+        o.append("\t\tfree(%s);\n" % h["out_buf"][0])
+    o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
+             + qq(fn["name"] + ": bad arguments") + ");\n\t}\n")
+
+
+def srv_call(fn, o, h):
+    """The call, its return on the wire, and any out-list whose element
+    type the errno decides."""
+    n = fn["name"]
+    # The client already formatted the `...` away, so what arrived is
+    # text. It goes to libalpm as an argument to a literal "%s", never as
+    # the format itself -- a % that came out of the formatting is data.
+    vfmt = variadic_fmt(fn)
+    args = h["args"]
+    if vfmt:
+        args = [('"%s", ' + a) if a == vfmt else a for a in args]
+
+    call = "%s(%s)" % (n, ", ".join(args))
+    rk, rct = fn["ret"]["kind"], fn["ret"]["c_type"]
+    hooked = h["hooked"] = server_hooks(fn)
+    err_lists = [(op, out_list_by_errno(n, op)) for op in out_params_of(n)
+                 if out_list_by_errno(n, op)]
+    if (hooked or err_lists) and rk not in ("scalar", "enum"):
+        raise SystemExit("emit: %s: hooks and errno-typed lists need an "
+                         "int return to judge the call by" % n)
+
+    if hooked:
+        o.append("\t/* libalpm is about to free objects the table points\n"
+                 "\t * at; the hooks note them first and drop them after.\n"
+                 "\t * See arpc_invalidate.c. */\n")
+        o.append("\tvoid *arpc_hook = arpc_hook_%s_pre(rq);\n" % n)
+
+    if rk == "opaque_void":
+        owner = owner_expr(fn, opaque_handle(fn, "@return"))
+        o.append("\tvoid *r = %s;\n" % call)
+        o.append("\t/* Not data: an object this server is holding open,\n"
+                 "\t * so it goes back as an id like any other handle. */\n")
+        o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
+                 % (opaque_handle(fn, "@return"), owner))
+    elif rk == "void":
+        o.append("\t%s;\n\tarpc_ret_null(rs);\n" % call)
+    elif rk in ("scalar", "enum"):
+        if h["out_buf"]:
+            bn, _ = h["out_buf"]
+            o.append("\tsize_t r = (size_t)%s;\n" % call)
+            o.append("\tarpc_ret_i64(rs, (long long)r);\n")
+            o.append("\tarpc_out_bytes(rs, " + qq(bn) + ", %s, r);\n" % bn)
+            o.append("\tfree(%s);\n" % bn)
+        elif hooked or err_lists:
+            o.append("\tlong long arpc_rc = (long long)%s;\n" % call)
+            o.append("\tarpc_ret_i64(rs, arpc_rc);\n")
+        else:
+            o.append("\tarpc_ret_i64(rs, (long long)%s);\n" % call)
+    elif rk == "string":
+        if ret_string_owned(fn):
+            o.append("\tchar *r = %s;\n" % call)
+            o.append("\tarpc_ret_str(rs, r);\n")
+            o.append("\tfree(r);\t/* header says char*: caller-owned */\n")
+        else:
+            o.append("\tarpc_ret_str(rs, %s);\n" % call)
+    elif rk == "handle":
+        owner = owner_expr(fn, handle_tag(rct))
+        o.append("\t%s r = %s;\n" % (rct, call))
+        o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
+                 % (handle_tag(rct), owner))
+    elif rk == "struct_ptr":
+        e = elem_of(rct)
+        o.append("\t%s r = %s;\n" % (rct, call))
+        o.append("\tarpc_ret_begin(rs);\n")
+        o.append("\tput_%s(arpc_res_writer(rs), r, %s);\n"
+                 % (e["name"], owner_expr(fn, None)))
+        if struct_own(n) == "caller":
+            ff = libalpm_free_fn(rct)
+            o.append("\t/* overlay says caller-owned; the server is the\n"
+                     "\t * caller that made it, so it frees it here */\n")
+            o.append("\t%s(r);\n" % (ff or "free"))
+    elif rk == "list":
+        e = ret_elem(n)
+        own = list_ownership(n)
+        o.append("\talpm_list_t *r = %s;\n" % call)
+        o.append("\tarpc_ret_begin(rs);\n")
+        o.append("\tput_list_%s(arpc_res_writer(rs), r, %s);\n"
+                 % (e["name"], owner_expr(fn, elem_tag(e))))
+        if own == "caller":
+            o.append("\t/* overlay says caller-owned: the server is that "
+                     "caller */\n")
+            o.append(free_elems_code(e, "r", 1,
+                                     owner_expr(fn, elem_tag(e))))
+            o.append("\talpm_list_free(r);\n")
+
+    # An out-list whose element type depends on the errno. The errno is
+    # read before anything else can reset it, and travels alongside.
+    for op, by_err in err_lists:
+        hp = errno_handle_param(fn)
+        o.append("\t/* What %s holds depends on why the call failed.\n"
+                 "\t * pacman's own reader switches on the errno, and so\n"
+                 "\t * does the client, so it travels beside the list. */\n"
+                 % op)
+        o.append("\talpm_errno_t %s_err = alpm_errno(%s);\n" % (op, hp))
+        o.append("\tarpc_out_i64(rs, " + qq(op + ".errno")
+                 + ", (long long)%s_err);\n" % op)
+        o.append("\tswitch (%s_err) {\n" % op)
+        for err, e in by_err:
+            own = owner_expr(fn, elem_tag(e))
+            o.append("\tcase %s:\n" % err)
+            o.append("\t\tput_list_%s(arpc_out_writer(rs, " % e["name"]
+                     + qq(op) + "), %s_v, %s);\n" % (op, own))
+            o.append(free_elems_code(e, op + "_v", 2, own))
+            o.append("\t\tbreak;\n")
+        o.append("\tdefault:\n")
+        o.append("\t\t/* Empty, or an errno this list was not said to\n"
+                 "\t\t * carry anything for: not ours to interpret. */\n")
+        o.append("\t\tajw_null(arpc_out_writer(rs, " + qq(op) + "));\n")
+        o.append("\t\tbreak;\n\t}\n")
+        o.append("\talpm_list_free(%s_v);\n" % op)
+
+
+def srv_outs(fn, o, h):
+    """The out-params on the wire, then the post hook."""
+    n = fn["name"]
+    out_list_names = [x[0] for x in h["out_lists"]]
+    out_handle_tags = dict(h["out_handles"])
+    out_byte_len = dict(h["out_bytes"])
+    out_struct_map = {x[0]: x for x in h["out_structs"]}
+    for op in out_params_of(n):
+        if op in out_list_names or out_list_by_errno(n, op):
+            continue
+        if op in out_struct_map:
+            _, e, clearfn = out_struct_map[op]
+            o.append("\tput_%s(arpc_out_writer(rs, " % e["name"]
+                     + qq(op) + "), &%s_v, %s);\n"
+                     % (op, owner_expr(fn, None)))
+            o.append("\t/* libalpm filled it for its caller to release,\n"
+                     "\t * and here that caller is the server. */\n")
+            o.append("\t%s(&%s_v);\n" % (clearfn or "(void)", op))
+            continue
+        if op in out_byte_len.values():
+            # The buffer's own length says how long it is; sending it
+            # twice would only create something to disagree with.
+            continue
+        if op in out_byte_len:
+            o.append("\tarpc_out_bytes(rs, " + qq(op)
+                     + ", %s_v, %s_v);\n" % (op, out_byte_len[op]))
+            o.append("\tfree(%s_v);\t/* libalpm says the caller frees "
+                     "it, and that is us */\n" % op)
+            continue
+        if op in out_handle_tags:
+            # A handle handed back through a pointer is filed exactly
+            # like a returned one: an id under the same owner, so it
+            # dies with that owner and cannot be mistaken for a pointer.
+            o.append("\tarpc_out_i64(rs, " + qq(op)
+                     + ", (long long)arpc_handle_put(%s_v, %s, %s));\n"
+                     % (op, out_handle_tags[op],
+                        owner_expr(fn, out_handle_tags[op])))
+            continue
+        o.append("\tarpc_out_i64(rs, " + qq(op) + ", (long long)%s_v);\n"
+                 % op)
+    for op, e in h["out_lists"]:
+        own = owner_expr(fn, elem_tag(e))
+        o.append("\tput_list_%s(arpc_out_writer(rs, " % e["name"]
+                 + qq(op) + "), %s_v, %s);\n" % (op, own))
+        o.append("\t/* libalpm filled this for us to own, so it goes once\n"
+                 "\t * it is on the wire. */\n")
+        o.append(free_elems_code(e, op + "_v", 1, own))
+        o.append("\talpm_list_free(%s_v);\n" % op)
+
+    if h["hooked"]:
+        o.append("\tarpc_hook_%s_post(rq, arpc_hook, arpc_rc);\n" % n)
+
+
+def srv_finish(fn, o, h):
+    """Drop the temporaries, and the ids this call retired."""
+    spec = OVERLAY["functions"].get(fn["name"], {})
+    for tn, te in h["temps"]:
+        o.append("\tdrop_list_%s(%s);\n" % (te, tn))
+    for tn, te in h["struct_temps"]:
+        o.append("\tdrop_%s(%s);\n" % (te, tn))
+    for tn in h["byte_temps"]:
+        o.append("\tfree(%s);\n" % tn)
+
+    if spec.get("destroys"):
+        o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
+    if spec.get("closes"):
+        ci = next(i for i, p in enumerate(fn["params"])
+                  if p["name"] == spec["closes"])
+        o.append("\t/* libalpm has closed it, so the id goes too: a later\n"
+                 "\t * use then misses instead of reaching a freed "
+                 "cursor. */\n")
+        o.append("\tarpc_handle_drop(arpc_arg_id(rq, %d));\n" % ci)
+
+    o.append("\treturn 0;\n}\n\n")
+
+
 def emit_server(model, gen, need, rin, src_header):
     o = [BANNER % src_header]
     o.append('#include "arpc_server.h"\n')
@@ -1184,6 +1838,7 @@ def emit_server(model, gen, need, rin, src_header):
              "#else\n#  define ARPC_MAYBE_UNUSED\n#endif\n\n")
     elems = collect_elems(gen, need)
     o.append(emit_server_helpers(need, elems))
+    o.append(emit_adopt_wrappers(need))
     o.append(emit_server_readers(rin))
     o.append(emit_server_list_writers(elems, param_elems_of(gen)))
 
@@ -1191,290 +1846,34 @@ def emit_server(model, gen, need, rin, src_header):
         n = fn["name"]
         if client_local_record(n) or client_local_clear_record(n):
             continue    # handled entirely on the client; never reaches here
-        spec = OVERLAY["functions"].get(n, {})
         o.append("static int h_%s(arpc_req *rq, arpc_res *rs)\n{\n" % n)
-
-        args, temps, struct_temps, byte_temps = [], [], [], []
-        # length parameter -> the buffer it measures, so the call is handed
-        # the length that was actually decoded
-        blen_owner = {byte_buffer(fn, p["name"]): p["name"]
-                      for p in fn["params"] if byte_buffer(fn, p["name"])}
-        byte_checks = []
-        out_buf = None
-        outs_here = set(out_params_of(n))
-        for i, p in enumerate(fn["params"]):
-            k, pn, ct = p["kind"], p["name"], p["c_type"]
-            if pn in outs_here:
-                # Declared and passed by the out-param block below. Only a
-                # struct_ptr can reach here, being the one kind that is a
-                # legitimate input as well.
-                continue
-            bb = byte_buffer(fn, pn)
-            if bb and k == "string":
-                # An input buffer: base64 in, malloc'd bytes out, freed after
-                # the call. The decoded length is what libalpm is told, and
-                # the length that travelled alongside is checked against it
-                # rather than believed.
-                o.append("\tsize_t %s_n = 0;\n" % pn)
-                o.append("\tunsigned char *%s = arpc_arg_bytes(rq, %d, "
-                         "&%s_n);\n" % (pn, i, pn))
-                args.append("(%s)%s" % (ct, pn))
-                byte_temps.append(pn)
-                byte_checks.append((pn, bb))
-                continue
-            if k == "string":
-                o.append("\tconst char *%s = arpc_arg_str(rq, %d);\n" % (pn, i))
-                args.append(pn)
-            elif k in ("scalar", "enum"):
-                o.append("\tlong long %s = arpc_arg_i64(rq, %d);\n" % (pn, i))
-                args.append("%s_n" % blen_owner[pn] if pn in blen_owner
-                            else "(%s)%s" % (ct, pn))
-            elif k == "handle":
-                o.append("\t%s %s = (%s)arpc_arg_handle(rq, %d, %s);\n"
-                         % (ct, pn, ct, i, handle_tag(ct)))
-                args.append(pn)
-            elif k == "struct_ptr":
-                e = elem_of(ct)
-                o.append("\t%s %s = read_%s(rq, arpc_arg_node(rq, %d));\n"
-                         % (e["c_type"], pn, e["name"], i))
-                args.append(pn)
-                struct_temps.append((pn, e["name"]))
-            elif k == "list":
-                e = param_elem(n, pn)
-                o.append("\talpm_list_t *%s = take_list_%s(rq, %d);\n"
-                         % (pn, e["name"], i))
-                args.append(pn)
-                temps.append((pn, e["name"]))
-            elif k == "opaque_void" and opaque_handle(fn, pn):
-                o.append("\tvoid *%s = arpc_arg_handle(rq, %d, %s);\n"
-                         % (pn, i, opaque_handle(fn, pn)))
-                args.append(pn)
-            elif k == "opaque_void" and out_buffer(fn, pn):
-                # Declared after the loop: it is sized by a parameter that
-                # has not been read yet at this point.
-                out_buf = (pn, out_buffer(fn, pn))
-                args.append(pn)
-
-        if out_buf:
-            bn, sn = out_buf
-            o.append("\t/* The caller's buffer is on the other side of the\n"
-                     "\t * pipe, so libalpm fills one here and the bytes go\n"
-                     "\t * back with the count. */\n")
-            o.append("\tunsigned char *%s = (%s > 0 && %s < (1 << 24))\n"
-                     "\t\t\t? (unsigned char *)malloc((size_t)%s) : NULL;\n"
-                     % (bn, sn, sn, sn))
-
-        out_lists = []
-        out_handles = []
-        out_bytes = []
-        out_structs = []
-        for op in out_params_of(n):
-            for p in fn["params"]:
-                if p["name"] != op:
-                    continue
-                if p["kind"] == "ptr_string":
-                    # A byte buffer libalpm allocates for its caller, and the
-                    # server is that caller: it goes out base64 and is freed
-                    # here, because nothing on the client can free it.
-                    o.append("\tunsigned char *%s_v = NULL;\n" % op)
-                    args.append("&%s_v" % op)
-                    out_bytes.append((op, byte_buffer(fn, op)))
-                elif p["kind"] == "ptr_list":
-                    o.append("\talpm_list_t *%s_v = NULL;\n" % op)
-                    args.append("&%s_v" % op)
-                    out_lists.append((op, param_elem(n, op)))
-                elif p["kind"] == "ptr_handle":
-                    # alpm_pkg_t ** -> alpm_pkg_t *: one level of
-                    # indirection off, not every trailing star.
-                    inner = p["c_type"][:-1].strip()
-                    o.append("\t%s %s_v = NULL;\n" % (inner, op))
-                    args.append("&%s_v" % op)
-                    out_handles.append((op, handle_tag(inner)))
-                elif p["kind"] == "struct_ptr":
-                    # A struct libalpm fills in place. The caller's copy is
-                    # on the other side of the pipe, so one is provided here
-                    # and serialised afterwards.
-                    o.append("\t%s %s_v;\n"
-                             % (base_type(p["c_type"]), op))
-                    o.append("\tmemset(&%s_v, 0, sizeof(%s_v));\n" % (op, op))
-                    args.append("&%s_v" % op)
-                    out_structs.append((op, elem_of(p["c_type"]),
-                                        libalpm_clear_fn(p["c_type"])))
-                else:
-                    inner = p["c_type"].rstrip(" *")
-                    o.append("\t%s %s_v = 0;\n" % (inner, op))
-                    args.append("&%s_v" % op)
-
-        o.append("\tif (arpc_req_bad(rq)")
-        if out_buf:
-            o.append("\n\t    || (%s > 0 && !%s)" % (out_buf[1], out_buf[0]))
-        for bn, ln in byte_checks:
-            # The length that travelled and the length that decoded have to
-            # agree. They do by construction, so a disagreement means the
-            # frame is not what it claims and libalpm is not told about it.
-            o.append("\n\t    || (size_t)%s != %s_n" % (ln, bn))
-        o.append(") {\n")
-        for tn, te in temps:
-            o.append("\t\tdrop_list_%s(%s);\n" % (te, tn))
-        for tn, te in struct_temps:
-            o.append("\t\tdrop_%s(%s);\n" % (te, tn))
-        for tn in byte_temps:
-            o.append("\t\tfree(%s);\n" % tn)
-        if out_buf:
-            o.append("\t\tfree(%s);\n" % out_buf[0])
-        o.append("\t\treturn arpc_fail(rs, ARPC_E_INVALID_PARAMS,\n\t\t\t"
-                 + qq(n + ": bad arguments") + ");\n\t}\n")
-
-        # The client already formatted the `...` away, so what arrived is
-        # text. It goes to libalpm as an argument to a literal "%s", never as
-        # the format itself -- a % that came out of the formatting is data.
-        vfmt = variadic_fmt(fn)
-        if vfmt:
-            args = [('"%s", ' + a) if a == vfmt else a for a in args]
-
-        call = "%s(%s)" % (n, ", ".join(args))
-        rk, rct = fn["ret"]["kind"], fn["ret"]["c_type"]
-
-        # the owner a returned handle or list element should be filed under
-        owner = "0"
-        for i, p in enumerate(fn["params"]):
-            if p["kind"] != "handle":
-                continue
-            owner = ("arpc_arg_id(rq, %d)" % i
-                     if handle_tag(p["c_type"]) == "ARPC_H_HANDLE"
-                     else "arpc_owner_of(arpc_arg_id(rq, %d))" % i)
-            break
-
-        if rk == "opaque_void":
-            o.append("\tvoid *r = %s;\n" % call)
-            o.append("\t/* Not data: an object this server is holding open,\n"
-                     "\t * so it goes back as an id like any other handle. */\n")
-            o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
-                     % (opaque_handle(fn, "@return"), owner))
-        elif rk == "void":
-            o.append("\t%s;\n\tarpc_ret_null(rs);\n" % call)
-        elif rk in ("scalar", "enum"):
-            if out_buf:
-                bn, _ = out_buf
-                o.append("\tsize_t r = (size_t)%s;\n" % call)
-                o.append("\tarpc_ret_i64(rs, (long long)r);\n")
-                o.append("\tarpc_out_bytes(rs, " + qq(bn) + ", %s, r);\n" % bn)
-                o.append("\tfree(%s);\n" % bn)
-            else:
-                o.append("\tarpc_ret_i64(rs, (long long)%s);\n" % call)
-        elif rk == "string":
-            if ret_string_owned(fn):
-                o.append("\tchar *r = %s;\n" % call)
-                o.append("\tarpc_ret_str(rs, r);\n")
-                o.append("\tfree(r);\t/* header says char*: caller-owned */\n")
-            else:
-                o.append("\tarpc_ret_str(rs, %s);\n" % call)
-        elif rk == "handle":
-            o.append("\t%s r = %s;\n" % (rct, call))
-            o.append("\tarpc_ret_handle(rs, arpc_handle_put(r, %s, %s));\n"
-                     % (handle_tag(rct), owner))
-        elif rk == "struct_ptr":
-            e = elem_of(rct)
-            o.append("\t%s r = %s;\n" % (rct, call))
-            o.append("\tarpc_ret_begin(rs);\n")
-            o.append("\tput_%s(arpc_res_writer(rs), r, %s);\n"
-                     % (e["name"], owner))
-            if struct_own(n) == "caller":
-                ff = libalpm_free_fn(rct)
-                o.append("\t/* overlay says caller-owned; the server is the\n"
-                         "\t * caller that made it, so it frees it here */\n")
-                o.append("\t%s(r);\n" % (ff or "free"))
-        elif rk == "list":
-            e = ret_elem(n)
-            own = list_ownership(n)
-            o.append("\talpm_list_t *r = %s;\n" % call)
-            o.append("\tarpc_ret_begin(rs);\n")
-            o.append("\tput_list_%s(arpc_res_writer(rs), r, %s);\n"
-                     % (e["name"], owner))
-            if own == "caller":
-                o.append("\t/* overlay says caller-owned: the server is that "
-                         "caller */\n")
-                if e["kind"] == "string":
-                    o.append("\talpm_list_free_inner(r, free);\n")
-                o.append("\talpm_list_free(r);\n")
-
-        out_list_names = [x[0] for x in out_lists]
-        out_handle_tags = dict(out_handles)
-        out_byte_len = dict(out_bytes)
-        out_struct_map = {x[0]: x for x in out_structs}
-        for op in out_params_of(n):
-            if op in out_list_names:
-                continue
-            if op in out_struct_map:
-                _, e, clearfn = out_struct_map[op]
-                o.append("\tput_%s(arpc_out_writer(rs, " % e["name"]
-                         + qq(op) + "), &%s_v, %s);\n" % (op, owner))
-                o.append("\t/* libalpm filled it for its caller to release,\n"
-                         "\t * and here that caller is the server. */\n")
-                o.append("\t%s(&%s_v);\n" % (clearfn or "(void)", op))
-                continue
-            if op in out_byte_len.values():
-                # The buffer's own length says how long it is; sending it
-                # twice would only create something to disagree with.
-                continue
-            if op in out_byte_len:
-                o.append("\tarpc_out_bytes(rs, " + qq(op)
-                         + ", %s_v, %s_v);\n" % (op, out_byte_len[op]))
-                o.append("\tfree(%s_v);\t/* libalpm says the caller frees "
-                         "it, and that is us */\n" % op)
-                continue
-            if op in out_handle_tags:
-                # A handle handed back through a pointer is filed exactly
-                # like a returned one: an id under the same owner, so it
-                # dies with that owner and cannot be mistaken for a pointer.
-                o.append("\tarpc_out_i64(rs, " + qq(op)
-                         + ", (long long)arpc_handle_put(%s_v, %s, %s));\n"
-                         % (op, out_handle_tags[op], owner))
-                continue
-            o.append("\tarpc_out_i64(rs, " + qq(op) + ", (long long)%s_v);\n"
-                     % op)
-        for op, e in out_lists:
-            o.append("\tput_list_%s(arpc_out_writer(rs, " % e["name"]
-                     + qq(op) + "), %s_v, %s);\n" % (op, owner))
-            o.append("\t/* libalpm filled this for us to own, so it goes once\n"
-                     "\t * it is on the wire. */\n")
-            if e["kind"] == "string":
-                o.append("\talpm_list_free_inner(%s_v, free);\n" % op)
-            o.append("\talpm_list_free(%s_v);\n" % op)
-
-        for tn, te in temps:
-            o.append("\tdrop_list_%s(%s);\n" % (te, tn))
-        for tn, te in struct_temps:
-            o.append("\tdrop_%s(%s);\n" % (te, tn))
-        for tn in byte_temps:
-            o.append("\tfree(%s);\n" % tn)
-
-        if spec.get("destroys"):
-            o.append("\tarpc_handle_drop_owner(arpc_arg_id(rq, 0));\n")
-        if spec.get("closes"):
-            ci = next(i for i, p in enumerate(fn["params"])
-                      if p["name"] == spec["closes"])
-            o.append("\t/* libalpm has closed it, so the id goes too: a later\n"
-                     "\t * use then misses instead of reaching a freed "
-                     "cursor. */\n")
-            o.append("\tarpc_handle_drop(arpc_arg_id(rq, %d));\n" % ci)
-
-        o.append("\treturn 0;\n}\n\n")
+        h = srv_args(fn, o)
+        srv_check(fn, o, h)
+        srv_call(fn, o, h)
+        srv_outs(fn, o, h)
+        srv_finish(fn, o, h)
 
     o.append(emit_cb_server(model))
     o.append(emit_pkg_batch(gen))
 
-    o.append("const arpc_method arpc_methods[] = {\n")
+    methods = []
     if any(is_batchable(f) for f in gen):
         # Not a libalpm function: the one composite method, which returns a
         # single field for many packages at once.
-        o.append("\t{ " + qq("arpc.pkg_fields") + ", h_arpc_pkg_fields },\n")
+        methods.append(("arpc.pkg_fields", "h_arpc_pkg_fields"))
     for fn in gen:
         if client_local_record(fn["name"]) or \
                 client_local_clear_record(fn["name"]):
             continue
-        o.append("\t{ " + qq(fn["name"]) + ", h_%s },\n" % fn["name"])
+        methods.append((fn["name"], "h_" + fn["name"]))
+    # Sorted as strcmp sorts, by bytes, because the dispatcher bsearches it.
+    methods.sort(key=lambda m: m[0].encode())
+    o.append("/* Sorted by name: the dispatcher bsearches it. */\n")
+    o.append("const arpc_method arpc_methods[] = {\n")
+    for name, handler in methods:
+        o.append("\t{ " + qq(name) + ", %s },\n" % handler)
     o.append("\t{ NULL, NULL }\n};\n")
+    o.append("const size_t arpc_method_count = %d;\n" % len(methods))
     return "".join(o)
 
 
@@ -1625,6 +2024,12 @@ def emit_client_helpers(need, elems):
                      "\t * field can fetch that field for all of them. */\n")
             o.append("\tarpc_pkg_group_register(out);\n")
         o.append("\treturn out;\n}\n\n")
+        # How the cache releases a borrowed list of these, when its owner
+        # goes: the same shape as a record's free_*, so the cache need not
+        # know lists from structs.
+        o.append("ARPC_MAYBE_UNUSED static void free_list_%s(void *p)\n{\n"
+                 "\tarpc_free_list((alpm_list_t *)p, %s);\n}\n\n"
+                 % (e["name"], elem_free_fn(e)))
     return "".join(o)
 
 
@@ -1916,6 +2321,9 @@ def emit_client(model, gen, need, rin, src_header):
             if rk == "string":
                 o.append("\treturn arpc_pkg_field_str(ARPC_ID(%s), " % pn
                          + qq(n) + ");\n")
+            elif rk == "handle":
+                o.append("\treturn (%s)(uintptr_t)arpc_pkg_field_i64("
+                         "ARPC_ID(%s), " % (rct, pn) + qq(n) + ");\n")
             else:
                 o.append("\treturn (%s)arpc_pkg_field_i64(ARPC_ID(%s), "
                          % (rct, pn) + qq(n) + ");\n")
@@ -1937,6 +2345,12 @@ def emit_client(model, gen, need, rin, src_header):
             # count there is. These return a number of bytes, so nothing
             # read is the honest answer.
             fail = "return 0;"
+        if "fail" in spec:
+            # What to hand the caller when the server cannot be reached at
+            # all, where the kind's default would mislead: alpm_errno's zero
+            # says "no error", and alpm_strerror's NULL is a crash in the
+            # printf every frontend puts it through.
+            fail = "return (%s)(%s);" % (rct, spec["fail"])
 
         first_handle = None
         for p in fn["params"]:
@@ -1945,7 +2359,9 @@ def emit_client(model, gen, need, rin, src_header):
                 break
         owner = "ARPC_ID(%s)" % first_handle if first_handle else "0"
 
-        o.append("%s %s(%s)\n{\n\tarpc_call c;\n" % (rct, n, sig))
+        # The lock, for the whole of the call: see arpc_client.h.
+        o.append("%s %s(%s)\n{\n\tarpc_call c;\n\tarpc_enter();\n"
+                 % (rct, n, sig))
 
         if vfmt:
             o.append("\t/* The wire cannot carry `...`, and this is where\n"
@@ -1960,17 +2376,22 @@ def emit_client(model, gen, need, rin, src_header):
 
         # A borrowed list is looked up before the call, not after: libalpm
         # hands back the same pointer for repeated calls, and re-fetching
-        # would either break that or free a list the caller still holds.
-        if rk == "struct_ptr" and struct_own(n) == "borrowed":
-            o.append("\t%s cached = (%s)arpc_cached_ptr(%s, %s);\n"
-                     % (rct, rct, owner, qq(n)))
-            o.append("\tif (cached)\n\t\treturn cached;\n")
-        if rk == "list" and list_ownership(n) == "borrowed":
-            o.append("\talpm_list_t *cached = arpc_cached_list(%s, %s);\n"
-                     % (owner, qq(n)))
-            o.append("\tif (cached)\n\t\treturn cached;\n")
+        # would either break that or free a list the caller still holds. A
+        # cached NULL is an answer, an empty list, and is not fetched again.
+        borrowed_ptr = rk == "struct_ptr" and struct_own(n) == "borrowed"
+        borrowed_list = rk == "list" and list_ownership(n) == "borrowed"
+        cache_key = None
+        if borrowed_ptr or borrowed_list:
+            setup, cache_key = cache_key_code(fn, first_handle)
+            o.append(setup)
+        if borrowed_ptr or borrowed_list:
+            o.append("\tvoid *cached;\n")
+            o.append("\tif (arpc_cached(%s, %s, &cached)) {\n"
+                     "\t\tarpc_leave();\n\t\treturn (%s)cached;\n\t}\n"
+                     % (owner, cache_key, rct))
 
-        o.append("\tif (!arpc_begin(&c, " + qq(n) + "))\n\t\t%s\n" % fail)
+        o.append("\tif (!arpc_begin(&c, " + qq(n) + ")) {\n"
+                 "\t\tarpc_leave();\n\t\t%s\n\t}\n" % fail)
 
         for p in fn["params"]:
             k, pn = p["kind"], p["name"]
@@ -2008,8 +2429,8 @@ def emit_client(model, gen, need, rin, src_header):
                 # positional and the ones after it are read by index.
                 o.append("\tarpc_put_null(&c);\n")
 
-        o.append("\tif (!arpc_invoke(&c)) {\n\t\tarpc_end(&c);\n\t\t%s\n\t}\n"
-                 % fail)
+        o.append("\tif (!arpc_invoke(&c)) {\n\t\tarpc_end(&c);\n"
+                 "\t\tarpc_leave();\n\t\t%s\n\t}\n" % fail)
 
         for p in fn["params"]:
             ob = out_buffer(fn, p["name"])
@@ -2047,6 +2468,22 @@ def emit_client(model, gen, need, rin, src_header):
                              "\t\tfree(%s_v);\n" % (op, op, op, op))
                     o.append("\tif (%s)\n\t\t*%s = %s_n;\n"
                              % (blen, blen, op))
+                elif p["kind"] == "ptr_list" and out_list_by_errno(n, op):
+                    o.append("\tif (%s) {\n" % op)
+                    o.append("\t\t/* Which materialiser depends on why the\n"
+                             "\t\t * call failed; the server sent the errno\n"
+                             "\t\t * beside the list. */\n")
+                    o.append("\t\tint %s_node = arpc_out_node(&c, " % op
+                             + qq(op) + ");\n")
+                    o.append("\t\tswitch ((alpm_errno_t)arpc_out_i64(&c, "
+                             + qq(op + ".errno") + ")) {\n")
+                    for err, e in out_list_by_errno(n, op):
+                        o.append("\t\tcase %s:\n" % err)
+                        o.append("\t\t\t*%s = build_list_%s(arpc_doc(&c), "
+                                 "%s_node);\n" % (op, e["name"], op))
+                        o.append("\t\t\tbreak;\n")
+                    o.append("\t\tdefault:\n\t\t\t*%s = NULL;\n"
+                             "\t\t\tbreak;\n\t\t}\n\t}\n" % op)
                 elif p["kind"] == "ptr_list":
                     e = param_elem(n, op)
                     o.append("\tif (%s)\n\t\t*%s = build_list_%s("
@@ -2069,9 +2506,14 @@ def emit_client(model, gen, need, rin, src_header):
                     o.append("\tif (%s)\n\t\t*%s = (%s)(uintptr_t)"
                              "arpc_out_i64(&c, " % (op, op, inner)
                              + qq(op) + ");\n")
-                    if spec.get("creates"):
+                    if spec.get("creates") == "handle":
                         # The connection has to outlive what this made, the
-                        # same as a create that returns its handle.
+                        # same as a create that returns its handle. A
+                        # package lives under a handle that already holds
+                        # the connection, and would not be a ref of its own
+                        # even if it could: alpm_add_pkg hands a loaded
+                        # package to the transaction, which frees it, and
+                        # alpm_pkg_free is then never called to release it.
                         o.append("\tif (%s && *%s)\n\t\tarpc_conn_ref();\n"
                                  % (op, op))
                 else:
@@ -2079,43 +2521,87 @@ def emit_client(model, gen, need, rin, src_header):
                     o.append("\tif (%s)\n\t\t*%s = (%s)arpc_out_i64(&c, "
                              % (op, op, inner) + qq(op) + ");\n")
 
-        def teardown():
-            if spec.get("destroys") and first_handle:
-                o.append("\tarpc_purge_owner(ARPC_ID(%s));\n" % first_handle)
+        inv = invalidation_of(fn)
+
+        def after_call():
+            """Once the reply is in: what this call did to the caches, and
+            then the lock is let go."""
+            if not first_handle:
+                o.append("\tarpc_leave();\n")
+                return
+            if spec.get("destroys") == "handle":
+                o.append("\tarpc_purge_root(ARPC_ID(%s));\n" % first_handle)
                 o.append("\tarpc_conn_unref();\n")
+                o.append("\tarpc_leave();\n")
+                return
+            if spec.get("destroys"):
+                o.append("\tarpc_purge_owner(ARPC_ID(%s));\n" % first_handle)
+            if not inv:
+                o.append("\tarpc_leave();\n")
+                return
+            if inv["keys"]:
+                o.append("\t/* What this may have changed is detached, so the\n"
+                         "\t * next read of it fetches afresh. */\n")
+                o.append("\tstatic const char *const arpc_keys[] = {\n")
+                for k in inv["keys"]:
+                    o.append("\t\t" + qq(k) + ",\n")
+                o.append("\t\tNULL\n\t};\n")
+                if inv["under"] == "self":
+                    o.append("\tarpc_detach(ARPC_ID(%s), 0, arpc_keys);\n"
+                             % first_handle)
+                elif inv["under"] == "root":
+                    o.append("\tarpc_detach(ARPC_ID(%s), 1, arpc_keys);\n"
+                             % first_handle)
+                else:
+                    o.append("\tfor (const alpm_list_t *arpc_l = %s; arpc_l;\n"
+                             "\t     arpc_l = arpc_l->next)\n"
+                             "\t\tarpc_detach(ARPC_ID(arpc_l->data), 0, "
+                             "arpc_keys);\n" % inv["under"])
+            for col in inv["columns"]:
+                o.append("\tarpc_drop_column(ARPC_ID(%s), %s);\n"
+                         % (first_handle, qq(col)))
+            o.append("\tarpc_leave();\n")
 
         if rk == "opaque_void":
             o.append("\tvoid *r = (void *)(uintptr_t)arpc_ret_handle(&c);\n")
             o.append("\tarpc_end(&c);\n")
-            teardown()
+            after_call()
             o.append("\treturn r;\n")
         elif rk == "void":
             o.append("\tarpc_end(&c);\n")
-            teardown()
+            after_call()
         elif rk in ("scalar", "enum"):
             o.append("\t%s r = (%s)arpc_ret_i64(&c);\n" % (rct, rct))
             o.append("\tarpc_end(&c);\n")
-            teardown()
+            after_call()
             o.append("\treturn r;\n")
         elif rk == "string":
             if ret_string_owned(fn):
                 o.append("\tchar *r = arpc_take_str(&c);\t/* caller frees */\n")
                 o.append("\tarpc_end(&c);\n")
-                teardown()
+                after_call()
                 o.append("\treturn r;\n")
-            else:
+            elif first_handle:
                 o.append("\tconst char *r = arpc_intern_str(&c, %s, " % owner
                          + qq(n) + ");\n")
                 o.append("\tarpc_end(&c);\n")
-                teardown()
+                after_call()
+                o.append("\treturn r;\n")
+            else:
+                o.append("\t/* Nothing owns it and its value depends on the\n"
+                         "\t * arguments -- alpm_strerror -- so it is kept for\n"
+                         "\t * good, as libalpm's own static strings are. */\n")
+                o.append("\tconst char *r = arpc_intern_static(&c);\n")
+                o.append("\tarpc_end(&c);\n")
+                after_call()
                 o.append("\treturn r;\n")
         elif rk == "handle":
             o.append("\t%s r = (%s)(uintptr_t)arpc_ret_handle(&c);\n"
                      % (rct, rct))
             o.append("\tarpc_end(&c);\n")
-            if spec.get("creates"):
+            if spec.get("creates") == "handle":
                 o.append("\tif (r)\n\t\tarpc_conn_ref();\n")
-            teardown()
+            after_call()
             o.append("\treturn r;\n")
         elif rk == "struct_ptr":
             e = elem_of(rct)
@@ -2124,13 +2610,15 @@ def emit_client(model, gen, need, rin, src_header):
             o.append("\tarpc_end(&c);\n")
             if struct_own(n) == "borrowed":
                 o.append("\t/* Borrowed: lives as long as its owner, and\n"
-                         "\t * the caller must not free it. */\n")
-                o.append("\tarpc_cache_ptr(%s, %s, r, free_%s);\n"
-                         % (owner, qq(n), e["name"]))
+                         "\t * the caller must not free it. The cache says\n"
+                         "\t * which copy lives, in case a callback fetched\n"
+                         "\t * the same thing while this was in flight. */\n")
+                o.append("\tr = (%s)arpc_cache(%s, %s, r, free_%s);\n"
+                         % (rct, owner, cache_key, e["name"]))
             else:
                 o.append("\t/* Caller-owned: freed with %s. */\n"
                          % (libalpm_free_fn(rct) or "free"))
-            teardown()
+            after_call()
             o.append("\treturn r;\n")
         elif rk == "list":
             e = ret_elem(n)
@@ -2139,13 +2627,15 @@ def emit_client(model, gen, need, rin, src_header):
             o.append("\tarpc_end(&c);\n")
             if list_ownership(n) == "borrowed":
                 o.append("\t/* Borrowed: lives as long as its owner, and the\n"
-                         "\t * caller must not free it. */\n")
-                o.append("\tarpc_cache_list(%s, %s, r, %s);\n"
-                         % (owner, qq(n), elem_free_fn(e)))
+                         "\t * caller must not free it. The cache says which\n"
+                         "\t * copy lives, in case a callback fetched the same\n"
+                         "\t * thing while this was in flight. */\n")
+                o.append("\tr = (alpm_list_t *)arpc_cache(%s, %s, r, "
+                         "free_list_%s);\n" % (owner, cache_key, e["name"]))
             else:
                 o.append("\t/* Caller-owned: freed by the caller, per the\n"
                          "\t * usual libalpm idiom for this function. */\n")
-            teardown()
+            after_call()
             o.append("\treturn r;\n")
         o.append("}\n\n")
 
@@ -2198,8 +2688,27 @@ def main():
               "libalpm: %s (expected %s). Re-verify ownership before shipping."
               % (sorted(owned), sorted(expected)), file=sys.stderr)
 
+    # The errno an out-list's element type is keyed on has to be a real one:
+    # a typo here would be a variant that silently arrives empty.
+    errnos = set()
+    for e in model["enums"]:
+        if any(v["name"] == "ALPM_ERR_OK" for v in e["values"]):
+            errnos = {v["name"] for v in e["values"]}
+    for key, m in OVERLAY.get("out_list_elem_by_errno", {}).items():
+        if key.startswith("_"):
+            continue
+        for err in m:
+            if err not in errnos:
+                raise SystemExit("overlay: out_list_elem_by_errno.%s: %s is "
+                                 "not a value of alpm_errno_t" % (key, err))
+
     cb_validate(model)
     gen, skipped, cb_api = select(model)
+    GENERATED.update((f["name"], f) for f in gen)
+    for name in OVERLAY.get("server_hooks", {}):
+        if not name.startswith("_") and name not in GENERATED:
+            raise SystemExit("overlay: server_hooks names %s, which is not "
+                             "generated" % name)
     need = records_needed(gen, cb_seed_records(model))
     rin = records_input(gen)
     os.makedirs(a.outdir, exist_ok=True)
@@ -2210,6 +2719,7 @@ def main():
         ("arpc_stubs.c", emit_client(model, gen, need, rin,
                                     model["header"])),
         ("arpc_handle_tags.h", emit_handle_tags(model)),
+        ("alpm.def", emit_def(model)),
     )
     for name, text in files:
         with open(os.path.join(a.outdir, name), "w", encoding="utf-8") as fh:
@@ -2230,6 +2740,13 @@ def main():
             OVERLAY.get("record_fields_uncarried", {}).items() if "." in k},
         "skipped": {"count": len(skipped), "by_reason": reasons,
                     "detail": dict(skipped)},
+        # Calls that detach the client's borrowed caches, with what each
+        # detaches, and calls the server brackets with hooks: both come from
+        # the overlay, and both are worth seeing at a glance.
+        "invalidates": {f["name"]: invalidation_of(f) for f in gen
+                        if invalidation_of(f)},
+        "server_hooks": sorted(k for k in OVERLAY.get("server_hooks", {})
+                               if not k.startswith("_")),
     }
     with open(os.path.join(a.outdir, "coverage.json"), "w",
               encoding="utf-8") as fh:

@@ -12,7 +12,9 @@ libalpm's semantics, and the file is self-contained by design -- its own
 header says so, and it includes nothing but `stdlib.h`, `string.h` and
 `alpm_list.h`.
 
-The `alpm_list.h` in this pacman tree is byte-identical to the one installed
-by the libalpm the server links against, which is what makes this safe. If
-that ever stops being true, the build should fail rather than drift: see the
-header check in `src/client/CMakeLists.txt`.
+It was taken together with pacman 6.1.0's `alpm_list.h`, and it is compiled
+against the `alpm_list.h` the server's libalpm installs. Those have to be the
+same header, or the list this client builds is not the list libalpm walks.
+`alpm_list.h.sha256` is the digest of the header it was vendored with, and
+`src/client/CMakeLists.txt` checks the installed one against it at configure
+time: a mismatch fails the build and says to re-vendor both.

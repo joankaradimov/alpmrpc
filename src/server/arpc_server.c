@@ -5,60 +5,111 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------------------------------------------------------- handle table */
+/* ---------------------------------------------------------- handle table
+ *
+ * Two indexes over one set of slots: by id, which is how the wire refers to
+ * an object, and by (pointer, tag), so that the same libalpm object always
+ * gets the same id. The second is what keeps pointer identity across the
+ * wire -- the package alpm_db_get_pkg() returns is the one in the pkgcache
+ * list, and callers compare them -- and it is also what stops the table
+ * growing by a slot per accessor call.
+ *
+ * Objects form a tree: a package belongs to its db, a db to its handle, a
+ * changelog cursor to its package. Dropping a node drops what is under it.
+ * The root of that tree travels in the id's high bits (ARPC_ROOT), so the
+ * client can tell which handle any id belongs to without being told.
+ */
 
 typedef struct {
 	uint64_t id;            /* 0 = empty slot */
 	void *ptr;
 	uint64_t owner;
 	arpc_handle_tag tag;
+	void (*release)(void *); /* adopted: freed when the slot is dropped */
 } slot;
 
-static slot *g_tab;
+static slot *g_tab;             /* open-addressed, by id */
+static size_t *g_byptr;         /* open-addressed, by (ptr, tag): slot + 1 */
 static size_t g_cap, g_used;
-static uint64_t g_next_id = 1;
+static uint64_t g_next_seq = 1;
+static uint64_t g_next_root = 1;
 
-static size_t slot_for(slot *tab, size_t cap, uint64_t id)
+static size_t mix(uint64_t x, size_t mask)
 {
 	/* Fibonacci hashing; ids are dense and monotonic so the low bits alone
 	 * would cluster badly. */
+	return (size_t)((x * 11400714819323198485ULL) >> 32) & mask;
+}
+
+static size_t slot_for(slot *tab, size_t cap, uint64_t id)
+{
 	size_t mask = cap - 1;
-	size_t i = (size_t)((id * 11400714819323198485ULL) >> 32) & mask;
+	size_t i = mix(id, mask);
 	while (tab[i].id && tab[i].id != id)
 		i = (i + 1) & mask;
 	return i;
 }
 
-static int grow(void)
+/* The g_byptr entry for (ptr, tag): the one pointing at its slot, or the
+ * empty one where it would go. */
+static size_t ptr_for(slot *tab, size_t *byptr, size_t cap, const void *p,
+		      arpc_handle_tag tag)
 {
-	size_t ncap = g_cap ? g_cap * 2 : 256;
-	slot *nt = (slot *)calloc(ncap, sizeof(*nt));
-	if (!nt)
-		return 0;
-	for (size_t i = 0; i < g_cap; i++)
-		if (g_tab[i].id)
-			nt[slot_for(nt, ncap, g_tab[i].id)] = g_tab[i];
-	free(g_tab);
-	g_tab = nt;
-	g_cap = ncap;
-	return 1;
+	size_t mask = cap - 1;
+	size_t i = mix((uint64_t)(uintptr_t)p ^ ((uint64_t)tag << 56), mask);
+	while (byptr[i]) {
+		const slot *s = &tab[byptr[i] - 1];
+		if (s->ptr == p && s->tag == tag)
+			break;
+		i = (i + 1) & mask;
+	}
+	return i;
 }
 
-uint64_t arpc_handle_put(void *ptr, arpc_handle_tag tag, uint64_t owner)
+static void index_ptr(slot *tab, size_t *byptr, size_t cap, size_t si)
 {
-	if (!ptr)
-		return 0;                       /* NULL stays NULL across the wire */
-	if ((g_used + 1) * 4 >= g_cap * 3 && !grow())
-		return 0;
+	byptr[ptr_for(tab, byptr, cap, tab[si].ptr, tab[si].tag)] = si + 1;
+}
 
-	uint64_t id = g_next_id++;
-	size_t i = slot_for(g_tab, g_cap, id);
-	g_tab[i].id = id;
-	g_tab[i].ptr = ptr;
-	g_tab[i].tag = tag;
-	g_tab[i].owner = owner;
-	g_used++;
-	return id;
+/* Rebuild both indexes at `ncap`, keeping the slots `keep` accepts, or all
+ * of them when it is NULL. Open addressing cannot simply blank a slot --
+ * that would cut probe chains -- so a drop is a rebuild. It is O(cap), and
+ * happens when something is released, which is rare next to a lookup. */
+static int rebuild(size_t ncap, int (*keep)(const slot *, void *), void *ctx)
+{
+	slot *nt = (slot *)calloc(ncap, sizeof(*nt));
+	size_t *np = (size_t *)calloc(ncap, sizeof(*np));
+	if (!nt || !np) {
+		free(nt);
+		free(np);
+		return 0;
+	}
+	size_t used = 0;
+	for (size_t i = 0; i < g_cap; i++) {
+		if (!g_tab[i].id)
+			continue;
+		if (keep && !keep(&g_tab[i], ctx)) {
+			/* An adopted object is freed here and nowhere else.
+			 * What it frees in turn -- a conflict's copies of its
+			 * packages -- has slots of its own that this same
+			 * pass drops, and nothing below reads through a slot's
+			 * pointer, so the order does not matter. */
+			if (g_tab[i].release)
+				g_tab[i].release(g_tab[i].ptr);
+			continue;
+		}
+		size_t si = slot_for(nt, ncap, g_tab[i].id);
+		nt[si] = g_tab[i];
+		index_ptr(nt, np, ncap, si);
+		used++;
+	}
+	free(g_tab);
+	free(g_byptr);
+	g_tab = nt;
+	g_byptr = np;
+	g_cap = ncap;
+	g_used = used;
+	return 1;
 }
 
 static slot *find(uint64_t id)
@@ -69,6 +120,77 @@ static slot *find(uint64_t id)
 	return g_tab[i].id == id ? &g_tab[i] : NULL;
 }
 
+static slot *find_ptr(const void *p, arpc_handle_tag tag)
+{
+	if (!p || !g_cap)
+		return NULL;
+	size_t i = ptr_for(g_tab, g_byptr, g_cap, p, tag);
+	return g_byptr[i] ? &g_tab[g_byptr[i] - 1] : NULL;
+}
+
+/* Is `id` `o` itself, or somewhere below it? Chains are short -- handle,
+ * db, package, cursor -- and the bound only guards against a cycle that
+ * cannot happen. */
+static int under(uint64_t id, uint64_t o)
+{
+	for (int depth = 0; id && depth < 8; depth++) {
+		if (id == o)
+			return 1;
+		slot *s = find(id);
+		id = s ? s->owner : 0;
+	}
+	return 0;
+}
+
+uint64_t arpc_handle_put(void *ptr, arpc_handle_tag tag, uint64_t owner)
+{
+	if (!ptr)
+		return 0;                       /* NULL stays NULL across the wire */
+
+	slot *have = find_ptr(ptr, tag);
+	if (have) {
+		/* Seen before: same object, same id. If it was first filed
+		 * under an ancestor of this owner -- a package met in an event
+		 * before its db was ever listed -- re-file it under the closer
+		 * one, so that dropping the db drops it too. */
+		if (owner && owner != have->owner && under(owner, have->owner))
+			have->owner = owner;
+		return have->id;
+	}
+
+	if ((g_used + 1) * 4 >= g_cap * 3 &&
+	    !rebuild(g_cap ? g_cap * 2 : 256, NULL, NULL))
+		return 0;
+
+	uint64_t root;
+	if (owner)
+		root = ARPC_ROOT(owner);
+	else if (tag == ARPC_H_HANDLE)
+		root = g_next_root++;
+	else
+		root = 0;                       /* nobody's; lives until exit */
+	uint64_t id = (root << ARPC_ROOT_SHIFT) | g_next_seq++;
+
+	size_t i = slot_for(g_tab, g_cap, id);
+	g_tab[i].id = id;
+	g_tab[i].ptr = ptr;
+	g_tab[i].tag = tag;
+	g_tab[i].owner = owner;
+	g_tab[i].release = NULL;
+	index_ptr(g_tab, g_byptr, g_cap, i);
+	g_used++;
+	return id;
+}
+
+uint64_t arpc_handle_adopt(void *ptr, uint64_t owner, void (*release)(void *))
+{
+	uint64_t id = arpc_handle_put(ptr, ARPC_H_NONE, owner);
+	slot *s = find(id);
+	if (s)
+		s->release = release;
+	return id;
+}
+
 void *arpc_handle_get(uint64_t id, arpc_handle_tag tag)
 {
 	slot *s = find(id);
@@ -77,56 +199,79 @@ void *arpc_handle_get(uint64_t id, arpc_handle_tag tag)
 	return (s && s->tag == tag) ? s->ptr : NULL;
 }
 
-uint64_t arpc_owner_of(uint64_t id)
+uint64_t arpc_ancestor(uint64_t id, arpc_handle_tag tag)
 {
-	slot *s = find(id);
-	return s ? s->owner : 0;
-}
-
-/* Open addressing cannot simply blank a slot: that would cut probe chains.
- * Rebuilding is O(cap) but only happens on release, which is rare. */
-static void rebuild_without(int (*drop)(const slot *, void *), void *ctx)
-{
-	slot *nt = (slot *)calloc(g_cap, sizeof(*nt));
-	if (!nt)
-		return;
-	size_t used = 0;
-	for (size_t i = 0; i < g_cap; i++) {
-		if (!g_tab[i].id || drop(&g_tab[i], ctx))
-			continue;
-		nt[slot_for(nt, g_cap, g_tab[i].id)] = g_tab[i];
-		used++;
+	uint64_t top = id;
+	for (int depth = 0; id && depth < 8; depth++) {
+		slot *s = find(id);
+		if (!s)
+			break;
+		if (tag != ARPC_H_NONE && s->tag == tag)
+			return id;
+		top = id;
+		id = s->owner;
 	}
-	free(g_tab);
-	g_tab = nt;
-	g_used = used;
+	return top;
 }
 
-static int drop_one(const slot *s, void *ctx) { return s->id == *(uint64_t *)ctx; }
-static int drop_owned(const slot *s, void *ctx)
+static int keep_not(const slot *s, void *ctx)
+{
+	return s->id != *(uint64_t *)ctx;
+}
+
+static int keep_outside(const slot *s, void *ctx)
+{
+	return !under(s->id, *(uint64_t *)ctx);
+}
+
+static int keep_outside_or_self(const slot *s, void *ctx)
 {
 	uint64_t o = *(uint64_t *)ctx;
-	return s->id == o || s->owner == o;
+	return s->id == o || !under(s->id, o);
+}
+
+static void drop_matching(int (*keep)(const slot *, void *), void *ctx)
+{
+	if (g_cap)
+		rebuild(g_cap, keep, ctx);
 }
 
 void arpc_handle_drop(uint64_t id)
 {
 	if (find(id))
-		rebuild_without(drop_one, &id);
+		drop_matching(keep_not, &id);
 }
 
 void arpc_handle_drop_owner(uint64_t owner)
 {
 	if (owner) {
-		rebuild_without(drop_owned, &owner);
+		drop_matching(keep_outside, &owner);
 		arpc_cb_purge(owner);
 	}
 }
 
+void arpc_handle_drop_under(uint64_t owner)
+{
+	if (owner)
+		drop_matching(keep_outside_or_self, &owner);
+}
+
+void arpc_handle_drop_ptr(void *ptr, arpc_handle_tag tag)
+{
+	slot *s = find_ptr(ptr, tag);
+	if (s)
+		arpc_handle_drop_owner(s->id);
+}
+
 void arpc_handle_reset(void)
 {
+	for (size_t i = 0; i < g_cap; i++)
+		if (g_tab[i].id && g_tab[i].release)
+			g_tab[i].release(g_tab[i].ptr);
 	free(g_tab);
+	free(g_byptr);
 	g_tab = NULL;
+	g_byptr = NULL;
 	g_cap = g_used = 0;
 }
 
@@ -192,6 +337,16 @@ void *arpc_arg_handle(arpc_req *rq, int i, arpc_handle_tag tag)
 int arpc_req_bad(const arpc_req *rq) { return rq->bad; }
 void arpc_req_mark_bad(arpc_req *rq) { rq->bad = 1; }
 
+/* The first element of a list argument, as an id. Read without marking the
+ * request bad: an empty or absent list is a legitimate argument, and this
+ * is only asked after the arguments have been checked. */
+uint64_t arpc_list_owner(arpc_req *rq, int i)
+{
+	int arr = aj_elem(rq->doc, rq->params, i);
+	int e = aj_first(rq->doc, arr);
+	return e >= 0 ? (uint64_t)aj_i64(rq->doc, e, 0) : 0;
+}
+
 /* ---- raw node access, used by generated list code ---- */
 
 int arpc_arg_node(arpc_req *rq, int i)
@@ -202,16 +357,6 @@ int arpc_arg_node(arpc_req *rq, int i)
 int arpc_node_is_null(const arpc_req *rq, int n)
 {
 	return aj_is_null(rq->doc, n);
-}
-
-int arpc_node_count(const arpc_req *rq, int n)
-{
-	return aj_count(rq->doc, n);
-}
-
-int arpc_node_elem(const arpc_req *rq, int arr, int k)
-{
-	return aj_elem(rq->doc, arr, k);
 }
 
 int arpc_node_first(const arpc_req *rq, int arr)
@@ -384,13 +529,22 @@ char *arpc_handle_frame(const char *req, size_t len)
 		aj_free(&d);
 		return reply_error(0, ARPC_E_PARSE, "malformed JSON");
 	}
+	return arpc_handle_parsed(&d);
+}
 
-	long long id = aj_i64(&d, aj_member(&d, 0, "id"), 0);
-	const char *method = aj_str(&d, aj_member(&d, 0, "method"), NULL);
-	int params = aj_member(&d, 0, "params");
+static int method_cmp(const void *key, const void *elem)
+{
+	return strcmp((const char *)key, ((const arpc_method *)elem)->name);
+}
+
+char *arpc_handle_parsed(aj_doc *d)
+{
+	long long id = aj_i64(d, aj_member(d, 0, "id"), 0);
+	const char *method = aj_str(d, aj_member(d, 0, "method"), NULL);
+	int params = aj_member(d, 0, "params");
 
 	if (!method) {
-		aj_free(&d);
+		aj_free(d);
 		return reply_error(id, ARPC_E_INVALID_REQ, "missing method");
 	}
 
@@ -400,7 +554,7 @@ char *arpc_handle_frame(const char *req, size_t len)
 	 * which is what lets a rebuild replace the binary. */
 	if (!strcmp(method, "arpc.shutdown")) {
 		g_shutdown_requested = 1;
-		aj_free(&d);
+		aj_free(d);
 		aj_w w;
 		ajw_init(&w);
 		ajw_obj_begin(&w);
@@ -427,21 +581,19 @@ char *arpc_handle_frame(const char *req, size_t len)
 			break;
 		}
 	}
-	for (const arpc_method *k = m ? (const arpc_method *)NULL
-				      : arpc_methods; k && k->name; k++) {
-		if (!strcmp(k->name, method)) {
-			m = k;
-			break;
-		}
-	}
+	if (!m)
+		m = (const arpc_method *)bsearch(method, arpc_methods,
+						 arpc_method_count,
+						 sizeof(*arpc_methods),
+						 method_cmp);
 	if (!m) {
 		char buf[256];
 		snprintf(buf, sizeof(buf), "no such method: %s", method);
-		aj_free(&d);
+		aj_free(d);
 		return reply_error(id, ARPC_E_NO_METHOD, buf);
 	}
 
-	arpc_req rq = { &d, params, 0 };
+	arpc_req rq = { d, params, 0 };
 	arpc_res rs;
 	memset(&rs, 0, sizeof(rs));
 
@@ -467,12 +619,11 @@ char *arpc_handle_frame(const char *req, size_t len)
 		ajw_reserve(&w, rs.out.len + 2);
 		ajw_key(&w, "result");
 		ajw_raw(&w, rs.out.buf, rs.out.len);
-		w.need_comma = 1;
 		ajw_obj_end(&w);
 		out = finish(&w);
 	}
 
 	ajw_free(&rs.out);
-	aj_free(&d);
+	aj_free(d);
 	return out ? out : reply_error(id, ARPC_E_INTERNAL, "out of memory");
 }

@@ -11,6 +11,7 @@ add_executable(alpmrpcd
   arpc_server.c
   arpc_callbacks.c
   arpc_mtree.c
+  arpc_invalidate.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c
@@ -38,10 +39,16 @@ target_link_libraries(alpmrpcd PRIVATE
 # Asking is enough -- the server finishes its current connection and exits,
 # and the next client starts a fresh one on demand. If it will not go, fail
 # loudly rather than install something that will not be used.
+#
+# The endpoint to ask on is the install prefix's, not the MSYS2 root's: a
+# server runs from <prefix>/usr/bin, and that is the file being replaced.
+# For a real install the two are the same directory; for the tests' stage
+# directory they are not, and the server the tests left idle there is the
+# one holding the binary.
 install(CODE "
   set(_stopper \"$<TARGET_FILE:alpmrpcd>\")
   execute_process(
-    COMMAND \"\${_stopper}\" --root \"${MSYS2_ROOT}\" --stop
+    COMMAND \"\${_stopper}\" --root \"\${CMAKE_INSTALL_PREFIX}\" --stop
     RESULT_VARIABLE _stop_rc
     OUTPUT_QUIET ERROR_QUIET)
   if(NOT _stop_rc EQUAL 0)
