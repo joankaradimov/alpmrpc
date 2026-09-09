@@ -519,7 +519,7 @@ static sstr *g_static;
 
 const char *arpc_intern_static(arpc_call *c)
 {
-	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, "ret"),
+	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, ARPC_RET_KEY),
 			       NULL);
 	if (!s)
 		return NULL;
@@ -965,7 +965,7 @@ void arpc_put_bytes(arpc_call *c, const unsigned char *b, size_t n)
 unsigned char *arpc_ret_bytes(arpc_call *c, size_t *n)
 {
 	*n = 0;
-	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, "ret"),
+	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, ARPC_RET_KEY),
 			       NULL);
 	return s ? arpc_b64_decode(s, n) : NULL;
 }
@@ -1063,7 +1063,7 @@ const aj_doc *arpc_doc(const arpc_call *c)
 
 int arpc_ret_node(const arpc_call *c)
 {
-	return aj_member(&c->rsp, c->result, "ret");
+	return aj_member(&c->rsp, c->result, ARPC_RET_KEY);
 }
 
 int arpc_out_node(const arpc_call *c, const char *name)
@@ -1073,12 +1073,13 @@ int arpc_out_node(const arpc_call *c, const char *name)
 
 long long arpc_ret_i64(arpc_call *c)
 {
-	return aj_i64(&c->rsp, aj_member(&c->rsp, c->result, "ret"), 0);
+	return aj_i64(&c->rsp, aj_member(&c->rsp, c->result, ARPC_RET_KEY), 0);
 }
 
 uint64_t arpc_ret_handle(arpc_call *c)
 {
-	return (uint64_t)aj_i64(&c->rsp, aj_member(&c->rsp, c->result, "ret"), 0);
+	return (uint64_t)aj_i64(&c->rsp,
+				aj_member(&c->rsp, c->result, ARPC_RET_KEY), 0);
 }
 
 long long arpc_out_i64(arpc_call *c, const char *name)
@@ -1088,7 +1089,9 @@ long long arpc_out_i64(arpc_call *c, const char *name)
 
 const char *arpc_intern_str(arpc_call *c, uint64_t owner, const char *key)
 {
-	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, "ret"), NULL);
+	const char *s = aj_str(&c->rsp,
+			       aj_member(&c->rsp, c->result, ARPC_RET_KEY),
+			       NULL);
 	if (!s)
 		return NULL;
 	return intern(owner, key, s);
@@ -1096,7 +1099,9 @@ const char *arpc_intern_str(arpc_call *c, uint64_t owner, const char *key)
 
 char *arpc_take_str(arpc_call *c)
 {
-	const char *s = aj_str(&c->rsp, aj_member(&c->rsp, c->result, "ret"), NULL);
+	const char *s = aj_str(&c->rsp,
+			       aj_member(&c->rsp, c->result, ARPC_RET_KEY),
+			       NULL);
 	return s ? _strdup(s) : NULL;
 }
 

@@ -305,6 +305,33 @@ int main(void)
 		}
 	}
 
+	/* A list that arrives through an out-parameter rather than as the
+	 * return value. alpm_db_search is the only function whose out-list is
+	 * named "ret", which is what the return value itself once travelled
+	 * as: both went into one object under one key, and the reader took
+	 * whichever came first, so every search came back empty. */
+	printf("\n-- an out-parameter list, beside the return value --\n");
+	if (cache) {
+		const char *known = alpm_pkg_get_name((alpm_pkg_t *)cache->data);
+		alpm_list_t *needles = alpm_list_add(NULL, (void *)known);
+		alpm_list_t *found = NULL;
+		int rc = alpm_db_search(db, needles, &found);
+		snprintf(buf, sizeof(buf), "rc=%d, %zu found for %s",
+			 rc, alpm_list_count(found), known ? known : "?");
+		check(rc == 0, "alpm_db_search() returns its return value", buf);
+		check(alpm_list_count(found) > 0,
+			      "and its results, beside it in the reply", buf);
+		int hit = 0;
+		for (alpm_list_t *i = found; i && !hit; i = i->next) {
+			const char *n = alpm_pkg_get_name((alpm_pkg_t *)i->data);
+			hit = n && known && !strcmp(n, known);
+		}
+		check(hit, "the package searched for is among them", known);
+		alpm_list_free(needles);
+		alpm_list_free(found);
+	} else {
+		check(1, "no local packages to search for", "skipped");
+	}
 	printf("\n-- teardown releases cached lists --\n");
 	snprintf(buf, sizeof(buf), "%zu entries cached", arpc_stats_cached());
 	check(arpc_stats_cached() > 0, "lists and columns are cached before it",

@@ -442,6 +442,43 @@ def out_params_of(name):
     return OVERLAY["functions"].get(name, {}).get("out_params", [])
 
 
+# Must match ARPC_RET_KEY in src/common/arpc_wire.h. The generator never
+# writes the key itself -- arpc_ret_* does -- but it has to know it to check
+# that no out-parameter can be mistaken for it.
+RET_KEY = "@ret"
+
+
+def reply_keys_validate(gen):
+    """No two members of a reply may share a key.
+
+    A reply carries the call's return value under RET_KEY and every
+    out-parameter under its own name. Out-parameter names are C identifiers
+    and RET_KEY deliberately is not one, so those two namespaces cannot meet
+    -- but that is a property of RET_KEY's spelling, not something the code
+    enforces, and it was not always true. alpm_db_search's third parameter is
+    named "ret", which is exactly what the return value used to travel as:
+    the results and the return value went out as two members of one object
+    under one key, and the reader took whichever came first.
+
+    So the spelling is checked rather than trusted, and duplicate
+    out-parameters -- which the overlay could still ask for -- with it.
+    """
+    for fn in gen:
+        n = fn["name"]
+        seen = set()
+        for op in out_params_of(n):
+            if op == RET_KEY:
+                raise SystemExit(
+                    "emit: %s has an out-parameter named %r, which is the key "
+                    "the return value travels under. One of them would be "
+                    "lost. Give RET_KEY a spelling no C identifier can have."
+                    % (n, op))
+            if op in seen:
+                raise SystemExit("emit: %s has two out-parameters named %r; "
+                                 "a reply cannot carry both" % (n, op))
+            seen.add(op)
+
+
 def out_list_by_errno(fname, pname):
     """An out-list whose element type depends on why the call failed.
 
@@ -2823,6 +2860,7 @@ def main():
             raise SystemExit("overlay: server_hooks names %s, which is not "
                              "generated" % name)
     paths_validate(model)
+    reply_keys_validate(gen)
     need = records_needed(gen, cb_seed_records(model))
     rin = records_input(gen)
     os.makedirs(a.outdir, exist_ok=True)

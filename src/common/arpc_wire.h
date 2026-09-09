@@ -24,7 +24,18 @@ extern "C" {
 /* 3: ids carry their root handle in their high bits, the same object always
  * gets the same id, and an out-list whose element type depends on the errno
  * travels with that errno beside it. */
-#define ARPC_PROTO_VERSION 3
+/* 4: the return value has a key of its own, ARPC_RET_KEY, rather than
+ * sharing the parameter namespace. alpm_db_search's out-parameter is itself
+ * named "ret", so its results and its return value were two members of the
+ * same object under the same key, and the first one found won. */
+#define ARPC_PROTO_VERSION 4
+
+/* The reply slot holding a call's return value.
+ *
+ * Out-parameters travel under their own names, which are C identifiers. This
+ * one is not an identifier and cannot be spelled as one, so no parameter can
+ * ever collide with it -- which is the whole point, since one already did. */
+#define ARPC_RET_KEY "@ret"
 
 /* An id carries the root it belongs to -- the alpm_handle_t at the top of
  * its ownership chain -- in its high bits. Either side can then tell which

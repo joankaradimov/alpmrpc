@@ -168,7 +168,7 @@ void arpc_dispatch_callback(const aj_doc *d, aj_w *reply)
 	ajw_obj_begin(reply);
 	ajw_key(reply, "cbseq");
 	ajw_i64(reply, seq);
-	ajw_key(reply, "ret");
+	ajw_key(reply, ARPC_RET_KEY);
 	ajw_i64(reply, ret);
 	ajw_obj_end(reply);
 }

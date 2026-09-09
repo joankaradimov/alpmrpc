@@ -76,7 +76,7 @@ void arpc_out_bytes(arpc_res *rs, const char *name, const unsigned char *b,
                     size_t n);
 void arpc_ret_bytes(arpc_res *rs, const unsigned char *b, size_t n);
 
-/* Open the "ret" slot and hand back the writer, so generated code can emit a
+/* Open the return slot and hand back the writer, so generated code can emit a
  * composite value (an array, an object) straight into the response instead of
  * building it somewhere else and copying it in. */
 void  arpc_ret_begin(arpc_res *rs);

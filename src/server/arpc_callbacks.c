@@ -75,7 +75,7 @@ int arpc_cb_wanted(uint64_t handle, int kind)
 	return r && (r->enabled & (1u << kind));
 }
 
-/* Send one callback frame and wait for the answer. Returns the reply's "ret"
+/* Send one callback frame and wait for the answer. Returns the reply's return
  * or `dflt` if the connection failed -- a dead pipe must not wedge libalpm
  * mid-transaction. */
 long long arpc_cb_send(int kind, uint64_t handle, aj_w *args, long long dflt)
@@ -114,7 +114,7 @@ long long arpc_cb_send(int kind, uint64_t handle, aj_w *args, long long dflt)
 		 * the number anyway would answer one question with another's
 		 * reply. */
 		if (aj_i64(&d, aj_member(&d, 0, "cbseq"), -1) == seq)
-			r = aj_i64(&d, aj_member(&d, 0, "ret"), dflt);
+			r = aj_i64(&d, aj_member(&d, 0, ARPC_RET_KEY), dflt);
 	}
 	aj_free(&d);
 	free(reply);

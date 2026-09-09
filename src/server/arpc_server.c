@@ -404,7 +404,7 @@ static void ensure_obj(arpc_res *rs)
 static void set_ret(arpc_res *rs)
 {
 	ensure_obj(rs);
-	ajw_key(&rs->out, "ret");
+	ajw_key(&rs->out, ARPC_RET_KEY);
 	rs->has_ret = 1;
 }
 
@@ -446,7 +446,7 @@ aj_w *arpc_out_writer(arpc_res *rs, const char *name)
 {
 	ensure_obj(rs);
 	if (!rs->has_ret)
-		arpc_ret_null(rs);      /* keep "ret" first for readable traces */
+		arpc_ret_null(rs);      /* the return goes first in traces */
 	ajw_key(&rs->out, name);
 	return &rs->out;
 }
@@ -482,7 +482,7 @@ void arpc_out_i64(arpc_res *rs, const char *name, long long v)
 {
 	ensure_obj(rs);
 	if (!rs->has_ret)
-		arpc_ret_null(rs);      /* keep "ret" first for readable traces */
+		arpc_ret_null(rs);      /* the return goes first in traces */
 	ajw_key(&rs->out, name);
 	ajw_i64(&rs->out, v);
 }
@@ -580,7 +580,7 @@ char *arpc_handle_parsed(aj_doc *d)
 		ajw_obj_begin(&w);
 		ajw_key(&w, "id");     ajw_i64(&w, id);
 		ajw_key(&w, "result"); ajw_obj_begin(&w);
-		ajw_key(&w, "ret");    ajw_i64(&w, 0);
+		ajw_key(&w, ARPC_RET_KEY); ajw_i64(&w, 0);
 		ajw_obj_end(&w);
 		ajw_obj_end(&w);
 		return finish(&w);
