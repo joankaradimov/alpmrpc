@@ -10,7 +10,13 @@
 typedef struct {
 	const char *p, *end;
 	aj_doc *d;
+	int depth;              /* containers open; the parser is recursive */
 } aj_p;
+
+/* Deeper than anything on this wire by two orders of magnitude, and well
+ * short of what a frame of nothing but brackets would need to run the
+ * stack out. */
+#define AJ_MAX_DEPTH 256
 
 static int node_new(aj_doc *d, aj_type t)
 {
@@ -172,8 +178,19 @@ done:
 }
 
 static int parse_value(aj_p *p);
+static int parse_container_(aj_p *p, int is_obj);
 
 static int parse_container(aj_p *p, int is_obj)
+{
+	if (p->depth >= AJ_MAX_DEPTH)
+		return -1;
+	p->depth++;
+	int r = parse_container_(p, is_obj);
+	p->depth--;
+	return r;
+}
+
+static int parse_container_(aj_p *p, int is_obj)
 {
 	int self = node_new(p->d, is_obj ? AJ_OBJ : AJ_ARR);
 	if (self < 0)
@@ -307,7 +324,7 @@ static int parse_value(aj_p *p)
 int aj_parse(aj_doc *d, const char *text, size_t len)
 {
 	memset(d, 0, sizeof(*d));
-	aj_p p = { text, text + len, d };
+	aj_p p = { text, text + len, d, 0 };
 
 	int root = parse_value(&p);
 	if (root != 0)
@@ -465,6 +482,7 @@ void ajw_raw(aj_w *w, const char *s, size_t n)
 {
 	if (wgrow(w, n))
 		wraw_(w, s, n);
+	w->need_comma = 1;      /* it was a value: what follows gets a comma */
 }
 
 static void wsep(aj_w *w)

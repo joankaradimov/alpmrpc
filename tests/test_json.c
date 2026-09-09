@@ -188,7 +188,8 @@ int main(void)
 		ajw_reserve(&outer, inner.len + 2);
 		ajw_key(&outer, "result");
 		ajw_raw(&outer, inner.buf, inner.len);
-		outer.need_comma = 1;
+		ajw_key(&outer, "after");
+		ajw_i64(&outer, 2);
 		ajw_obj_end(&outer);
 
 		aj_doc d;
@@ -200,6 +201,10 @@ int main(void)
 			const char *v = aj_str(&d, aj_member(&d, res, "ret"), NULL);
 			if (!v || strcmp(v, "local\"db"))
 				fail("spliced value", v, "local\"db");
+			/* The splice is a value, so the member after it needs
+			 * its comma; a writer that forgot would not re-parse. */
+			if (aj_i64(&d, aj_member(&d, 0, "after"), 0) != 2)
+				fail("member after a splice", "?", "2");
 		}
 		aj_free(&d);
 		ajw_free(&inner);

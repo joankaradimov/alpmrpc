@@ -79,8 +79,10 @@ void ajw_free(aj_w *w);
  * Returns 0 on allocation failure (w->err is then set). */
 int  ajw_reserve(aj_w *w, size_t bytes);
 
-/* Append already-formatted JSON verbatim: no escaping, no separator logic.
- * For splicing one writer's output into another. */
+/* Append already-formatted JSON verbatim as a value, after a key or at the
+ * start of a container: no escaping and no separator before it, but it
+ * counts as a value, so what follows gets its comma. For splicing one
+ * writer's output into another. */
 void ajw_raw(aj_w *w, const char *s, size_t n);
 
 void ajw_obj_begin(aj_w *w);
