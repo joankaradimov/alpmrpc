@@ -200,6 +200,28 @@ int main(int argc, char **argv)
 	check(can_open(buf), "into the root that was named: the scriptlet log "
 	      "is there", "opened natively");
 
+	printf("\n-- a signature is checked against this root's keyring --\n");
+	/* The gpgdir is a path like the others. It is also the one setting
+	 * libalpm hands gpgme only once per process, and e2e_transaction runs
+	 * just before this test, on the server this test then reuses, checking
+	 * signatures against its own root's keyring. Unless the server points
+	 * gpgme at each handle's gpgdir, that is the keyring read here, and
+	 * this root's key is not in it. */
+	char gpgdir[1024];
+	snprintf(gpgdir, sizeof(gpgdir), "%s\\etc\\pacman.d\\gnupg\\", win_root);
+	check(alpm_option_set_gpgdir(h, gpgdir) == 0,
+	      "alpm_option_set_gpgdir() with a Win32 path", NULL);
+	const char *gd = alpm_option_get_gpgdir(h);
+	check(is_win32(gd) && same_place(gd, gpgdir),
+	      "and it comes back as one", gd);
+	alpm_pkg_t *signed_base = NULL;
+	rc = alpm_pkg_load(h, base_pkg, 1, ALPM_SIG_PACKAGE, &signed_base);
+	check(rc == 0 && signed_base,
+	      "alpm_pkg_load() verifies it with this root's key",
+	      rc == 0 ? NULL : alpm_strerror(alpm_errno(h)));
+	if (signed_base)
+		alpm_pkg_free(signed_base);
+
 	printf("\n-- a record's field arrives as Win32 --\n");
 	/* alpmrpc-squatter ships a file alpmrpc-base owns; the commit refuses
 	 * with an alpm_fileconflict_t whose file is an absolute path. */

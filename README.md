@@ -286,6 +286,12 @@ everything else, why it is not.
   takes its old entry back, so its pointer stays stable, as libalpm's would.
   Strings that belong to nobody -- `alpm_strerror`'s -- are static in
   libalpm and are kept for good here.
+- **Each handle's signatures are checked against its own keyring.** libalpm
+  hands gpgme a gpgdir once per process, the first time it checks a
+  signature, and a server serves client after client. So before each call
+  the server points gpgme at the gpgdir of the handle the call is for,
+  whenever that differs from the last call's; otherwise every client would
+  be checked against the first one's keys.
 - **The server is single-threaded**, which keeps libalpm's `fork()` for
   scriptlets and hooks on the path Cygwin actually supports.
 - **The client holds one lock for the whole of a call** -- from the cache
@@ -328,6 +334,9 @@ test builds a second such root and hands libalpm nothing but Win32 paths,
 checking each one that comes back -- a returned string, a list, a conflict's
 file, a fetch callback's destination, the files a fetch wrote -- by opening
 it natively; it exists only in the Win32-path build, which is the default.
+It runs after the transaction test, on the server that test leaves idle, and
+checks a signature against its own root's keyring, so a server that checks
+every client against the first one's keyring fails it.
 
 `bench_codec` reports round-trip cost, the codec's share of it, and
 throughput on a bulk payload -- run it before and after anything that

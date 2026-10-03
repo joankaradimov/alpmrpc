@@ -13,6 +13,7 @@ add_executable(alpmrpcd
   arpc_mtree.c
   arpc_invalidate.c
   arpc_paths.c
+  arpc_gpgdir.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_json.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_b64.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/arpc_wire.c

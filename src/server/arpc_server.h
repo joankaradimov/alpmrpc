@@ -206,6 +206,14 @@ void  arpc_put_path_list(aj_w *w, const alpm_list_t *l);
 /* Converts a list of strings the server owns, in place. */
 void  arpc_paths_in_list(alpm_list_t *l);
 
+/* ---- gpgdir ----
+ *
+ * libalpm hands gpgme a gpgdir once per process, and this process serves
+ * client after client, so before each call the dispatcher points gpgme at
+ * the gpgdir of the handle the call is for. See src/server/arpc_gpgdir.c.
+ * The handle is void * so this header does not have to pull in alpm.h. */
+void  arpc_gpgdir_follow(void *handle);
+
 /* Set once a client has asked the server to exit. The accept loop checks it
  * after each connection closes, so an in-flight call always completes. */
 int arpc_shutdown_requested(void);

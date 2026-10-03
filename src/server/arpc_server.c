@@ -557,6 +557,18 @@ static int method_cmp(const void *key, const void *elem)
 	return strcmp((const char *)key, ((const arpc_method *)elem)->name);
 }
 
+/* The handle a call is for: its first argument's, when that is the id of a
+ * handle or of anything under one. Read without marking the request bad --
+ * plenty of calls take no handle, and some take no argument at all. */
+static void *req_handle(const arpc_req *rq)
+{
+	int n = aj_elem(rq->doc, rq->params, 0);
+	if (n < 0 || rq->doc->nodes[n].type != AJ_NUM)
+		return NULL;
+	uint64_t id = (uint64_t)rq->doc->nodes[n].num;
+	return arpc_handle_get(arpc_ancestor(id, ARPC_H_HANDLE), ARPC_H_HANDLE);
+}
+
 char *arpc_handle_parsed(aj_doc *d)
 {
 	long long id = aj_i64(d, aj_member(d, 0, "id"), 0);
@@ -618,6 +630,7 @@ char *arpc_handle_parsed(aj_doc *d)
 	arpc_res rs;
 	memset(&rs, 0, sizeof(rs));
 
+	arpc_gpgdir_follow(req_handle(&rq));
 	m->fn(&rq, &rs);
 
 	char *out;

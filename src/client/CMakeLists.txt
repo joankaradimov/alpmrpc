@@ -148,7 +148,12 @@ if(ALPMRPC_BUILD_TESTS)
       add_executable(e2e_paths ${_tests}/e2e_paths.c)
       target_link_libraries(e2e_paths PRIVATE alpm)
       add_test(NAME e2e_paths COMMAND e2e_paths "${_scratch_paths}")
-      set_tests_properties(e2e_paths PROPERTIES FIXTURES_REQUIRED scratch_paths)
+      # After e2e_transaction, whose signature checks set up gpgme in the
+      # server this test then reuses: its own check has to reach its own
+      # root's keyring regardless.
+      set_tests_properties(e2e_paths PROPERTIES
+        FIXTURES_REQUIRED scratch_paths
+        DEPENDS e2e_transaction)
     endif()
 
     # Rebuilds the fixture itself between runs, so it is not part of ctest.
